@@ -599,6 +599,10 @@ namespace PuckUltimateFrisbeeMod
             return state;
         }
 
+        // Sprint Stamina Tuning:
+        // 1.0f = vanilla drain speed, 0.45f = 55% slower stamina drain (players can sprint >2x longer!)
+        public static float SprintStaminaDrainMultiplier = 0.45f;
+
         /// <summary>
         /// Computes a natural human arm reach from the hockey stick:
         /// - Compresses HORIZONTAL protrusion so the arm stays close to the torso.
@@ -4808,13 +4812,16 @@ namespace PuckUltimateFrisbeeMod
         }
     }
 
-    // Auto-clear dive state if no fall after a short window, and apply turf slide drag when fallen
+   // Slow down sprint stamina drain, auto-clear dive state, and apply turf slide drag when fallen
     [HarmonyPatch(typeof(PlayerBody), "FixedUpdate")]
     public static class PlayerBody_DiveAutoClearAndDrag_Patch
     {
         private static readonly FieldInfo _ambientDragField = AccessTools.Field(typeof(Movement), "ambientDrag")
                                                            ?? AccessTools.Field(typeof(Movement), "drag");
         private static readonly PropertyInfo _ambientDragProp = AccessTools.Property(typeof(Movement), "AmbientDrag");
+
+        // Tracks previous tick stamina per player so we can scale down sprinting stamina drain
+        internal static readonly Dictionary<ulong, float> PrevStamina = new Dictionary<ulong, float>();
 
         [HarmonyPostfix]
         public static void Postfix(PlayerBody __instance)
@@ -4824,6 +4831,37 @@ namespace PuckUltimateFrisbeeMod
             if (player == null) return;
             var id = player.NetworkObjectId;
 
+            // -----------------------------------------------------------------
+            // 1. SLOW DOWN SPRINT STAMINA DEPLETION WHEN RUNNING
+            // -----------------------------------------------------------------
+            if (__instance.Stamina != null)
+            {
+                float currentStamina = __instance.Stamina.Value;
+                bool isHoldingDisc = (UltimateRulesManager.Holder == player) ||
+                                     UltimateNetworkSync.IsPlayerHoldingAnyDisc(player.OwnerClientId);
+                bool isDiving = UltimateDiveMod.DiveToggled.Contains(id);
+                bool isSprinting = __instance.IsSprinting != null && __instance.IsSprinting.Value;
+
+                if (PrevStamina.TryGetValue(id, out float prevStamina))
+                {
+                    float drain = prevStamina - currentStamina;
+
+                    // Only refund gradual sprinting drain (ignores instant 0f dive cost & throw wind-up meter)
+                    if (isSprinting && !isHoldingDisc && !isDiving && drain > 0f && drain < 0.15f)
+                    {
+                        float mult = Mathf.Clamp(UltimateRulesManager.SprintStaminaDrainMultiplier, 0.05f, 1.0f);
+                        float adjustedStamina = Mathf.Clamp01(prevStamina - (drain * mult));
+                        __instance.Stamina.Value = adjustedStamina;
+                        currentStamina = adjustedStamina;
+                    }
+                }
+
+                PrevStamina[id] = currentStamina;
+            }
+
+            // -----------------------------------------------------------------
+            // 2. DIVE DRAG & AUTO-CLEAR LOGIC
+            // -----------------------------------------------------------------
             if (!UltimateDiveMod.DiveToggled.Contains(id)) return;
             if (!UltimateDiveMod.DiveStartedAt.TryGetValue(id, out var t0)) return;
 
@@ -4851,20 +4889,6 @@ namespace PuckUltimateFrisbeeMod
         }
     }
 
-    // Clear dive toggle when the player stands back up
-    [HarmonyPatch(typeof(PlayerBody), "OnStandUp")]
-    public static class PlayerBody_OnStandUp_DivePatch
-    {
-        [HarmonyPostfix]
-        public static void Postfix(PlayerBody __instance)
-        {
-            if (!NetworkRoles.IsServer || __instance == null) return;
-            var p = __instance.Player;
-            if (p == null) return;
-            UltimateDiveMod.ClearDiveState(p);
-        }
-    }
-
     // Clean up per-player dive dictionaries when a player body despawns
     [HarmonyPatch(typeof(PlayerBody), "OnNetworkDespawn")]
     public static class PlayerBody_OnNetworkDespawn_DivePatch
@@ -4878,8 +4902,10 @@ namespace PuckUltimateFrisbeeMod
 
             UltimateDiveMod.DiveToggled.Remove(id);
             UltimateDiveMod.DiveStartedAt.Remove(id);
+            PlayerBody_DiveAutoClearAndDrag_Patch.PrevStamina.Remove(id);
         }
     }
+    
     [HarmonyPatch(typeof(PlayerCamera), "OnNetworkPostSpawn")]
     public static class PlayerCamera_ExtendFarClip_Patch
     {
