@@ -716,6 +716,7 @@ namespace PuckUltimateFrisbeeMod
         public class ThrowWindupTracker
         {
             public bool IsCharging = false;
+            public bool RequireFreshShiftPress = false; // Prevents sprinting into a catch from charging/throwing!
             public float ChargeStartTime = 0f;
             public float StaminaUsed = 0f;
             public int LastUpdatedTick = -1;
@@ -732,6 +733,22 @@ namespace PuckUltimateFrisbeeMod
             public float SmoothedSwingPowerBonus = 0f;
 
             public const float FullChargeSeconds = 2.20f;
+
+            public void OnCatchOrPickup(Player holder)
+            {
+                Reset(holder?.PlayerBody);
+                // If the player is currently holding Shift (sprinting) when they catch/pickup,
+                // ignore Shift until they release it first!
+                bool holdingShiftOnCatch = holder?.PlayerInput != null && holder.PlayerInput.SprintInput.ServerValue;
+                RequireFreshShiftPress = holdingShiftOnCatch;
+            }
+
+            public void CancelCharge(PlayerBody body)
+            {
+                Reset(body);
+                // Require the player to release Shift before they can start a new charge
+                RequireFreshShiftPress = true;
+            }
 
             public void BeginCharge(PlayerBody body, Stick stick, Vector2 stickAngle)
             {
@@ -784,7 +801,6 @@ namespace PuckUltimateFrisbeeMod
                     PeakForwardSwingAccel = Mathf.Max(forwardAccel, PeakForwardSwingAccel * decay);
                     PeakAngularWhipSpeed = Mathf.Max(angularSpeed, PeakAngularWhipSpeed * decay);
 
-                    // Adjusted thresholds for compressed hand reach
                     float speedNorm = Mathf.Clamp01(PeakForwardSwingSpeed / 1.6f);
                     float accelNorm = Mathf.Clamp01(PeakForwardSwingAccel / 20.0f);
                     float angularNorm = Mathf.Clamp01((PeakAngularWhipSpeed / 220.0f) + (angularAccel / 1800.0f) * 0.5f);
@@ -1752,12 +1768,24 @@ namespace PuckUltimateFrisbeeMod
                         holder.PlayerBody.IsSprinting.Value = false;
                     }
 
-                    if (!tracker.IsCharging)
+                    // 1. If the player was already holding Shift when they caught the disc (or just cancelled a throw),
+                    //    wait until they let go of Shift before allowing a new throw wind-up!
+                    if (tracker.RequireFreshShiftPress)
                     {
                         if (holder.PlayerBody.Stamina != null)
                             holder.PlayerBody.Stamina.Value = 1.0f;
 
-                        if (isHoldingShift && holdTime > 0.16f)
+                        if (!isHoldingShift)
+                        {
+                            tracker.RequireFreshShiftPress = false;
+                        }
+                    }
+                    else if (!tracker.IsCharging)
+                    {
+                        if (holder.PlayerBody.Stamina != null)
+                            holder.PlayerBody.Stamina.Value = 1.0f;
+
+                        if (isHoldingShift && holdTime > 0.12f)
                         {
                             tracker.BeginCharge(holder.PlayerBody, holder.Stick, currentStickAngle);
                         }
@@ -2819,14 +2847,13 @@ namespace PuckUltimateFrisbeeMod
             UltimateRulesManager.LastDeflector = null;
             UltimateRulesManager.LastTurnoverTeam = PlayerTeam.None;
 
-            if (UltimateRulesManager.WindupTrackers.TryGetValue(catcher.OwnerClientId, out var tracker))
+            if (!UltimateRulesManager.WindupTrackers.TryGetValue(catcher.OwnerClientId, out var tracker))
             {
-                tracker.Reset(catcher.PlayerBody);
+                tracker = new UltimateRulesManager.ThrowWindupTracker();
+                UltimateRulesManager.WindupTrackers[catcher.OwnerClientId] = tracker;
             }
-            else if (catcher.PlayerBody != null && catcher.PlayerBody.Stamina != null)
-            {
-                catcher.PlayerBody.Stamina.Value = 1.0f;
-            }
+            // Automatically ignores Shift if the player was sprinting into the catch/pickup!
+            tracker.OnCatchOrPickup(catcher);
 
             // Determine whether the catcher has running momentum to carry over
             Rigidbody catcherRb = catcher.PlayerBody.Rigidbody;
@@ -4621,13 +4648,54 @@ namespace PuckUltimateFrisbeeMod
             }
         }
 
+        public static void ClientSendCancelThrowAction()
+        {
+            EnsureNetworkRegistered();
+            var nm = NetworkManager.Singleton;
+            if (nm == null || !nm.IsConnectedClient || nm.CustomMessagingManager == null) return;
+
+            if (NetworkRoles.IsServer)
+            {
+                Player localPlayer = MonoBehaviourSingleton<PlayerManager>.Instance?.GetPlayerByClientId(nm.LocalClientId);
+                if (localPlayer != null)
+                {
+                    ServerCancelPlayerThrow(localPlayer);
+                }
+                return;
+            }
+
+            using (var writer = new FastBufferWriter(4, Allocator.Temp))
+            {
+                writer.WriteValueSafe((byte)2); // 2 = Cancel Throw / Pump Fake
+                nm.CustomMessagingManager.SendNamedMessage(DiveMessageName, NetworkManager.ServerClientId, writer, NetworkDelivery.Reliable);
+            }
+        }
+
+        public static void ServerCancelPlayerThrow(Player player)
+        {
+            if (player == null) return;
+            if (UltimateRulesManager.WindupTrackers.TryGetValue(player.OwnerClientId, out var tracker))
+            {
+                tracker.CancelCharge(player.PlayerBody);
+            }
+        }
+
         private static void OnDiveMessageReceived(ulong senderClientId, FastBufferReader reader)
         {
             if (!NetworkRoles.IsServer) return;
             if (MonoBehaviourSingleton<PlayerManager>.Instance == null) return;
 
+            byte actionType = 1;
+            try { reader.ReadValueSafe(out actionType); } catch { }
+
             Player player = MonoBehaviourSingleton<PlayerManager>.Instance.GetPlayerByClientId(senderClientId);
-            if (player != null && player.PlayerInput != null)
+            if (player == null) return;
+
+            if (actionType == 2)
+            {
+                ServerCancelPlayerThrow(player);
+            }
+            else if (player.PlayerInput != null)
             {
                 TryStartDiveNow(player.PlayerInput);
             }
@@ -4716,14 +4784,24 @@ namespace PuckUltimateFrisbeeMod
             if (IsTypingOrPaused()) return;
 
             var kb = UnityEngine.InputSystem.Keyboard.current;
+            var mouse = UnityEngine.InputSystem.Mouse.current;
+
+            // If holding a disc: Right-Click, R key, or Spacebar cancels the throw windup (Pump Fake!)
+            if (UltimateNetworkSync.IsPlayerHoldingAnyDisc(Body.Player.OwnerClientId))
+            {
+                bool cancelPressed = (kb != null && (kb.rKey.wasPressedThisFrame || kb.spaceKey.wasPressedThisFrame)) ||
+                                     (mouse != null && mouse.rightButton.wasPressedThisFrame);
+                if (cancelPressed)
+                {
+                    UltimateDiveMod.ClientSendCancelThrowAction();
+                }
+                return;
+            }
+
             bool divePressed = (kb != null && kb.fKey.wasPressedThisFrame);
 
             if (divePressed && (Time.unscaledTime - _lastDiveSendTime) >= ClientDiveCooldown)
             {
-                // Don't send if we are currently holding a disc
-                if (UltimateNetworkSync.IsPlayerHoldingAnyDisc(Body.Player.OwnerClientId))
-                    return;
-
                 _lastDiveSendTime = Time.unscaledTime;
                 UltimateDiveMod.ClientSendDiveAction();
             }
