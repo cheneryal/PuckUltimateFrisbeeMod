@@ -99,7 +99,21 @@ namespace PuckUltimateFrisbeeMod
         public static Vector3 ArmRotationOffset = new Vector3(180f, 180f, -0.1f);
         public static Vector3 ArmPositionOffset = new Vector3(0f, 0f, -0.12f);
         public static float ArmThicknessMultiplier = 1.0f;
-        public static float ArmLengthMultiplier = 0.65f;
+        public static float ArmLengthMultiplier = 0.58f;
+
+        // Horizontal vs Vertical Reach Tuning:
+        // Compresses horizontal stick protrusion while allowing FULL overhead high-catch & Hammer reach!
+        public static float ArmHorizontalCompression = 0.68f; // Pulls horizontal poke-check reach closer to body
+        public static float ArmMaxHorizontalReach = 1.05f;    // Max horizontal distance from shoulder
+        public static float ArmVerticalMultiplier = 1.25f;    // Amplifies vertical reach so you can sky high discs & throw Hammers!
+
+        // Legacy alias so any existing code referencing ArmReachCompression compiles cleanly
+        public static float ArmReachCompression
+        {
+            get => ArmHorizontalCompression;
+            set => ArmHorizontalCompression = value;
+        }
+
         public static float ArmScale
         {
             get => ArmThicknessMultiplier;
@@ -109,7 +123,6 @@ namespace PuckUltimateFrisbeeMod
         public static Vector3 DiscMeshRotationOffset = new Vector3(-90f, 0f, 0f);
         public static float DiscMeshScale = 2.5f;
 
-        // --- ADD THESE 3 LINES ---
         public static float DiscWorldRadius = 0.24f;
         public static float DiscHalfThickness = 0.035f;
         public static float WristRollMultiplier = 1.35f;
@@ -506,7 +519,15 @@ namespace PuckUltimateFrisbeeMod
         public static float EndzoneZThreshold = 32.0f;  // Goal lines at +/- 32m (64m central zone + two 18m endzones)
         public static float FieldHalfWidth = 18.5f;     // +/- 18.5m (37m total width)
         public static float BrickMarkZ = 14.0f;         // Brick Marks are 18m in front of each Goal Line (32m - 18m = +/- 14m)
-        public static float MarkerRadius = 4.5f;        // Defender must be within marking range (scaled for field size) to count Stall!
+        public static float MarkerRadius = 4.5f;        // Defender must be within marking range to count Stall!
+        public static float DoubleTeamRadius = 3.0f;    // 3m (10ft): Only 1 unguarded defender allowed within 3m of thrower!
+
+        // Momentum Carry-Over ("2-3 Step Grace Period") after catching on the run
+        public static float CatchMomentumGraceDuration = 0.65f;
+        public static float CatchMomentumDecelRate = 13.5f;
+        public static bool IsHolderPivotLocked = false;
+        public static Vector3 CatchInitialSpot = Vector3.zero;
+        public static bool CaughtInCentralZone = false;
 
         // Possession & Disc State
         public static Player Holder = null;
@@ -522,22 +543,24 @@ namespace PuckUltimateFrisbeeMod
         public static float ActiveFlightSpinSign = 1f; // +1f = CW, -1f = CCW
         public static float FirstGroundTouchTime = 0f;
         public static bool WasTippedInFlight = false;
+        public static bool WasDefensiveBlock = false;
         public static Player LastDeflector = null;
         public static float LastDeflectionTime = 0f;
         public static GamePhase LastObservedPhase = GamePhase.None;
         public static PlayerTeam LastTurnoverTeam = PlayerTeam.None;
 
-        // Out-of-Bounds Crossing Tracking (tracks the last in-bounds position before crossing a sideline/endline)
+        // Out-of-Bounds Crossing Tracking
         public static Vector3 LastInBoundsFlightPos = Vector3.zero;
         public static bool WentOutOfBoundsInFlight = false;
 
-        // Timers & Stall Count (Only increments when guarded by a Marker, or slowly if unguarded in 1v0 solo testing)
+        // Timers, Stall Count & Double-Team Tracking
         public static float CatchTime = 0f;
         public static float ReleaseTime = 0f;
         public static float StallCount = 0f;
         public static float StallDuration = 10.0f;
         public static int LastStallAnnounced = 0;
         public static Player ActiveMarker = null;
+        public static float LastDoubleTeamWarningTime = 0f;
 
         // Per-Disc state so multiple discs in Warmup can fly, tumble, and be held independently!
         public class DiscFlightState
@@ -551,12 +574,16 @@ namespace PuckUltimateFrisbeeMod
             public float ActiveFlightSpinSign = 1f;
             public float FirstGroundTouchTime = 0f;
             public bool WasTippedInFlight = false;
+            public bool WasDefensiveBlock = false;
             public Player LastDeflector = null;
             public float LastDeflectionTime = 0f;
             public float CatchTime = 0f;
             public float ReleaseTime = 0f;
             public Vector3 LastInBoundsFlightPos = Vector3.zero;
             public bool WentOutOfBoundsInFlight = false;
+            public bool IsHolderPivotLocked = false;
+            public Vector3 CatchInitialSpot = Vector3.zero;
+            public bool CaughtInCentralZone = false;
         }
 
         public static readonly Dictionary<Puck, DiscFlightState> DiscStates = new Dictionary<Puck, DiscFlightState>();
@@ -572,7 +599,100 @@ namespace PuckUltimateFrisbeeMod
             return state;
         }
 
-        // Last Disc Position Tracking (for client-side prediction of disc flight and bounce)
+        /// <summary>
+        /// Computes a natural human arm reach from the hockey stick:
+        /// - Compresses HORIZONTAL protrusion so the arm stays close to the torso.
+        /// - Preserves & boosts VERTICAL reach when aiming up so players can sky high discs and throw Hammers!
+        /// </summary>
+        public static Vector3 GetHandWorldPosition(Stick stick, out Vector3 shoulderAnchor, out Vector3 shaftDir)
+        {
+            if (stick == null)
+            {
+                shoulderAnchor = Vector3.zero;
+                shaftDir = Vector3.forward;
+                return Vector3.zero;
+            }
+
+            Player ownerPlayer = stick.Player;
+            PlayerBody body = stick.PlayerBody != null ? stick.PlayerBody : (ownerPlayer != null ? ownerPlayer.PlayerBody : null);
+            bool isLeft = ownerPlayer != null && ownerPlayer.Handedness != null && ownerPlayer.Handedness.Value == PlayerHandedness.Left;
+
+            Vector3 rawBladeTip = stick.BladeHandlePosition;
+            Vector3 rawShaftStart = stick.ShaftHandlePosition;
+
+            if (body != null)
+            {
+                // Anchor shoulder higher on the upper torso (y = 0.52m local)
+                Vector3 shoulderWorld = body.transform.TransformPoint(new Vector3(isLeft ? -0.28f : 0.28f, 0.52f, 0.06f));
+                shoulderAnchor = Vector3.Lerp(rawShaftStart, shoulderWorld, 0.65f);
+            }
+            else
+            {
+                shoulderAnchor = rawShaftStart;
+            }
+
+            Vector3 rawDelta = rawBladeTip - shoulderAnchor;
+
+            // 1. Compress ONLY the horizontal (X/Z) extension so the arm doesn't poke out 1.6m horizontally
+            Vector3 horizDelta = new Vector3(rawDelta.x, 0f, rawDelta.z);
+            float horizDist = horizDelta.magnitude;
+            if (horizDist > 0.001f)
+            {
+                float compressedHoriz = Mathf.Min(
+                    horizDist * UltimateVisualTuning.ArmHorizontalCompression,
+                    UltimateVisualTuning.ArmMaxHorizontalReach
+                );
+                horizDelta = (horizDelta / horizDist) * compressedHoriz;
+            }
+
+            // 2. Amplify vertical reach so raising the stick reaches high above the head
+            float vertDelta = rawDelta.y * UltimateVisualTuning.ArmVerticalMultiplier;
+
+            // 3. When aiming upward (Hammer / High Catch), the stick shaft also pitches up:
+            //    Use the shaft's upward angle to lift the hand into an overhead position!
+            Vector3 rawShaftVec = rawBladeTip - rawShaftStart;
+            if (rawShaftVec.sqrMagnitude > 0.01f)
+            {
+                Vector3 rawShaftDir = rawShaftVec.normalized;
+                if (rawShaftDir.y > 0.05f)
+                {
+                    // Add extra overhead extension when aiming up
+                    vertDelta += rawShaftDir.y * 0.45f * UltimateVisualTuning.ArmVerticalMultiplier;
+                }
+            }
+
+            //Also check PlayerInput pitch if available (negative X = looking up in Puck)
+            if (ownerPlayer != null && ownerPlayer.PlayerInput != null)
+            {
+                float aimPitchX = NetworkRoles.IsServer
+                    ? ownerPlayer.PlayerInput.StickRaycastOriginAngleInput.ServerValue.x
+                    : ownerPlayer.PlayerInput.StickRaycastOriginAngleInput.ClientValue.x;
+
+                if (aimPitchX < 0f)
+                {
+                    float overheadFactor = Mathf.Clamp01(-aimPitchX / 30f); // 0..1 as player looks up
+                    vertDelta += overheadFactor * 0.55f * UltimateVisualTuning.ArmVerticalMultiplier;
+                    // Pull hand slightly closer horizontally when reaching straight overhead (like a real Hammer/sky reach)
+                    horizDelta *= Mathf.Lerp(1.0f, 0.78f, overheadFactor);
+                }
+            }
+
+            Vector3 finalDelta = new Vector3(horizDelta.x, vertDelta, horizDelta.z);
+            if (finalDelta.sqrMagnitude < 0.005f)
+            {
+                shaftDir = body != null ? body.transform.forward : stick.transform.forward;
+                return shoulderAnchor + shaftDir * 0.55f;
+            }
+
+            shaftDir = finalDelta.normalized;
+            return shoulderAnchor + finalDelta;
+        }
+
+        public static Vector3 GetHandWorldPosition(Stick stick)
+        {
+            return GetHandWorldPosition(stick, out _, out _);
+        }
+
         public static Vector3 LastDiscFramePos = Vector3.zero;
         public static PlayerTeam GetTeam(Player player)
         {
@@ -606,11 +726,10 @@ namespace PuckUltimateFrisbeeMod
             public Vector2 PrevStickAngle = Vector2.zero;
             public float PrevAngularSpeed = 0f;
 
-            // Peak forward whip metrics (decays slightly over time so only a swing near release counts!)
-            public float PeakForwardSwingSpeed = 0f;       // m/s of hand movement
-            public float PeakForwardSwingAccel = 0f;       // m/s^2 of hand acceleration
-            public float PeakAngularWhipSpeed = 0f;        // deg/s of mouse aim whip
-            public float SmoothedSwingPowerBonus = 0f;     // 0.0 to 1.0 normalized swing contribution
+            public float PeakForwardSwingSpeed = 0f;
+            public float PeakForwardSwingAccel = 0f;
+            public float PeakAngularWhipSpeed = 0f;
+            public float SmoothedSwingPowerBonus = 0f;
 
             public const float FullChargeSeconds = 2.20f;
 
@@ -623,7 +742,7 @@ namespace PuckUltimateFrisbeeMod
 
                 if (body != null && stick != null)
                 {
-                    PrevLocalHandPos = body.transform.InverseTransformPoint(stick.BladeHandlePosition);
+                    PrevLocalHandPos = body.transform.InverseTransformPoint(GetHandWorldPosition(stick));
                 }
                 PrevLocalHandVel = Vector3.zero;
                 PrevStickAngle = stickAngle;
@@ -649,33 +768,27 @@ namespace PuckUltimateFrisbeeMod
 
                 if (body != null && stick != null)
                 {
-                    // 1. Measure 3D hand velocity & acceleration in PlayerBody local space
-                    Vector3 currentLocalHand = body.transform.InverseTransformPoint(stick.BladeHandlePosition);
+                    Vector3 currentLocalHand = body.transform.InverseTransformPoint(GetHandWorldPosition(stick));
                     Vector3 handVel = (currentLocalHand - PrevLocalHandPos) / dt;
                     Vector3 handAccel = (handVel - PrevLocalHandVel) / dt;
 
-                    // Forward whip is primarily +Z (reaching back to -X/+X and snapping forward toward +Z)
                     float forwardSpeed = Mathf.Max(0f, handVel.z) + Mathf.Abs(handVel.x) * 0.65f;
                     float forwardAccel = Mathf.Max(0f, handAccel.z) + Mathf.Abs(handAccel.x) * 0.5f;
 
-                    // 2. Measure 2D mouse stick angle whip speed & acceleration (deg/sec)
                     Vector2 angleDelta = currentStickAngle - PrevStickAngle;
                     float angularSpeed = angleDelta.magnitude / dt;
                     float angularAccel = Mathf.Max(0f, (angularSpeed - PrevAngularSpeed) / dt);
 
-                    // Decay old peaks slightly (half-life ~0.22s) so the player must swing right before release!
                     float decay = Mathf.Exp(-dt * 4.5f);
                     PeakForwardSwingSpeed = Mathf.Max(forwardSpeed, PeakForwardSwingSpeed * decay);
                     PeakForwardSwingAccel = Mathf.Max(forwardAccel, PeakForwardSwingAccel * decay);
                     PeakAngularWhipSpeed = Mathf.Max(angularSpeed, PeakAngularWhipSpeed * decay);
 
-                    // Normalize each component:
-                    // ~2.8 m/s hand speed = 100%, ~35 m/s^2 hand accel = 100%, ~220 deg/s mouse whip = 100%
-                    float speedNorm = Mathf.Clamp01(PeakForwardSwingSpeed / 2.8f);
-                    float accelNorm = Mathf.Clamp01(PeakForwardSwingAccel / 35.0f);
+                    // Adjusted thresholds for compressed hand reach
+                    float speedNorm = Mathf.Clamp01(PeakForwardSwingSpeed / 1.6f);
+                    float accelNorm = Mathf.Clamp01(PeakForwardSwingAccel / 20.0f);
                     float angularNorm = Mathf.Clamp01((PeakAngularWhipSpeed / 220.0f) + (angularAccel / 1800.0f) * 0.5f);
 
-                    // Combine velocity (50%), acceleration snap (30%), and angular mouse whip (20%)
                     SmoothedSwingPowerBonus = Mathf.Clamp01(
                         Mathf.Max(speedNorm * 0.55f + accelNorm * 0.45f, angularNorm * 0.85f)
                     );
@@ -691,7 +804,6 @@ namespace PuckUltimateFrisbeeMod
                     body.IsSprinting.Value = false;
                     if (body.Stamina != null)
                     {
-                        // Visually show total power (Stamina charge + Mouse Swing snap) on the Stamina bar!
                         float visualPower = GetCombinedThrowPower();
                         body.Stamina.Value = Mathf.Clamp01(1.0f - visualPower);
                     }
@@ -700,7 +812,6 @@ namespace PuckUltimateFrisbeeMod
 
             public float GetCombinedThrowPower()
             {
-                // Stamina hold gives up to 65% base power; Mouse Swing Velocity & Acceleration adds up to +45% (and allows quick-snap throws!)
                 float baseCharge = StaminaUsed * 0.65f;
                 float swingContribution = SmoothedSwingPowerBonus * 0.45f;
                 return Mathf.Clamp01(baseCharge + swingContribution);
@@ -744,6 +855,7 @@ namespace PuckUltimateFrisbeeMod
                 Holder.PlayerBody.Server_Unfreeze();
             }
             Holder = null;
+            IsHolderPivotLocked = false;
             LastThrower = null;
             SecondLastThrower = null;
             IsDiscInFlight = false;
@@ -752,7 +864,9 @@ namespace PuckUltimateFrisbeeMod
             StallCount = 0f;
             LastStallAnnounced = 0;
             ActiveMarker = null;
+            LastDoubleTeamWarningTime = 0f;
             WasTippedInFlight = false;
+            WasDefensiveBlock = false;
             LastDeflector = null;
             LastDeflectionTime = 0f;
             LastTurnoverTeam = PlayerTeam.None;
@@ -770,7 +884,6 @@ namespace PuckUltimateFrisbeeMod
 
         public static bool IsPositionOutOfBounds(Vector3 pos)
         {
-            // In Ultimate Frisbee, the perimeter lines themselves are Out-of-Bounds!
             return Mathf.Abs(pos.x) >= FieldHalfWidth || Mathf.Abs(pos.z) >= FieldHalfLength;
         }
 
@@ -782,18 +895,18 @@ namespace PuckUltimateFrisbeeMod
 
             bool isLeftHanded = holder.Handedness != null && holder.Handedness.Value == PlayerHandedness.Left;
 
-            Vector3 localHand = holder.PlayerBody.transform.InverseTransformPoint(holder.Stick.BladeHandlePosition);
+            Vector3 localHand = holder.PlayerBody.transform.InverseTransformPoint(GetHandWorldPosition(holder.Stick));
             float wristRoll = holder.Stick.BladeAngle;
 
             bool isForehandSide;
             if (!isLeftHanded)
             {
-                isForehandSide = (localHand.x >= 0.08f) || (localHand.x > -0.08f && wristRoll < -6f);
+                isForehandSide = (localHand.x >= 0.05f) || (localHand.x > -0.05f && wristRoll < -6f);
                 spinSign = isForehandSide ? -1f : 1f;
             }
             else
             {
-                isForehandSide = (localHand.x <= -0.08f) || (localHand.x < 0.08f && wristRoll > 6f);
+                isForehandSide = (localHand.x <= -0.05f) || (localHand.x < 0.05f && wristRoll > 6f);
                 spinSign = isForehandSide ? 1f : -1f;
             }
 
@@ -838,7 +951,6 @@ namespace PuckUltimateFrisbeeMod
 
         public static PlayerTeam? GetEndzoneTeamAtPosition(Vector3 pos)
         {
-            // Blue defends North (+Z >= +32m), Red defends South (-Z <= -32m)
             if (pos.z >= EndzoneZThreshold) return PlayerTeam.Blue;
             if (pos.z <= -EndzoneZThreshold) return PlayerTeam.Red;
             return null;
@@ -1007,7 +1119,6 @@ namespace PuckUltimateFrisbeeMod
         {
             if (Stick == null) return;
 
-            // Keep vanilla stick mesh hidden on all remote/local sticks in case the game re-enabled it on skin/team update
             if (Stick.StickMesh != null)
             {
                 foreach (var r in Stick.StickMesh.GetComponentsInChildren<Renderer>(true))
@@ -1016,32 +1127,16 @@ namespace PuckUltimateFrisbeeMod
                 }
             }
 
-           Player ownerPlayer = Stick.Player;
+            Player ownerPlayer = Stick.Player;
             if (ownerPlayer != null)
             {
                 UpdateWristbandTeamColor(UltimateRulesManager.GetTeam(ownerPlayer));
             }
-            PlayerBody body = Stick.PlayerBody != null ? Stick.PlayerBody : (ownerPlayer != null ? ownerPlayer.PlayerBody : null);
 
             bool isLeft = ownerPlayer != null && ownerPlayer.Handedness != null && ownerPlayer.Handedness.Value == PlayerHandedness.Left;
 
-            Vector3 bladeTip = Stick.BladeHandlePosition;
-            Vector3 shaftStart = Stick.ShaftHandlePosition;
-
-            if (body != null)
-            {
-                Vector3 shoulderWorld = body.transform.TransformPoint(new Vector3(isLeft ? -0.32f : 0.32f, 0.35f, 0.05f));
-                shaftStart = Vector3.Lerp(Stick.ShaftHandlePosition, shoulderWorld, 0.35f);
-            }
-
-            Vector3 shaftVector = (bladeTip - shaftStart);
-            float shaftLength = shaftVector.magnitude;
-            if (shaftLength < 0.05f)
-            {
-                shaftVector = body != null ? body.transform.forward : Stick.transform.forward;
-                shaftLength = 1.15f;
-            }
-            Vector3 shaftDir = shaftVector / shaftLength;
+            Vector3 bladeTip = UltimateRulesManager.GetHandWorldPosition(Stick, out Vector3 shaftStart, out Vector3 shaftDir);
+            float armSpanDistance = Mathf.Clamp(Vector3.Distance(bladeTip, shaftStart), 0.45f, 1.35f);
 
             Quaternion lookRot = Quaternion.LookRotation(shaftDir, Vector3.up);
             float wristRoll = Stick.BladeAngle * UltimateVisualTuning.WristRollMultiplier;
@@ -1051,31 +1146,32 @@ namespace PuckUltimateFrisbeeMod
             {
                 Quaternion finalRot = aimRot * Quaternion.Euler(UltimateVisualTuning.ArmRotationOffset);
 
-                float baseScale = (1.15f / Mathf.Max(0.1f, NativeModelLength)) * UltimateVisualTuning.ArmLengthMultiplier;
-                float widthScale = baseScale * UltimateVisualTuning.ArmThicknessMultiplier;
+                // Scale the arm length dynamically with the actual shoulder-to-hand span so it never looks like a floating stub!
+                float targetWorldLen = armSpanDistance * UltimateVisualTuning.ArmLengthMultiplier * 1.45f;
+                float lengthScale = targetWorldLen / Mathf.Max(0.1f, NativeModelLength);
+                float widthScale = (1.15f / Mathf.Max(0.1f, NativeModelLength)) * 0.55f * UltimateVisualTuning.ArmThicknessMultiplier;
 
                 Vector3 scaleVec = new Vector3(widthScale, widthScale, widthScale);
-                if (LongestLocalAxis == 0) scaleVec.x = baseScale;
-                else if (LongestLocalAxis == 1) scaleVec.y = baseScale;
-                else scaleVec.z = baseScale;
+                if (LongestLocalAxis == 0) scaleVec.x = lengthScale;
+                else if (LongestLocalAxis == 1) scaleVec.y = lengthScale;
+                else scaleVec.z = lengthScale;
 
                 if (isLeft) scaleVec.x = -scaleVec.x;
 
                 CustomArmInstance.localScale = scaleVec;
                 CustomArmInstance.rotation = finalRot;
 
-                float totalWorldLength = NativeModelLength * baseScale;
                 Vector3 worldCenterOffset = finalRot * Vector3.Scale(NativeModelCenterOffset, scaleVec);
 
-                Vector3 desiredCenterPos = bladeTip - (shaftDir * (totalWorldLength * 0.35f)) + (aimRot * UltimateVisualTuning.ArmPositionOffset);
+                // Position the arm so the hand is at bladeTip and the forearm stretches back to the shoulder
+                Vector3 desiredCenterPos = bladeTip - (shaftDir * (targetWorldLen * 0.35f)) + (aimRot * UltimateVisualTuning.ArmPositionOffset);
                 CustomArmInstance.position = desiredCenterPos - worldCenterOffset;
             }
             else if (ProceduralArmCylinder != null && ProceduralHandPalm != null)
             {
-                // Multiplayer fallback if asset bundle isn't present on a client
                 ProceduralArmCylinder.position = Vector3.Lerp(shaftStart, bladeTip, 0.5f);
                 ProceduralArmCylinder.rotation = aimRot * Quaternion.Euler(90f, 0f, 0f);
-                ProceduralArmCylinder.localScale = new Vector3(0.11f, shaftLength * 0.45f, 0.11f);
+                ProceduralArmCylinder.localScale = new Vector3(0.11f, armSpanDistance * 0.45f, 0.11f);
 
                 ProceduralHandPalm.position = bladeTip;
                 ProceduralHandPalm.rotation = aimRot;
@@ -1236,16 +1332,9 @@ namespace PuckUltimateFrisbeeMod
             Stick stick = holder.Stick;
             bool isLeft = holder.Handedness != null && holder.Handedness.Value == PlayerHandedness.Left;
 
-            Vector3 shoulderWorld = holder.PlayerBody.transform.TransformPoint(new Vector3(isLeft ? -0.32f : 0.32f, 0.35f, 0.05f));
-            Vector3 shaftStart = Vector3.Lerp(stick.ShaftHandlePosition, shoulderWorld, 0.35f);
-            Vector3 bladeTip = stick.BladeHandlePosition;
-
-            Vector3 shaftDir = (bladeTip - shaftStart);
-            if (shaftDir.sqrMagnitude < 0.001f) shaftDir = holder.PlayerBody.transform.forward;
-            shaftDir.Normalize();
+            Vector3 bladeTip = UltimateRulesManager.GetHandWorldPosition(stick, out _, out Vector3 shaftDir);
 
             Quaternion lookRot = Quaternion.LookRotation(shaftDir, Vector3.up);
-            // Smoothly follow scroll wheel in both directions without snapping!
             float wristRoll = stick.BladeAngle * UltimateVisualTuning.WristRollMultiplier;
             Quaternion handGripRot = lookRot * Quaternion.Euler(0f, 0f, wristRoll);
 
@@ -1255,7 +1344,6 @@ namespace PuckUltimateFrisbeeMod
             discPos = bladeTip + (handGripRot * localOffset);
             discRot = handGripRot * Quaternion.Euler(UltimateVisualTuning.HeldDiscPitchOffset);
 
-            // Prevent held disc rim from clipping into the grass when aiming low
             float minY = GetMinimumCenterHeightForRotation(discRot);
             if (discPos.y < minY) discPos.y = minY;
         }
@@ -1295,46 +1383,58 @@ namespace PuckUltimateFrisbeeMod
         {
             if (!_showTunerGUI) return;
 
-            GUI.Box(new Rect(20, 120, 420, 290), "ULTIMATE VISUAL TUNER (F8 to Hide)");
+            GUI.Box(new Rect(20, 120, 430, 390), "ULTIMATE VISUAL TUNER (F8 to Hide)");
             int y = 148;
 
             GUI.Label(new Rect(35, y, 390, 22), "Keys: Arrows = X/Z | I/K (PgUp/Dn) = Y Height | [ / ] = Pitch");
             y += 26;
 
             Vector3 off = UltimateVisualTuning.HeldDiscHandOffset;
-            GUI.Label(new Rect(35, y, 160, 20), $"Disc Offset X: {off.x:F3}");
-            off.x = GUI.HorizontalSlider(new Rect(200, y + 4, 220, 20), off.x, -0.35f, 0.35f);
+            GUI.Label(new Rect(35, y, 165, 20), $"Disc Offset X: {off.x:F3}");
+            off.x = GUI.HorizontalSlider(new Rect(205, y + 4, 215, 20), off.x, -0.35f, 0.35f);
             y += 24;
 
-            GUI.Label(new Rect(35, y, 160, 20), $"Disc Offset Y: {off.y:F3}");
-            off.y = GUI.HorizontalSlider(new Rect(200, y + 4, 220, 20), off.y, -0.25f, 0.35f);
+            GUI.Label(new Rect(35, y, 165, 20), $"Disc Offset Y: {off.y:F3}");
+            off.y = GUI.HorizontalSlider(new Rect(205, y + 4, 215, 20), off.y, -0.25f, 0.35f);
             y += 24;
 
-            GUI.Label(new Rect(35, y, 160, 20), $"Disc Offset Z: {off.z:F3}");
-            off.z = GUI.HorizontalSlider(new Rect(200, y + 4, 220, 20), off.z, -0.10f, 0.60f);
+            GUI.Label(new Rect(35, y, 165, 20), $"Disc Offset Z: {off.z:F3}");
+            off.z = GUI.HorizontalSlider(new Rect(205, y + 4, 215, 20), off.z, -0.10f, 0.60f);
             UltimateVisualTuning.HeldDiscHandOffset = off;
             y += 24;
 
             Vector3 pitch = UltimateVisualTuning.HeldDiscPitchOffset;
-            GUI.Label(new Rect(35, y, 160, 20), $"Disc Pitch X: {pitch.x:F1}°");
-            pitch.x = GUI.HorizontalSlider(new Rect(200, y + 4, 220, 20), pitch.x, -60f, 45f);
+            GUI.Label(new Rect(35, y, 165, 20), $"Disc Pitch X: {pitch.x:F1}°");
+            pitch.x = GUI.HorizontalSlider(new Rect(205, y + 4, 215, 20), pitch.x, -60f, 45f);
             y += 24;
 
-            GUI.Label(new Rect(35, y, 160, 20), $"Disc Roll Z: {pitch.z:F1}°");
-            pitch.z = GUI.HorizontalSlider(new Rect(200, y + 4, 220, 20), pitch.z, -45f, 45f);
+            GUI.Label(new Rect(35, y, 165, 20), $"Disc Roll Z: {pitch.z:F1}°");
+            pitch.z = GUI.HorizontalSlider(new Rect(205, y + 4, 215, 20), pitch.z, -45f, 45f);
             UltimateVisualTuning.HeldDiscPitchOffset = pitch;
             y += 24;
 
-            GUI.Label(new Rect(35, y, 160, 20), $"Disc Scale: {UltimateVisualTuning.DiscMeshScale:F2}");
-            UltimateVisualTuning.DiscMeshScale = GUI.HorizontalSlider(new Rect(200, y + 4, 220, 20), UltimateVisualTuning.DiscMeshScale, 0.3f, 2.0f);
+            GUI.Label(new Rect(35, y, 165, 20), $"Horiz Reach: {UltimateVisualTuning.ArmHorizontalCompression:F2}");
+            UltimateVisualTuning.ArmHorizontalCompression = GUI.HorizontalSlider(new Rect(205, y + 4, 215, 20), UltimateVisualTuning.ArmHorizontalCompression, 0.35f, 1.0f);
             y += 24;
 
-            GUI.Label(new Rect(35, y, 160, 20), $"Arm Thickness: {UltimateVisualTuning.ArmThicknessMultiplier:F2}");
-            UltimateVisualTuning.ArmThicknessMultiplier = GUI.HorizontalSlider(new Rect(200, y + 4, 220, 20), UltimateVisualTuning.ArmThicknessMultiplier, 0.5f, 3.0f);
+            GUI.Label(new Rect(35, y, 165, 20), $"Max Horiz (m): {UltimateVisualTuning.ArmMaxHorizontalReach:F2}");
+            UltimateVisualTuning.ArmMaxHorizontalReach = GUI.HorizontalSlider(new Rect(205, y + 4, 215, 20), UltimateVisualTuning.ArmMaxHorizontalReach, 0.50f, 1.60f);
+            y += 24;
+
+            GUI.Label(new Rect(35, y, 165, 20), $"Vert/High Reach: {UltimateVisualTuning.ArmVerticalMultiplier:F2}");
+            UltimateVisualTuning.ArmVerticalMultiplier = GUI.HorizontalSlider(new Rect(205, y + 4, 215, 20), UltimateVisualTuning.ArmVerticalMultiplier, 0.80f, 2.00f);
+            y += 24;
+
+            GUI.Label(new Rect(35, y, 165, 20), $"Arm Length: {UltimateVisualTuning.ArmLengthMultiplier:F2}");
+            UltimateVisualTuning.ArmLengthMultiplier = GUI.HorizontalSlider(new Rect(205, y + 4, 215, 20), UltimateVisualTuning.ArmLengthMultiplier, 0.30f, 1.20f);
+            y += 24;
+
+            GUI.Label(new Rect(35, y, 165, 20), $"Arm Thickness: {UltimateVisualTuning.ArmThicknessMultiplier:F2}");
+            UltimateVisualTuning.ArmThicknessMultiplier = GUI.HorizontalSlider(new Rect(205, y + 4, 215, 20), UltimateVisualTuning.ArmThicknessMultiplier, 0.5f, 2.5f);
             y += 28;
 
-            string codeSnippet = $"Offset=({off.x:F3}f, {off.y:F3}f, {off.z:F3}f) | Pitch=({pitch.x:F1}f, 0f, {pitch.z:F1}f) | Scale={UltimateVisualTuning.DiscMeshScale:F2}f";
-            GUI.TextField(new Rect(35, y, 385, 22), codeSnippet);
+            string codeSnippet = $"HReach={UltimateVisualTuning.ArmHorizontalCompression:F2}f | MaxH={UltimateVisualTuning.ArmMaxHorizontalReach:F2}f | VMult={UltimateVisualTuning.ArmVerticalMultiplier:F2}f | ArmLen={UltimateVisualTuning.ArmLengthMultiplier:F2}f";
+            GUI.TextField(new Rect(35, y, 395, 22), codeSnippet);
         }
 
         private void LateUpdate()
@@ -1462,7 +1562,7 @@ namespace PuckUltimateFrisbeeMod
     }
 
     // =========================================================================
-    // 8. SERVER DISC PHYSICS, STAMINA-POWERED THROWS & RULES (Puck.FixedUpdate)
+     // 8. SERVER DISC PHYSICS, STAMINA-POWERED THROWS & RULES (Puck.FixedUpdate)
     // =========================================================================
     [HarmonyPatch(typeof(Puck), "FixedUpdate")]
     public static class Puck_UltimatePhysicsAndCatch_Patch
@@ -1479,12 +1579,16 @@ namespace PuckUltimateFrisbeeMod
             UltimateRulesManager.ActiveFlightSpinSign = ds.ActiveFlightSpinSign;
             UltimateRulesManager.FirstGroundTouchTime = ds.FirstGroundTouchTime;
             UltimateRulesManager.WasTippedInFlight = ds.WasTippedInFlight;
+            UltimateRulesManager.WasDefensiveBlock = ds.WasDefensiveBlock;
             UltimateRulesManager.LastDeflector = ds.LastDeflector;
             UltimateRulesManager.LastDeflectionTime = ds.LastDeflectionTime;
             UltimateRulesManager.CatchTime = ds.CatchTime;
             UltimateRulesManager.ReleaseTime = ds.ReleaseTime;
             UltimateRulesManager.LastInBoundsFlightPos = ds.LastInBoundsFlightPos;
             UltimateRulesManager.WentOutOfBoundsInFlight = ds.WentOutOfBoundsInFlight;
+            UltimateRulesManager.IsHolderPivotLocked = ds.IsHolderPivotLocked;
+            UltimateRulesManager.CatchInitialSpot = ds.CatchInitialSpot;
+            UltimateRulesManager.CaughtInCentralZone = ds.CaughtInCentralZone;
         }
 
         private static void SaveDiscState(UltimateRulesManager.DiscFlightState ds)
@@ -1499,12 +1603,16 @@ namespace PuckUltimateFrisbeeMod
             ds.ActiveFlightSpinSign = UltimateRulesManager.ActiveFlightSpinSign;
             ds.FirstGroundTouchTime = UltimateRulesManager.FirstGroundTouchTime;
             ds.WasTippedInFlight = UltimateRulesManager.WasTippedInFlight;
+            ds.WasDefensiveBlock = UltimateRulesManager.WasDefensiveBlock;
             ds.LastDeflector = UltimateRulesManager.LastDeflector;
             ds.LastDeflectionTime = UltimateRulesManager.LastDeflectionTime;
             ds.CatchTime = UltimateRulesManager.CatchTime;
             ds.ReleaseTime = UltimateRulesManager.ReleaseTime;
             ds.LastInBoundsFlightPos = UltimateRulesManager.LastInBoundsFlightPos;
             ds.WentOutOfBoundsInFlight = UltimateRulesManager.WentOutOfBoundsInFlight;
+            ds.IsHolderPivotLocked = UltimateRulesManager.IsHolderPivotLocked;
+            ds.CatchInitialSpot = UltimateRulesManager.CatchInitialSpot;
+            ds.CaughtInCentralZone = UltimateRulesManager.CaughtInCentralZone;
         }
 
         [HarmonyPostfix]
@@ -1526,7 +1634,6 @@ namespace PuckUltimateFrisbeeMod
 
             try
             {
-                // --- RELIABLE FACEOFF LINEUP & PULL START HANDLER ---
                 if (NetworkBehaviourSingleton<GameManager>.Instance != null)
                 {
                     GamePhase currentPhase = NetworkBehaviourSingleton<GameManager>.Instance.Phase;
@@ -1544,7 +1651,6 @@ namespace PuckUltimateFrisbeeMod
                     }
                 }
 
-                // --- PULL OFFSIDES RULE: Keep both teams behind their Goal Lines until the Pull is released! ---
                 if (!isWarmup && UltimateRulesManager.IsPullPlay)
                 {
                     EnforcePrePullGoalLineOffsides();
@@ -1559,15 +1665,50 @@ namespace PuckUltimateFrisbeeMod
                     if (!holder.IsCharacterSpawned || holder.Stick == null || holder.PlayerBody == null || holder.PlayerInput == null)
                     {
                         UltimateRulesManager.Holder = null;
+                        UltimateRulesManager.IsHolderPivotLocked = false;
                         UltimateNetworkSync.ServerBroadcastHolderState(null, 0, __instance);
                         rb.isKinematic = false;
                         __instance.Server_Unfreeze();
                         return;
                     }
 
-                    holder.PlayerBody.Server_Freeze((RigidbodyConstraints)10);
-                    Vector3 bodyVel = holder.PlayerBody.Rigidbody.linearVelocity;
-                    holder.PlayerBody.Rigidbody.linearVelocity = new Vector3(0f, bodyVel.y, 0f);
+                    float holdTime = Time.time - UltimateRulesManager.CatchTime;
+                    Rigidbody bodyRb = holder.PlayerBody.Rigidbody;
+
+                    // --- MOMENTUM CARRY-OVER GRACE PERIOD (2-3 Step Deceleration Stop) ---
+                    if (!UltimateRulesManager.IsHolderPivotLocked)
+                    {
+                        Vector3 bodyVel = bodyRb.linearVelocity;
+                        Vector3 horizVel = new Vector3(bodyVel.x, 0f, bodyVel.z);
+                        float horizSpeed = horizVel.magnitude;
+
+                        if (holdTime < UltimateRulesManager.CatchMomentumGraceDuration && horizSpeed > 0.45f)
+                        {
+                            // Smoothly decelerate the runner's momentum instead of jarring instant freeze
+                            Vector3 newHorizVel = Vector3.MoveTowards(
+                                horizVel,
+                                Vector3.zero,
+                                UltimateRulesManager.CatchMomentumDecelRate * Time.fixedDeltaTime
+                            );
+                            bodyRb.linearVelocity = new Vector3(newHorizVel.x, bodyVel.y, newHorizVel.z);
+
+                            // Keep player upright while skidding/stopping
+                            Vector3 angVel = bodyRb.angularVelocity;
+                            bodyRb.angularVelocity = new Vector3(0f, angVel.y, 0f);
+                        }
+                        else
+                        {
+                            // Establish Pivot Foot!
+                            UltimateRulesManager.IsHolderPivotLocked = true;
+                            EstablishPivotAfterMomentumStop(holder, isWarmup);
+                        }
+                    }
+                    else
+                    {
+                        holder.PlayerBody.Server_Freeze((RigidbodyConstraints)10);
+                        Vector3 bodyVel = bodyRb.linearVelocity;
+                        bodyRb.linearVelocity = new Vector3(0f, bodyVel.y, 0f);
+                    }
 
                     rb.isKinematic = true;
 
@@ -1588,7 +1729,7 @@ namespace PuckUltimateFrisbeeMod
                     rb.rotation = discRot;
                     __instance.transform.SetPositionAndRotation(gripPos, discRot);
 
-                    Vector3 handPos = holder.Stick.BladeHandlePosition;
+                    Vector3 handPos = UltimateRulesManager.GetHandWorldPosition(holder.Stick);
                     Vector3 aimForward = (handPos - holder.PlayerBody.transform.position);
                     aimForward.y = 0f;
                     if (aimForward.sqrMagnitude < 0.001f) aimForward = holder.PlayerBody.transform.forward;
@@ -1605,7 +1746,6 @@ namespace PuckUltimateFrisbeeMod
 
                     bool isHoldingShift = holder.PlayerInput.SprintInput.ServerValue;
                     Vector2 currentStickAngle = holder.PlayerInput.StickRaycastOriginAngleInput.ServerValue;
-                    float holdTime = Time.time - UltimateRulesManager.CatchTime;
 
                     if (holder.PlayerBody.IsSprinting != null)
                     {
@@ -1617,7 +1757,7 @@ namespace PuckUltimateFrisbeeMod
                         if (holder.PlayerBody.Stamina != null)
                             holder.PlayerBody.Stamina.Value = 1.0f;
 
-                        if (isHoldingShift && holdTime > 0.20f)
+                        if (isHoldingShift && holdTime > 0.16f)
                         {
                             tracker.BeginCharge(holder.PlayerBody, holder.Stick, currentStickAngle);
                         }
@@ -1635,7 +1775,7 @@ namespace PuckUltimateFrisbeeMod
                         }
                     }
 
-                    // --- REAL ULTIMATE MARKER-BASED 10-SECOND STALL COUNT ---
+                    // --- REAL ULTIMATE MARKER-BASED 10-SECOND STALL COUNT & DOUBLE-TEAM CHECK ---
                     if (!isWarmup && !UltimateRulesManager.IsPullPlay)
                     {
                         UpdateMarkerAndStallCount(__instance, holder, tracker, aimForward, spinByte, rb);
@@ -1686,16 +1826,22 @@ namespace PuckUltimateFrisbeeMod
                         if (!player.IsCharacterSpawned || player.Stick == null || player.PlayerBody == null)
                             continue;
 
-                        // Don't let a player who is already holding another disc in Warmup catch a second disc simultaneously!
                         if (isWarmup && UltimateNetworkSync.IsPlayerHoldingAnyDisc(player.OwnerClientId))
                             continue;
 
                         PlayerTeam playerTeam = UltimateRulesManager.GetTeam(player);
 
-                        if (player == UltimateRulesManager.LastThrower && timeSinceRelease < 0.35f && !UltimateRulesManager.WasTippedInFlight)
-                            continue;
+                        // Prevent thrower from immediately re-catching their own release OR catching a point-blank defensive hand-block!
+                        if (player == UltimateRulesManager.LastThrower)
+                        {
+                            if (timeSinceRelease < 0.35f && !UltimateRulesManager.WasTippedInFlight)
+                                continue;
+                            if (UltimateRulesManager.WasDefensiveBlock)
+                                continue;
+                        }
 
-                        Vector3 handPos = player.Stick.BladeHandlePosition;
+                        // Use the compressed hand position for all catch & tip checks!
+                        Vector3 handPos = UltimateRulesManager.GetHandWorldPosition(player.Stick, out _, out Vector3 shaftDir);
                         Vector3 bodyBasePos = player.PlayerBody.transform.position;
                         bool isDiving = UltimateDiveMod.IsPlayerDiving(player);
 
@@ -1704,7 +1850,6 @@ namespace PuckUltimateFrisbeeMod
 
                         Vector3 chestCatchPt = bodyBasePos + Vector3.up * 1.05f + player.PlayerBody.transform.forward * 0.25f;
                         float chestDist = Vector3.Distance(closestDiscPt, chestCatchPt);
-                        
 
                         // 1. GROUND PICKUP
                         if (!isAirborne)
@@ -1732,7 +1877,7 @@ namespace PuckUltimateFrisbeeMod
                                     if (!isOnTurnoverTeam && !isThrowerAfterOwnTurnover &&
                                         (UltimateRulesManager.OffensiveTeam == PlayerTeam.None || playerTeam == UltimateRulesManager.OffensiveTeam))
                                     {
-                                        canPickup = true;
+         	                            canPickup = true;
                                     }
                                 }
 
@@ -1751,25 +1896,31 @@ namespace PuckUltimateFrisbeeMod
 
                         bool canAttemptAirPlay = isWarmup ||
                                                  (player != UltimateRulesManager.LastThrower) ||
-                                                 UltimateRulesManager.WasTippedInFlight;
+                                                 (UltimateRulesManager.WasTippedInFlight && !UltimateRulesManager.WasDefensiveBlock);
 
                         if (!canAttemptAirPlay)
                             continue;
 
-                        Vector3 shaftDir = (handPos - player.Stick.ShaftHandlePosition);
-                        if (shaftDir.sqrMagnitude < 0.001f) shaftDir = player.PlayerBody.transform.forward;
-                        Quaternion handAimRot = Quaternion.LookRotation(shaftDir.normalized, Vector3.up) *
+                        // Point-blank defender mark check: Within 0.22s of release and within 3.2m of thrower,
+                        // a defender's hand block swats the disc straight down instead of catching it cleanly!
+                        bool isPointBlankMarkBlock = !isWarmup &&
+                                                     UltimateRulesManager.LastThrower != null &&
+                                                     UltimateRulesManager.AreOpponents(player, UltimateRulesManager.LastThrower) &&
+                                                     timeSinceRelease < 0.22f &&
+                                                     Vector3.Distance(bodyBasePos, UltimateRulesManager.LastThrower.PlayerBody.transform.position) < 3.2f;
+
+                        Quaternion handAimRot = Quaternion.LookRotation(shaftDir, Vector3.up) *
                                                 Quaternion.Euler(0f, 0f, player.Stick.BladeAngle * UltimateVisualTuning.WristRollMultiplier);
                         Vector3 handNormal = handAimRot * Vector3.up;
                         float handPlaneMatch = Mathf.Abs(Vector3.Dot(handNormal, discUp));
 
-                        float baseCatchRadius = Mathf.Lerp(0.33f, 0.58f, Mathf.Pow(discFlatness, 0.85f));
+                        float baseCatchRadius = Mathf.Lerp(0.35f, 0.60f, Mathf.Pow(discFlatness, 0.85f));
                         float wristMatchBonus = bladeFactor * handPlaneMatch * 0.14f;
                         float speedPenalty = Mathf.Lerp(0f, 0.07f, Mathf.Clamp01((discSpeed - 12f) / 10f)) * bladeFactor;
                         float cleanCatchRadius = baseCatchRadius + wristMatchBonus - speedPenalty;
                         if (isDiving)
                         {
-                            cleanCatchRadius += 0.28f; // Layout catch reach bonus!
+                            cleanCatchRadius += 0.28f;
                         }
 
                         bool isRecoveringOwnBobble = UltimateRulesManager.WasTippedInFlight &&
@@ -1780,8 +1931,8 @@ namespace PuckUltimateFrisbeeMod
                             cleanCatchRadius = Mathf.Max(cleanCatchRadius, 0.64f);
                         }
 
-                        bool caughtByHand = (sweptHandDist <= cleanCatchRadius);
-                        bool caughtInBreadbasket = (discFlatness > 0.72f && chestDist <= 0.42f && sweptHandDist <= 0.80f);
+                        bool caughtByHand = !isPointBlankMarkBlock && (sweptHandDist <= cleanCatchRadius);
+                        bool caughtInBreadbasket = !isPointBlankMarkBlock && (discFlatness > 0.72f && chestDist <= 0.42f && sweptHandDist <= 0.80f);
 
                         // A. CLEAN HAND CATCH
                         if (caughtByHand || caughtInBreadbasket)
@@ -1793,8 +1944,8 @@ namespace PuckUltimateFrisbeeMod
                         if (player == UltimateRulesManager.LastDeflector && (Time.time - UltimateRulesManager.LastDeflectionTime < 0.45f))
                             continue;
 
-                        // B. BLADED RIM GRAZE / DEFENSIVE HAND SWAT
-                        float outerTipRadius = Mathf.Lerp(0.62f, 0.70f, bladeFactor) + (isDiving ? 0.25f : 0f);
+                        // B. BLADED RIM GRAZE / DEFENSIVE HAND BLOCK
+                        float outerTipRadius = Mathf.Lerp(0.64f, 0.72f, bladeFactor) + (isDiving ? 0.25f : 0f);
                         if (sweptHandDist <= outerTipRadius)
                         {
                             ApplyAirborneDeflection(__instance, rb, player, handPos, isHandTip: true, bladeFactor: bladeFactor);
@@ -1854,7 +2005,7 @@ namespace PuckUltimateFrisbeeMod
                         return;
                     }
 
-                    if (rimTouchingGround && timeSinceRelease > 0.18f && !UltimateRulesManager.IsDiscTumblingOnGround)
+                    if (rimTouchingGround && timeSinceRelease > 0.08f && !UltimateRulesManager.IsDiscTumblingOnGround)
                     {
                         UltimateRulesManager.IsDiscTumblingOnGround = true;
                         UltimateRulesManager.FirstGroundTouchTime = Time.time;
@@ -1968,6 +2119,8 @@ namespace PuckUltimateFrisbeeMod
             float closestDist = float.MaxValue;
             Vector3 holderPos = holder.PlayerBody.transform.position;
 
+            var defendersInDoubleTeamZone = new List<Player>();
+
             foreach (var p in allPlayers)
             {
                 if (p == null || p == holder || !p.IsCharacterSpawned || p.PlayerBody == null)
@@ -1982,6 +2135,79 @@ namespace PuckUltimateFrisbeeMod
                     closestDist = d;
                     closestDefender = p;
                 }
+
+                // Check if this defender is inside the 3.0m (10ft) Marking Zone
+                if (d <= UltimateRulesManager.DoubleTeamRadius)
+                {
+                    defendersInDoubleTeamZone.Add(p);
+                }
+            }
+
+            // --- DOUBLE-TEAM DETECTION & ENFORCEMENT ---
+            // A second defender is only legally allowed inside 3.0m if they are actively guarding another offensive player within 3.5m
+            int illegalDoubleTeamers = 0;
+            if (defendersInDoubleTeamZone.Count > 1 && closestDefender != null)
+            {
+                foreach (var def in defendersInDoubleTeamZone)
+                {
+                    if (def == closestDefender) continue;
+
+                    bool isGuardingAnotherAttacker = false;
+                    Vector3 defPos = def.PlayerBody.transform.position;
+
+                    foreach (var other in allPlayers)
+                    {
+                        if (other == null || other == holder || !other.IsCharacterSpawned || other.PlayerBody == null)
+                            continue;
+                        if (UltimateRulesManager.GetTeam(other) == holderTeam)
+                        {
+                            if (Vector3.Distance(defPos, other.PlayerBody.transform.position) <= 3.5f)
+                            {
+                                isGuardingAnotherAttacker = true;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (!isGuardingAnotherAttacker)
+                    {
+                        illegalDoubleTeamers++;
+
+                        // Gently push the illegal second marker back to the 3.0m perimeter so they can't smother the thrower
+                        Vector3 pushDir = (defPos - holderPos);
+                        pushDir.y = 0f;
+                        if (pushDir.sqrMagnitude < 0.001f) pushDir = -def.PlayerBody.transform.forward;
+                        pushDir.Normalize();
+
+                        Vector3 legalPerimeterPos = holderPos + pushDir * (UltimateRulesManager.DoubleTeamRadius + 0.08f);
+                        legalPerimeterPos.y = defPos.y;
+                        def.PlayerBody.transform.position = legalPerimeterPos;
+                        if (def.PlayerBody.Rigidbody != null)
+                        {
+                            def.PlayerBody.Rigidbody.position = legalPerimeterPos;
+                            Vector3 v = def.PlayerBody.Rigidbody.linearVelocity;
+                            float inwardSpeed = Vector3.Dot(v, -pushDir);
+                            if (inwardSpeed > 0f)
+                            {
+                                def.PlayerBody.Rigidbody.linearVelocity = v + pushDir * inwardSpeed;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (illegalDoubleTeamers > 0)
+            {
+                // Rewind stall count while double-teaming and warn players
+                UltimateRulesManager.StallCount = Mathf.Max(0f, UltimateRulesManager.StallCount - Time.fixedDeltaTime * 1.5f);
+                UltimateRulesManager.LastStallAnnounced = Mathf.Min(UltimateRulesManager.LastStallAnnounced, Mathf.FloorToInt(UltimateRulesManager.StallCount));
+
+                if (Time.time - UltimateRulesManager.LastDoubleTeamWarningTime > 2.5f)
+                {
+                    UltimateRulesManager.LastDoubleTeamWarningTime = Time.time;
+                    UltimateRulesManager.BroadcastAnnouncement("DOUBLE TEAM! Only 1 marker allowed within 3m - Stall paused & rewound!", "#f1c40f");
+                }
+                return;
             }
 
             if (closestDefender != null)
@@ -2014,6 +2240,7 @@ namespace PuckUltimateFrisbeeMod
                 UltimateRulesManager.LastTurnoverTeam = holderTeam;
                 UltimateRulesManager.OffensiveTeam = opp ?? PlayerTeam.None;
                 UltimateRulesManager.Holder = null;
+                UltimateRulesManager.IsHolderPivotLocked = false;
                 UltimateRulesManager.LastThrower = holder;
                 UltimateRulesManager.ReleaseTime = Time.time;
                 UltimateRulesManager.StallCount = 0f;
@@ -2022,6 +2249,38 @@ namespace PuckUltimateFrisbeeMod
 
                 Vector3 dropPos = GetLegalFieldSpotAfterTurnover(holderPos + aimForward * 0.8f);
                 FlattenAndFreezeDiscOnGround(disc, rb, dropPos);
+            }
+        }
+
+        private static void EstablishPivotAfterMomentumStop(Player holder, bool isWarmup)
+        {
+            if (holder == null || holder.PlayerBody == null) return;
+
+            if (!isWarmup)
+            {
+                Vector3 pos = holder.PlayerBody.transform.position;
+                float maxX = UltimateRulesManager.FieldHalfWidth - 0.35f;
+                float goalLineZ = UltimateRulesManager.EndzoneZThreshold;
+
+                bool slidOutOfBounds = UltimateRulesManager.IsPositionOutOfBounds(pos);
+                bool slidIntoEndzone = UltimateRulesManager.CaughtInCentralZone && Mathf.Abs(pos.z) > goalLineZ;
+
+                // If momentum carried an in-bounds receiver across the sideline or goal-line,
+                // walk them back to the spot where they crossed / caught it to set their pivot!
+                if (slidOutOfBounds || slidIntoEndzone || Mathf.Abs(pos.z) > goalLineZ)
+                {
+                    float pivotX = Mathf.Clamp(pos.x, -maxX, maxX);
+                    float pivotZ = Mathf.Clamp(pos.z, -goalLineZ, goalLineZ);
+                    Vector3 legalPivot = new Vector3(pivotX, pos.y, pivotZ);
+                    holder.PlayerBody.Server_Teleport(legalPivot, holder.PlayerBody.transform.rotation);
+                }
+            }
+
+            holder.PlayerBody.Server_Freeze((RigidbodyConstraints)10);
+            if (holder.PlayerBody.Rigidbody != null)
+            {
+                Vector3 v = holder.PlayerBody.Rigidbody.linearVelocity;
+                holder.PlayerBody.Rigidbody.linearVelocity = new Vector3(0f, v.y, 0f);
             }
         }
 
@@ -2290,6 +2549,7 @@ namespace PuckUltimateFrisbeeMod
             UltimateRulesManager.LastThrower = null;
             UltimateRulesManager.SecondLastThrower = null;
             UltimateRulesManager.Holder = null;
+            UltimateRulesManager.IsHolderPivotLocked = false;
             UltimateRulesManager.IsDiscInFlight = false;
             UltimateRulesManager.IsDiscTumblingOnGround = false;
             UltimateRulesManager.WentOutOfBoundsInFlight = false;
@@ -2345,7 +2605,6 @@ namespace PuckUltimateFrisbeeMod
             float combinedPower = tracker.GetCombinedThrowPower();
             tracker.Reset(thrower.PlayerBody);
 
-            // Power curve blends Stamina Charge + Mouse Swing Velocity/Acceleration!
             float powerCurve = Mathf.Pow(combinedPower, 1.15f);
             float launchSpeed = Mathf.Lerp(6.5f, 24.0f, powerCurve);
 
@@ -2382,9 +2641,11 @@ namespace PuckUltimateFrisbeeMod
             UltimateRulesManager.SecondLastThrower = UltimateRulesManager.LastThrower;
             UltimateRulesManager.LastThrower = thrower;
             UltimateRulesManager.Holder = null;
+            UltimateRulesManager.IsHolderPivotLocked = false;
             UltimateRulesManager.IsDiscInFlight = true;
             UltimateRulesManager.IsDiscTumblingOnGround = false;
             UltimateRulesManager.WasTippedInFlight = false;
+            UltimateRulesManager.WasDefensiveBlock = false;
             UltimateRulesManager.LastDeflector = null;
             UltimateRulesManager.WentOutOfBoundsInFlight = false;
             UltimateRulesManager.LastInBoundsFlightPos = launchPos;
@@ -2395,7 +2656,6 @@ namespace PuckUltimateFrisbeeMod
             sbyte spinByte = (sbyte)(spinSign >= 0f ? 1 : -1);
             UltimateNetworkSync.ServerBroadcastHolderState(null, spinByte, disc);
 
-            // Play 3D Throw Whoosh (volume & pitch scale with combined throw power!)
             float throwVol = Mathf.Lerp(0.55f, 1.0f, combinedPower);
             float throwPitch = Mathf.Lerp(0.85f, 1.28f, combinedPower);
             UltimateAudioManager.ServerBroadcastSound(UltimateSoundType.Throw, launchPos, throwVol, throwPitch);
@@ -2417,7 +2677,11 @@ namespace PuckUltimateFrisbeeMod
 
         private static void ApplyAirborneDeflection(Puck disc, Rigidbody rb, Player deflector, Vector3 contactCenter, bool isHandTip, float bladeFactor = 0.5f)
         {
+            bool isDefensivePlay = UltimateRulesManager.LastThrower != null &&
+                                   UltimateRulesManager.AreOpponents(deflector, UltimateRulesManager.LastThrower);
+
             UltimateRulesManager.WasTippedInFlight = true;
+            UltimateRulesManager.WasDefensiveBlock = isDefensivePlay;
             UltimateRulesManager.LastDeflector = deflector;
             UltimateRulesManager.LastDeflectionTime = Time.time;
 
@@ -2427,36 +2691,49 @@ namespace PuckUltimateFrisbeeMod
 
             Vector3 bounceNormal = (discPos - contactCenter);
             if (bounceNormal.sqrMagnitude < 0.001f)
-                bounceNormal = -incomingVel.normalized + Vector3.up * 0.4f;
+                bounceNormal = -incomingVel.normalized;
             bounceNormal.Normalize();
 
             Vector3 playerVel = (deflector.PlayerBody != null && deflector.PlayerBody.Rigidbody != null)
                 ? deflector.PlayerBody.Rigidbody.linearVelocity
                 : Vector3.zero;
 
-            bool isDefensivePlay = UltimateRulesManager.LastThrower != null &&
-                                   UltimateRulesManager.AreOpponents(deflector, UltimateRulesManager.LastThrower);
-
             Vector3 newVel;
-            if (isHandTip)
+            if (isDefensivePlay)
             {
-                if (!isDefensivePlay)
+                // DEFENSIVE HAND / BODY BLOCK: Kill forward momentum and slam the disc downward to the turf
+                // so it never pops back into the thrower's hands for a free stall reset!
+                Vector3 lateralScatter = new Vector3(bounceNormal.x, 0f, bounceNormal.z);
+                if (lateralScatter.sqrMagnitude < 0.001f) lateralScatter = deflector.PlayerBody.transform.forward;
+                lateralScatter.Normalize();
+
+                // If blocking a point-blank throw, push away from the thrower
+                if (UltimateRulesManager.LastThrower != null && UltimateRulesManager.LastThrower.PlayerBody != null)
                 {
-                    Vector3 carryDir = incomingVel.sqrMagnitude > 0.1f ? incomingVel.normalized : bounceNormal;
-                    float horizCarry = Mathf.Clamp(incomingSpeed * Mathf.Lerp(0.22f, 0.40f, bladeFactor), 1.2f, 4.2f);
-                    newVel = new Vector3(carryDir.x, 0f, carryDir.z).normalized * horizCarry
-                             + bounceNormal * (1.2f * bladeFactor)
-                             + playerVel * 0.45f
-                             + Vector3.up * Mathf.Lerp(2.4f, 3.4f, bladeFactor);
+                    Vector3 awayFromThrower = (discPos - UltimateRulesManager.LastThrower.PlayerBody.transform.position);
+                    awayFromThrower.y = 0f;
+                    if (awayFromThrower.sqrMagnitude > 0.01f)
+                    {
+                        lateralScatter = (lateralScatter + awayFromThrower.normalized * 1.2f).normalized;
+                    }
                 }
-                else
-                {
-                    Vector3 deflectedDir = Vector3.Reflect(incomingVel.normalized, bounceNormal);
-                    deflectedDir = (deflectedDir + bounceNormal * 0.55f + Vector3.up * 0.45f).normalized;
-                    float retainedSpeed = Mathf.Clamp(incomingSpeed * 0.55f, 3.2f, 8.5f);
-                    newVel = deflectedDir * retainedSpeed + playerVel * 0.35f;
-                    if (newVel.y < 2.0f) newVel.y = 2.0f;
-                }
+
+                float deadenedHorizSpeed = Mathf.Clamp(incomingSpeed * 0.18f, 1.0f, 3.0f);
+                float downwardPlummetSpeed = isHandTip ? -5.5f : -4.5f;
+
+                newVel = lateralScatter * deadenedHorizSpeed
+                         + new Vector3(playerVel.x, 0f, playerVel.z) * 0.20f
+                         + Vector3.up * downwardPlummetSpeed;
+            }
+            else if (isHandTip)
+            {
+                // Offensive teammate bobble / tip
+                Vector3 carryDir = incomingVel.sqrMagnitude > 0.1f ? incomingVel.normalized : bounceNormal;
+                float horizCarry = Mathf.Clamp(incomingSpeed * Mathf.Lerp(0.22f, 0.40f, bladeFactor), 1.2f, 4.2f);
+                newVel = new Vector3(carryDir.x, 0f, carryDir.z).normalized * horizCarry
+                         + bounceNormal * (1.2f * bladeFactor)
+                         + playerVel * 0.45f
+                         + Vector3.up * Mathf.Lerp(2.2f, 3.2f, bladeFactor);
             }
             else
             {
@@ -2464,16 +2741,17 @@ namespace PuckUltimateFrisbeeMod
                 if (horizNormal.sqrMagnitude < 0.001f) horizNormal = deflector.PlayerBody.transform.forward;
                 horizNormal.Normalize();
 
-                float bounceSpeed = Mathf.Clamp(incomingSpeed * 0.32f, 1.8f, 4.8f);
-                newVel = (horizNormal * bounceSpeed) + (playerVel * 0.4f) + (Vector3.up * Mathf.Clamp(incomingSpeed * 0.22f, 1.5f, 3.0f));
+                float bounceSpeed = Mathf.Clamp(incomingSpeed * 0.28f, 1.5f, 4.0f);
+                newVel = (horizNormal * bounceSpeed) + (playerVel * 0.35f) + (Vector3.up * 1.2f);
             }
 
             disc.transform.position = discPos + bounceNormal * 0.10f;
             rb.position = disc.transform.position;
             rb.linearVelocity = newVel;
 
+            // Steeply tilt the disc on a defensive block so aerodynamics lose lift and it tumbles onto the grass
             Quaternion tipTilt = isDefensivePlay
-                ? Quaternion.Euler(UnityEngine.Random.Range(-16f, 16f), 0f, UnityEngine.Random.Range(-22f, 22f))
+                ? Quaternion.Euler(UnityEngine.Random.Range(40f, 68f), disc.transform.eulerAngles.y, UnityEngine.Random.Range(-55f, 55f))
                 : Quaternion.Slerp(disc.transform.rotation, Quaternion.Euler(0f, disc.transform.eulerAngles.y, 0f), 0.55f);
             rb.MoveRotation(tipTilt);
 
@@ -2483,9 +2761,9 @@ namespace PuckUltimateFrisbeeMod
             if (!UltimateRulesManager.IsWarmup)
             {
                 string playType = isHandTip
-                    ? (isDefensivePlay ? "DEFENSIVE TIP" : "BOBBLED")
+                    ? (isDefensivePlay ? "HAND BLOCK" : "BOBBLED")
                     : (isDefensivePlay ? "BODY BLOCK" : "BODY DEFLECTION");
-                UltimateRulesManager.BroadcastAnnouncement($"{playType} by #{deflector.Number.Value} {deflector.Username.Value}! Disc is still LIVE!", "#f39c12");
+                UltimateRulesManager.BroadcastAnnouncement($"{playType} by #{deflector.Number.Value} {deflector.Username.Value}!", "#f39c12");
             }
         }
 
@@ -2529,12 +2807,15 @@ namespace PuckUltimateFrisbeeMod
 
             UltimateRulesManager.Holder = catcher;
             UltimateRulesManager.CatchTime = Time.time;
+            UltimateRulesManager.CatchInitialSpot = catcherPos;
+            UltimateRulesManager.CaughtInCentralZone = Mathf.Abs(catcherPos.z) < UltimateRulesManager.EndzoneZThreshold;
             UltimateRulesManager.StallCount = 0f;
             UltimateRulesManager.LastStallAnnounced = 0;
             UltimateRulesManager.ActiveMarker = null;
             UltimateRulesManager.IsDiscInFlight = false;
             UltimateRulesManager.IsDiscTumblingOnGround = false;
             UltimateRulesManager.WasTippedInFlight = false;
+            UltimateRulesManager.WasDefensiveBlock = false;
             UltimateRulesManager.LastDeflector = null;
             UltimateRulesManager.LastTurnoverTeam = PlayerTeam.None;
 
@@ -2547,20 +2828,39 @@ namespace PuckUltimateFrisbeeMod
                 catcher.PlayerBody.Stamina.Value = 1.0f;
             }
 
-            catcher.PlayerBody.Server_Freeze((RigidbodyConstraints)10);
-            bool wasLayoutCatch = UltimateDiveMod.IsPlayerDiving(catcher);
-            catcher.PlayerBody.Rigidbody.linearVelocity = Vector3.zero;
+            // Determine whether the catcher has running momentum to carry over
+            Rigidbody catcherRb = catcher.PlayerBody.Rigidbody;
+            Vector3 currentVel = catcherRb != null ? catcherRb.linearVelocity : Vector3.zero;
+            float horizSpeed = new Vector2(currentVel.x, currentVel.z).magnitude;
+
+            if (horizSpeed > 0.65f)
+            {
+                // Allow a smooth 2-3 step deceleration slide before locking pivot!
+                UltimateRulesManager.IsHolderPivotLocked = false;
+                if (catcherRb != null)
+                {
+                    catcherRb.linearVelocity = new Vector3(currentVel.x * 0.85f, currentVel.y, currentVel.z * 0.85f);
+                }
+            }
+            else
+            {
+                UltimateRulesManager.IsHolderPivotLocked = true;
+                catcher.PlayerBody.Server_Freeze((RigidbodyConstraints)10);
+                if (catcherRb != null) catcherRb.linearVelocity = Vector3.zero;
+            }
+
             disc.Rigidbody.isKinematic = true;
             disc.Server_Freeze(RigidbodyConstraints.FreezeAll);
             UltimateNetworkSync.ServerBroadcastHolderState(catcher, 1, disc);
 
+            Vector3 catchSoundPos = UltimateRulesManager.GetHandWorldPosition(catcher.Stick);
             if (wasInFlight)
             {
-                UltimateAudioManager.ServerBroadcastSound(UltimateSoundType.Catch, catcher.Stick.BladeHandlePosition, 0.95f, UnityEngine.Random.Range(0.94f, 1.06f));
+                UltimateAudioManager.ServerBroadcastSound(UltimateSoundType.Catch, catchSoundPos, 0.95f, UnityEngine.Random.Range(0.94f, 1.06f));
             }
             else
             {
-                UltimateAudioManager.ServerBroadcastSound(UltimateSoundType.Pickup, catcher.Stick.BladeHandlePosition, 0.70f, UnityEngine.Random.Range(0.95f, 1.05f));
+                UltimateAudioManager.ServerBroadcastSound(UltimateSoundType.Pickup, catchSoundPos, 0.70f, UnityEngine.Random.Range(0.95f, 1.05f));
             }
 
             if (UltimateRulesManager.IsPullPlay && !wasInFlight && UltimateRulesManager.LastThrower == null)
@@ -2596,7 +2896,10 @@ namespace PuckUltimateFrisbeeMod
                     UltimateRulesManager.IsPullPlay = false;
                     UltimateRulesManager.IsCurrentThrowPull = false;
 
-                    WalkHolderToGoalLineIfInEndzone(catcher);
+                    if (UltimateRulesManager.IsHolderPivotLocked)
+                    {
+                        WalkHolderToGoalLineIfInEndzone(catcher);
+                    }
                     return;
                 }
                 else if (!UltimateRulesManager.IsPullPlay && !wasPull)
@@ -2606,6 +2909,7 @@ namespace PuckUltimateFrisbeeMod
                         UltimateRulesManager.BroadcastAnnouncement($"SECOND-CHANCE CATCH off the tip by #{catcher.Number.Value} {catcher.Username.Value}!", "#2ecc71");
                     }
 
+                    // In Ultimate, a goal is scored only if the receiver's FIRST point of contact is inside the attacking endzone!
                     if (UltimateRulesManager.IsInAttackingEndzone(catcher))
                     {
                         UltimateRulesManager.BroadcastAnnouncement($"GOAL! Caught in the Endzone by #{catcher.Number.Value} {catcher.Username.Value}!", "#2ecc71");
@@ -2619,7 +2923,7 @@ namespace PuckUltimateFrisbeeMod
             UltimateRulesManager.IsCurrentThrowPull = false;
             UltimateRulesManager.OffensiveTeam = UltimateRulesManager.IsWarmup ? PlayerTeam.None : catcherTeam;
 
-            if (!UltimateRulesManager.IsWarmup)
+            if (!UltimateRulesManager.IsWarmup && UltimateRulesManager.IsHolderPivotLocked)
             {
                 WalkHolderToGoalLineIfInEndzone(catcher);
             }
@@ -3450,6 +3754,12 @@ namespace PuckUltimateFrisbeeMod
             {
                 UltimateVisualTuning.HeldDiscHandOffset = new Vector3(ox, oy, oz);
                 UltimateRulesManager.BroadcastAnnouncement($"HeldDiscHandOffset set to ({ox}, {oy}, {oz})");
+                return false;
+            }
+            if (command == "/armreach" && args.Length == 1 && float.TryParse(args[0], out float areach))
+            {
+                UltimateVisualTuning.ArmReachCompression = Mathf.Clamp(areach, 0.25f, 1.0f);
+                UltimateRulesManager.BroadcastAnnouncement($"ArmReachCompression set to {UltimateVisualTuning.ArmReachCompression:F2}");
                 return false;
             }
             return true;
