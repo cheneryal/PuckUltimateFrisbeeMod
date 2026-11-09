@@ -4374,11 +4374,48 @@ namespace PuckUltimateFrisbeeMod
             src.rolloffMode = AudioRolloffMode.Linear;
             src.minDistance = 2.5f;
             src.maxDistance = 45.0f;
-            src.volume = Mathf.Clamp01(volume);
-            src.pitch = Mathf.Clamp(pitch, 0.5f, 2.0f);
+
+            // 1. Pitch & Volume Micro-Jitter (breaks up identical consecutive plays, especially on Throws)
+            float pitchJitter = (type == UltimateSoundType.Footstep)
+                ? UnityEngine.Random.Range(0.88f, 1.13f)
+                : UnityEngine.Random.Range(0.94f, 1.06f);
+            float volJitter = UnityEngine.Random.Range(0.90f, 1.08f);
+
+            src.volume = Mathf.Clamp01(volume * volJitter);
+            src.pitch = Mathf.Clamp(pitch * pitchJitter, 0.5f, 2.0f);
+
+            // 2. Micro-Transient Sample Offset:
+            // Randomly skip the first 0% to 2.5% of the waveform so the initial "attack" transients aren't identical
+            if (clip.samples > 500 && UnityEngine.Random.value > 0.35f)
+            {
+                int maxSampleSkip = Mathf.Min(clip.samples / 40, 600); // Up to ~13ms
+                src.timeSamples = UnityEngine.Random.Range(0, maxSampleSkip);
+            }
+
+            // 3. Procedural Tone/Timbre Variation via Low-Pass Filter:
+            // Randomly varies how "bright/snappy" vs "warm/muffled" each hit or step sounds!
+            AudioLowPassFilter lpf = sfxObj.AddComponent<AudioLowPassFilter>();
+            if (type == UltimateSoundType.Footstep || type == UltimateSoundType.GroundHit)
+            {
+                // Turf sounds: vary between deep soft grass and crisp turf
+                lpf.cutoffFrequency = UnityEngine.Random.Range(1800f, 9500f);
+                lpf.lowpassResonanceQ = UnityEngine.Random.Range(1.0f, 1.4f);
+            }
+            else if (type == UltimateSoundType.Catch || type == UltimateSoundType.BlockTip)
+            {
+                // Plastic catch/block: vary between palm-muffled thud (3.5kHz) and crisp plastic snap (18kHz)
+                lpf.cutoffFrequency = UnityEngine.Random.Range(3500f, 18000f);
+                lpf.lowpassResonanceQ = UnityEngine.Random.Range(1.0f, 1.6f);
+            }
+            else
+            {
+                // Throw / Pickup: subtle air tone shift
+                lpf.cutoffFrequency = UnityEngine.Random.Range(4500f, 20000f);
+            }
+
             src.Play();
 
-            UnityEngine.Object.Destroy(sfxObj, (clip.length / Mathf.Max(0.5f, src.pitch)) + 0.1f);
+            UnityEngine.Object.Destroy(sfxObj, (clip.length / Mathf.Max(0.5f, src.pitch)) + 0.15f);
         }
 
         private static AudioClip CreateProceduralClip(string name, float durationSec, Func<float, float, float> generator)
