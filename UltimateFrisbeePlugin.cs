@@ -142,6 +142,7 @@ namespace PuckUltimateFrisbeeMod
         public static GameObject CustomArmHandPrefab;
         public static GameObject CustomFrisbeePrefab;
         public static GameObject CustomGrassFieldPrefab;
+        public static GameObject CustomPlayerPrefab;
 
         public static void LoadAssets(string folderPath)
         {
@@ -175,8 +176,13 @@ namespace PuckUltimateFrisbeeMod
                 CustomArmHandPrefab = _bundle.LoadAsset<GameObject>("ArmHandPrefab");
                 CustomFrisbeePrefab = _bundle.LoadAsset<GameObject>("FrisbeeDiscPrefab");
                 CustomGrassFieldPrefab = _bundle.LoadAsset<GameObject>("GrassFieldPrefab");
+                CustomPlayerPrefab = _bundle.LoadAsset<GameObject>("UltimatePlayerPrefab")
+                  ?? _bundle.LoadAsset<GameObject>("Character")
+                  ?? _bundle.LoadAsset<GameObject>("skater");
 
-                UltimateFrisbeePlugin.ModLogger.Info($"AssetBundle Loaded: Arm={CustomArmHandPrefab != null}, Disc={CustomFrisbeePrefab != null}, Grass={CustomGrassFieldPrefab != null}");
+                UltimateFrisbeePlugin.ModLogger.Info(
+                    $"AssetBundle Loaded: Arm={CustomArmHandPrefab != null}, Disc={CustomFrisbeePrefab != null}, " +
+                    $"Grass={CustomGrassFieldPrefab != null}, Player={CustomPlayerPrefab != null}");
             }
             catch (Exception ex)
             {
@@ -1152,6 +1158,23 @@ namespace PuckUltimateFrisbeeMod
             {
                 UpdateWristbandTeamColor(UltimateRulesManager.GetTeam(ownerPlayer));
             }
+
+            // If the full-body Ultimate Athlete rig is active on this player,
+            // ONLY show this floating 1st-person arm for the LocalPlayer!
+            // (Remote players use their rigged body's IK arm instead so they don't have 3 arms!)
+            bool hasFullBodyRig = UltimateAssetLoader.CustomPlayerPrefab != null &&
+                                  ownerPlayer != null &&
+                                  ownerPlayer.PlayerBody != null &&
+                                  ownerPlayer.PlayerBody.GetComponentInChildren<UltimatePlayerMarker>(true) != null;
+
+            bool showFirstPersonArm = !hasFullBodyRig ||
+                UltimatePlayerIKBridge.IsLocalPlayerInFirstPerson(ownerPlayer, ownerPlayer.PlayerBody);
+
+            if (CustomArmInstance != null && CustomArmInstance.gameObject.activeSelf != showFirstPersonArm)
+            {
+                CustomArmInstance.gameObject.SetActive(showFirstPersonArm);
+            }
+            if (!showFirstPersonArm) return;
 
             bool isLeft = ownerPlayer != null && ownerPlayer.Handedness != null && ownerPlayer.Handedness.Value == PlayerHandedness.Left;
 
@@ -4582,8 +4605,11 @@ namespace PuckUltimateFrisbeeMod
                 UltimateNetworkSync.ServerBroadcastHolderState(UltimateRulesManager.Holder, UltimateNetworkSync.ClientSyncedThrowStyle);
             }
 
+
             if (!UltimateFrisbeePlugin.IsHeadlessServer)
             {
+                // Attach the full-body rigged Ultimate Frisbee athlete!
+                UltimatePlayerRigManager.AttachRigToPlayerBody(__instance);
                 // Ensure the newly spawned PlayerCamera also has 5,000m far clip distance!
                 Level_GrassStadiumSetup_Patch.ExtendAllCamerasDrawDistance();
                 var runner = __instance.GetComponent<UltimateRunningStrideController>();
@@ -4956,6 +4982,497 @@ namespace PuckUltimateFrisbeeMod
                 Level_GrassStadiumSetup_Patch.ApplyCameraLongDistanceSettings(cam);
             }
             Level_GrassStadiumSetup_Patch.ExtendAllCamerasDrawDistance();
+        }
+    }
+// =========================================================================
+    // 16. FULL-BODY SCULPTED ULTIMATE FRISBEE PLAYER (NO HOCKEY HELMET!)
+    // =========================================================================
+    public class UltimatePlayerMarker : MonoBehaviour
+    {
+        public PlayerTeam? LastAppliedTeam = null;
+    }
+
+    public class UltimateVanillaMeshSuppressor : MonoBehaviour
+    {
+        private bool _meshesCleared = false;
+
+        public void SuppressVanillaBody()
+        {
+            foreach (var r in GetComponentsInChildren<Renderer>(true))
+            {
+                if (r == null) continue;
+                // Keep ONLY the floating Username and Number text for the back of the jersey!
+                if (r.gameObject.name == "Username" || r.gameObject.name == "Number") continue;
+
+                // Hide ALL vanilla body AND vanilla hockey-helmet PlayerHead renderers!
+                r.enabled = false;
+                r.forceRenderingOff = true;
+
+                if (!_meshesCleared && r.GetComponentInParent<PlayerHead>(true) == null)
+                {
+                    if (r is SkinnedMeshRenderer smr) smr.sharedMesh = null;
+                    else if (r is MeshRenderer)
+                    {
+                        var mf = r.GetComponent<MeshFilter>();
+                        if (mf != null) mf.sharedMesh = null;
+                    }
+                }
+            }
+            _meshesCleared = true;
+        }
+
+        private void LateUpdate() => SuppressVanillaBody();
+    }
+
+    public class UltimateSkinAndTeamSync : MonoBehaviour
+    {
+        private PlayerHead _vanillaHead;
+        private Color _lastSkinColor = Color.clear;
+        private Color _lastHairColor = Color.clear;
+
+        public void Initialize(PlayerHead vanillaHead)
+        {
+            _vanillaHead = vanillaHead;
+            SyncHeadColors(force: true);
+        }
+
+        private void LateUpdate()
+        {
+            SyncHeadColors(force: false);
+        }
+
+        public void SyncHeadColors(bool force)
+        {
+            if (_vanillaHead == null) return;
+
+            Color skinCol = new Color(0.92f, 0.74f, 0.60f, 1f);
+            Color hairCol = new Color(0.18f, 0.12f, 0.08f, 1f);
+            bool foundSkin = false;
+            bool foundHair = false;
+
+            foreach (var r in _vanillaHead.GetComponentsInChildren<Renderer>(true))
+            {
+                if (r == null || r.sharedMaterial == null) continue;
+                string n = (r.gameObject.name + "_" + r.sharedMaterial.name).ToLowerInvariant();
+                Material m = r.sharedMaterial;
+                Color c = m.HasProperty("_BaseColor") ? m.GetColor("_BaseColor")
+                        : m.HasProperty("_Color") ? m.GetColor("_Color")
+                        : m.color;
+
+                if (!foundHair && (n.Contains("hair") || n.Contains("beard") || n.Contains("mustache") || n.Contains("brow")))
+                {
+                    hairCol = c;
+                    foundHair = true;
+                }
+                else if (!foundSkin && (n.Contains("head") || n.Contains("skin") || n.Contains("face")))
+                {
+                    skinCol = c;
+                    foundSkin = true;
+                }
+            }
+
+            if (!force &&
+                Vector4.Distance(skinCol, _lastSkinColor) < 0.01f &&
+                Vector4.Distance(hairCol, _lastHairColor) < 0.01f)
+            {
+                return;
+            }
+
+            _lastSkinColor = skinCol;
+            _lastHairColor = hairCol;
+
+            foreach (var r in GetComponentsInChildren<Renderer>(true))
+            {
+                if (r == null) continue;
+                string objName = r.gameObject.name;
+                bool isSkinObj = objName.Contains("Custom_Head") || objName.Contains("Arm") ||
+                                 objName.Contains("Glove") || objName.Contains("Leg");
+                bool isHairObj = objName.Contains("Custom_Hair");
+
+                Material[] mats = r.materials;
+                bool changed = false;
+                for (int i = 0; i < mats.Length; i++)
+                {
+                    if (mats[i] == null) continue;
+                    string matName = mats[i].name;
+
+                    if (isSkinObj || matName.IndexOf("Skin", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        if (mats[i].HasProperty("_BaseColor")) mats[i].SetColor("_BaseColor", skinCol);
+                        if (mats[i].HasProperty("_Color")) mats[i].SetColor("_Color", skinCol);
+                        mats[i].color = skinCol;
+                        changed = true;
+                    }
+                    else if (isHairObj || matName.IndexOf("Hair", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        if (mats[i].HasProperty("_BaseColor")) mats[i].SetColor("_BaseColor", hairCol);
+                        if (mats[i].HasProperty("_Color")) mats[i].SetColor("_Color", hairCol);
+                        mats[i].color = hairCol;
+                        changed = true;
+                    }
+                }
+                if (changed) r.materials = mats;
+            }
+        }
+    }
+
+    public class UltimateAnimationBridge : MonoBehaviour
+    {
+        private Animator _animator;
+        private Player _player;
+        private PlayerBody _body;
+        private Movement _movement;
+        private Vector3 _lastPos;
+        private float _smoothedSpeed;
+        private UltimatePlayerMarker _marker;
+
+         public void Initialize(Player player, PlayerBody body, Movement movement)
+        {
+            _animator = GetComponent<Animator>();
+            if (_animator != null)
+            {
+                _animator.applyRootMotion = false; // Prevent Root Motion from drifting off the collider!
+            }
+            _player = player;
+            _body = body;
+            _movement = movement;
+            _marker = GetComponent<UltimatePlayerMarker>();
+            if (_body != null) _lastPos = _body.transform.position;
+        }
+
+        private void Update()
+        {
+            if (_animator == null || _player == null || _body == null) return;
+
+            // Continuously ensure Team Blue / Team Red materials match the player's current team!
+            if (_marker != null)
+            {
+                PlayerTeam currentTeam = UltimateRulesManager.GetTeam(_player);
+                if ((currentTeam == PlayerTeam.Blue || currentTeam == PlayerTeam.Red) &&
+                    _marker.LastAppliedTeam != currentTeam)
+                {
+                    UltimatePlayerRigManager.ApplyTeamColors(_marker, currentTeam);
+                }
+            }
+
+            float targetSpeed = 0f;
+            if (_player.IsLocalPlayer && _body.Speed != null)
+            {
+                targetSpeed = _body.Speed.Value;
+            }
+            else if (Time.deltaTime > 0.0001f)
+            {
+                Vector3 curH = new Vector3(_body.transform.position.x, 0f, _body.transform.position.z);
+                Vector3 lastH = new Vector3(_lastPos.x, 0f, _lastPos.z);
+                targetSpeed = Vector3.Distance(curH, lastH) / Time.deltaTime;
+                _lastPos = _body.transform.position;
+            }
+
+            bool isHoldingDisc = UltimateNetworkSync.IsPlayerHoldingAnyDisc(_player.OwnerClientId);
+            if (isHoldingDisc) targetSpeed = 0f; // Pivot foot locked
+
+            _smoothedSpeed = Mathf.Lerp(_smoothedSpeed, targetSpeed, Time.deltaTime * 10f);
+
+            float currentTurn = 0f;
+            if (_player.IsLocalPlayer && _movement != null)
+            {
+                currentTurn = _movement.TurnSpeed * (_movement.IsTurningLeft ? -1f : 1f);
+            }
+
+            _animator.SetFloat("fSpeed", _smoothedSpeed);
+            _animator.SetFloat("fTurn", currentTurn);
+            _animator.SetBool("bIsSprinting", _body.IsSprinting != null && _body.IsSprinting.Value && !isHoldingDisc);
+            _animator.SetBool("bIsSliding", _body.IsSliding != null && _body.IsSliding.Value);
+            _animator.SetBool("bIsJumping", _body.IsJumping);
+            _animator.SetBool("bHasFallen", (_body.HasFallen != null && _body.HasFallen.Value) || UltimateDiveMod.IsPlayerDiving(_player));
+            _animator.SetBool("bIsGrounded", _body.IsGrounded);
+            _animator.SetBool("bIsHoldingDisc", isHoldingDisc);
+        }
+    }
+
+    [RequireComponent(typeof(Animator))]
+    public class UltimatePlayerIKBridge : MonoBehaviour
+    {
+        private Animator _animator;
+        private Player _player;
+        private PlayerBody _body;
+        private Transform _headBone;
+        private Transform _spineBone;
+        private Quaternion _lastHeadRot = Quaternion.identity;
+        private Quaternion _lastSpineRot = Quaternion.identity;
+
+        private Renderer[] _allBodyRenderers;
+
+        public void Initialize(Player player, PlayerBody body)
+        {
+            _animator = GetComponent<Animator>();
+            _player = player;
+            _body = body;
+
+            if (_animator != null && _animator.isHuman)
+            {
+                _headBone = _animator.GetBoneTransform(HumanBodyBones.Head);
+                _spineBone = _animator.GetBoneTransform(HumanBodyBones.Spine);
+            }
+
+            // Cache all renderers on the custom athlete body so we can cleanly hide them in 1st-person
+            var bodyList = new List<Renderer>();
+            foreach (var r in GetComponentsInChildren<Renderer>(true))
+            {
+                if (r == null) continue;
+                if (r.name == "Username" || r.name == "Number") continue;
+                bodyList.Add(r);
+            }
+            _allBodyRenderers = bodyList.ToArray();
+        }
+
+        private void OnAnimatorIK(int layerIndex)
+        {
+            if (_animator == null || !_animator.isHuman || _player == null || _player.Stick == null || _body == null)
+                return;
+
+            try
+            {
+                bool isLeft = _player.Handedness != null && _player.Handedness.Value == PlayerHandedness.Left;
+                AvatarIKGoal throwingHand = isLeft ? AvatarIKGoal.LeftHand : AvatarIKGoal.RightHand;
+                AvatarIKHint throwingElbow = isLeft ? AvatarIKHint.LeftElbow : AvatarIKHint.RightElbow;
+                AvatarIKGoal offHand = isLeft ? AvatarIKGoal.RightHand : AvatarIKGoal.LeftHand;
+
+                // 1. Dominant Hand IK -> Reaches to exact Frisbee Catch/Throw Position!
+                Vector3 handWorldPos = UltimateRulesManager.GetHandWorldPosition(_player.Stick, out Vector3 shoulderAnchor, out Vector3 shaftDir);
+                float wristRoll = _player.Stick.BladeAngle * UltimateVisualTuning.WristRollMultiplier;
+                Quaternion aimRot = Quaternion.LookRotation(shaftDir, Vector3.up) * Quaternion.Euler(0f, 0f, wristRoll);
+
+                // In our Blender T-Pose, LeftHand bone points +X (-90° yaw from +Z) and RightHand points -X (+90° yaw from +Z).
+                // Applying this offset aligns the avatar's fingers/palm with the Frisbee rim!
+                Quaternion handBoneAlign = Quaternion.Euler(0f, isLeft ? -90f : 90f, 0f);
+                Quaternion finalHandIKRot = aimRot * handBoneAlign;
+
+                _animator.SetIKPositionWeight(throwingHand, 1.0f);
+                _animator.SetIKRotationWeight(throwingHand, 1.0f);
+                _animator.SetIKPosition(throwingHand, handWorldPos);
+                _animator.SetIKRotation(throwingHand, finalHandIKRot);
+
+                // 2. Natural Elbow Hint -> Keeps the elbow tucked down/outward on Forehands & Backhands
+                Vector3 elbowHintPos = Vector3.Lerp(shoulderAnchor, handWorldPos, 0.45f)
+                                     + Vector3.down * 0.25f
+                                     + _body.transform.right * (isLeft ? -0.18f : 0.18f);
+                _animator.SetIKHintPositionWeight(throwingElbow, 0.65f);
+                _animator.SetIKHintPosition(throwingElbow, elbowHintPos);
+
+                // 3. Off-Hand IK -> Athletic counterbalance pose
+                Vector3 offHandLocal = new Vector3(isLeft ? 0.28f : -0.28f, 1.05f, 0.14f);
+                Vector3 offHandWorld = _body.transform.TransformPoint(offHandLocal);
+                _animator.SetIKPositionWeight(offHand, 0.35f);
+                _animator.SetIKRotationWeight(offHand, 0f);
+                _animator.SetIKPosition(offHand, offHandWorld);
+            }
+            catch
+            {
+                _animator.SetIKPositionWeight(AvatarIKGoal.LeftHand, 0f);
+                _animator.SetIKPositionWeight(AvatarIKGoal.RightHand, 0f);
+            }
+        }
+
+        public static bool IsLocalPlayerInFirstPerson(Player player, PlayerBody body)
+        {
+            if (player == null || !player.IsLocalPlayer || body == null) return false;
+            Camera cam = Camera.main;
+            if (cam == null) return true;
+
+            // In 1st-person, the camera sits at the head (~1.4m-1.8m above feet, < 0.85m horizontally from body).
+            // If the player switches to 3rd-person or free cam, the camera moves > 1.2m away!
+            Vector3 headPos = body.transform.position + Vector3.up * 1.6f;
+            return Vector3.Distance(cam.transform.position, headPos) < 1.15f;
+        }
+
+        private void LateUpdate()
+        {
+            if (_player == null || _body == null) return;
+
+            // Hide the custom body mesh on the LocalPlayer when in 1st-person so the collar/sleeves/torso
+            // never block the camera (just like SkaterMod's LocalPlayerVisibility)!
+            // If the player switches to 3rd-person camera, the full body automatically appears!
+            if (_player.IsLocalPlayer && _allBodyRenderers != null)
+            {
+                bool showBody = !IsLocalPlayerInFirstPerson(_player, _body);
+                for (int i = 0; i < _allBodyRenderers.Length; i++)
+                {
+                    Renderer r = _allBodyRenderers[i];
+                    if (r != null && r.enabled != showBody)
+                    {
+                        r.enabled = showBody;
+                    }
+                }
+            }
+
+            if (_headBone != null && _spineBone != null && _player.PlayerInput != null)
+            {
+                Vector2 lookAngle = _player.IsLocalPlayer
+                    ? _player.PlayerInput.LookAngleInput.ClientValue
+                    : _player.PlayerInput.LookAngleInput.ServerValue;
+
+                float yaw = Mathf.Clamp(lookAngle.y, -85f, 85f);
+                Quaternion targetSpine = Quaternion.Euler(0f, yaw * 0.55f, 0f);
+                Quaternion targetHead = Quaternion.Euler(0f, yaw * 0.45f, 0f);
+
+                _lastSpineRot = Quaternion.Lerp(_lastSpineRot, targetSpine, Time.deltaTime * 12f);
+                _lastHeadRot = Quaternion.Lerp(_lastHeadRot, targetHead, Time.deltaTime * 12f);
+
+                _spineBone.localRotation = _lastSpineRot;
+                _headBone.localRotation = _lastHeadRot;
+            }
+        }
+    }
+
+    public static class UltimatePlayerRigManager
+    {
+        public static void AttachRigToPlayerBody(PlayerBody body)
+        {
+            if (body == null || UltimateAssetLoader.CustomPlayerPrefab == null) return;
+            if (body.GetComponentInChildren<UltimatePlayerMarker>(true) != null) return;
+
+            Player player = body.Player;
+            if (player == null) return;
+
+            Transform origMeshTransform = body.transform.Find("Player Mesh");
+            if (origMeshTransform == null) return;
+
+            PlayerMesh playerMesh = origMeshTransform.GetComponent<PlayerMesh>();
+            if (playerMesh == null) return;
+
+            // 1. Suppress vanilla floating hockey torso AND vanilla hockey-helmet head!
+            var suppressor = origMeshTransform.GetComponent<UltimateVanillaMeshSuppressor>()
+                          ?? origMeshTransform.gameObject.AddComponent<UltimateVanillaMeshSuppressor>();
+            suppressor.SuppressVanillaBody();
+
+            // 2. Instantiate our sculpted Ultimate Frisbee Athlete (which includes Custom_Head + Backward Cap!)
+            GameObject athlete = UnityEngine.Object.Instantiate(UltimateAssetLoader.CustomPlayerPrefab, body.transform);
+            athlete.name = "UltimateAthleteInstance";
+            athlete.transform.localPosition = Vector3.zero;
+            athlete.transform.localRotation = Quaternion.identity;
+
+            UltimateAssetLoader.SmoothMeshNormals(athlete, 55f);
+            UltimateAssetLoader.ApplyRuntimeMaterials(athlete, 0.15f);
+
+            foreach (var smr in athlete.GetComponentsInChildren<SkinnedMeshRenderer>(true))
+            {
+                smr.updateWhenOffscreen = true;
+            }
+
+            var marker = athlete.AddComponent<UltimatePlayerMarker>();
+
+            // 3. Reparent Username & Number onto the back of the jersey (mixamorig:Spine2)
+            Transform spineBone = FindChildRecursive(athlete.transform, "mixamorig:Spine2");
+            if (spineBone != null)
+            {
+                Transform usernameTf = FindChildRecursive(origMeshTransform, "Username");
+                if (usernameTf != null)
+                {
+                    SetActiveAndVisible(usernameTf);
+                    usernameTf.SetParent(spineBone, false);
+                    string uname = player.Username.Value.ToString();
+                    Vector3 scale = new Vector3(1.25f, 0.5f, 1.0f);
+                    if (uname.Length > 9) scale.x *= (9f / uname.Length);
+                    usernameTf.localPosition = new Vector3(0.001f, 0.09f, -0.204f);
+                    usernameTf.localRotation = Quaternion.Euler(4.874f, 0f, 0f);
+                    usernameTf.localScale = scale;
+                }
+
+                Transform numberTf = FindChildRecursive(origMeshTransform, "Number");
+                if (numberTf != null)
+                {
+                    SetActiveAndVisible(numberTf);
+                    numberTf.SetParent(spineBone, false);
+                    numberTf.localPosition = new Vector3(0f, -0.15f, -0.228f);
+                    numberTf.localRotation = Quaternion.Euler(4.874f, 0f, 0f);
+                    numberTf.localScale = new Vector3(0.9f, 0.8f, 1.0f);
+                }
+            }
+
+            // 4. Sync Skin & Hair Colors from the hidden vanilla PlayerHead, plus attach Animation & IK Bridges
+            if (playerMesh.PlayerHead != null)
+            {
+                athlete.AddComponent<UltimateSkinAndTeamSync>().Initialize(playerMesh.PlayerHead);
+            }
+
+            athlete.AddComponent<UltimateAnimationBridge>().Initialize(player, body, body.GetComponent<Movement>());
+            athlete.AddComponent<UltimatePlayerIKBridge>().Initialize(player, body);
+
+            // 5. Apply Team Colors to Jersey, Backward Cap, Wristbands & Socks
+            ApplyTeamColors(marker, UltimateRulesManager.GetTeam(player));
+        }
+
+        public static void ApplyTeamColors(UltimatePlayerMarker marker, PlayerTeam team)
+        {
+            if (marker == null || marker.LastAppliedTeam == team) return;
+            marker.LastAppliedTeam = team;
+
+            Color teamColor = (team == PlayerTeam.Red)
+                ? new Color(0.90f, 0.22f, 0.20f, 1f)
+                : new Color(0.18f, 0.52f, 0.92f, 1f);
+
+            foreach (var r in marker.GetComponentsInChildren<Renderer>(true))
+            {
+                if (r == null) continue;
+                if (r.gameObject.name == "Username" || r.gameObject.name == "Number") continue;
+
+                bool isTeamPart = r.gameObject.name.Contains("Torso") ||
+                                  r.gameObject.name.Contains("Sleeve") ||
+                                  r.gameObject.name.Contains("Band") ||
+                                  r.gameObject.name.Contains("Cap_") ||
+                                  r.gameObject.name.Contains("Sock");
+
+                Material[] mats = r.materials;
+                bool changed = false;
+                for (int i = 0; i < mats.Length; i++)
+                {
+                    if (mats[i] == null) continue;
+                    string mName = mats[i].name;
+                    if (isTeamPart ||
+                        mName.IndexOf("Jersey", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        mName.IndexOf("Band", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        if (mats[i].HasProperty("_BaseColor")) mats[i].SetColor("_BaseColor", teamColor);
+                        if (mats[i].HasProperty("_Color")) mats[i].SetColor("_Color", teamColor);
+                        mats[i].color = teamColor;
+                        changed = true;
+                    }
+                }
+                if (changed) r.materials = mats;
+            }
+        }
+
+        private static void SetActiveAndVisible(Transform t)
+        {
+            if (t == null) return;
+            t.gameObject.SetActive(true);
+            foreach (var r in t.GetComponentsInChildren<Renderer>(true)) r.enabled = true;
+        }
+
+        private static Transform FindChildRecursive(Transform parent, string name)
+        {
+            foreach (Transform child in parent)
+            {
+                if (child.name == name) return child;
+                Transform res = FindChildRecursive(child, name);
+                if (res != null) return res;
+            }
+            return null;
+        }
+    }
+
+    [HarmonyPatch(typeof(PlayerMesh), "SetJerseyID")]
+    public static class PlayerMesh_UltimateTeamColor_Patch
+    {
+        [HarmonyPostfix]
+        public static void Postfix(PlayerMesh __instance, int jerseyID, PlayerTeam team)
+        {
+            var marker = __instance.GetComponentInParent<PlayerBody>()?.GetComponentInChildren<UltimatePlayerMarker>(true);
+            if (marker != null)
+            {
+                UltimatePlayerRigManager.ApplyTeamColors(marker, team);
+            }
         }
     }
 }
