@@ -5018,11 +5018,44 @@ namespace PuckUltimateFrisbeeMod
         private static readonly FieldInfo _ambientDragField = AccessTools.Field(typeof(Movement), "ambientDrag")
                                                            ?? AccessTools.Field(typeof(Movement), "drag");
         private static readonly PropertyInfo _ambientDragProp = AccessTools.Property(typeof(Movement), "AmbientDrag");
-        private static readonly MethodInfo _standUpMethod = AccessTools.Method(typeof(PlayerBody), "Server_StandUp")
-                                                         ?? AccessTools.Method(typeof(PlayerBody), "StandUp");
+
+        private static readonly MethodInfo _recoverMethod =
+            AccessTools.Method(typeof(PlayerBody), "Server_Recover") ??
+            AccessTools.Method(typeof(PlayerBody), "Server_StandUp") ??
+            AccessTools.Method(typeof(PlayerBody), "Recover") ??
+            AccessTools.Method(typeof(PlayerBody), "StandUp");
 
         // Tracks previous tick stamina per player so we can scale down sprinting stamina drain
         internal static readonly Dictionary<ulong, float> PrevStamina = new Dictionary<ulong, float>();
+
+        // Prevents the capsule from immediately re-tripping into a 2nd fall right after standing up!
+        internal static readonly Dictionary<ulong, float> DiveRecoveryImmunityUntil = new Dictionary<ulong, float>();
+
+        private static void ForceUprightAndLockConstraints(PlayerBody body, Rigidbody rb)
+        {
+            if (body == null || rb == null) return;
+
+            Vector3 forwardFlat = Vector3.ProjectOnPlane(body.transform.forward, Vector3.up);
+            if (forwardFlat.sqrMagnitude < 0.01f)
+                forwardFlat = Vector3.ProjectOnPlane(body.transform.up, Vector3.up);
+            if (forwardFlat.sqrMagnitude < 0.01f)
+                forwardFlat = Vector3.forward;
+
+            Quaternion uprightRot = Quaternion.LookRotation(forwardFlat.normalized, Vector3.up);
+
+            // Lift slightly off turf so capsule bottom doesn't clip ground when snapping vertical
+            Vector3 pos = rb.position;
+            if (pos.y < 0.25f) pos.y = 0.25f;
+
+            rb.linearVelocity = new Vector3(rb.linearVelocity.x * 0.5f, 0f, rb.linearVelocity.z * 0.5f);
+            rb.angularVelocity = Vector3.zero;
+            rb.position = pos;
+            rb.rotation = uprightRot;
+            body.transform.SetPositionAndRotation(pos, uprightRot);
+
+            // CRITICAL: Re-lock X and Z rotation constraints ((RigidbodyConstraints)10) so the capsule cannot tip over a 2nd time!
+            rb.constraints = RigidbodyConstraints.FreezeRotationX | RigidbodyConstraints.FreezeRotationZ;
+        }
 
         [HarmonyPostfix]
         public static void Postfix(PlayerBody __instance)
@@ -5031,6 +5064,26 @@ namespace PuckUltimateFrisbeeMod
             var player = __instance.Player;
             if (player == null) return;
             var id = player.NetworkObjectId;
+            Rigidbody rb = __instance.Rigidbody;
+
+            // -----------------------------------------------------------------
+            // 0. POST-DIVE STAND-UP IMMUNITY (Blocks the "2nd Fall" bounce!)
+            // -----------------------------------------------------------------
+            if (DiveRecoveryImmunityUntil.TryGetValue(id, out float immunityUntil))
+            {
+                if (Time.time < immunityUntil)
+                {
+                    if (__instance.HasFallen != null && __instance.HasFallen.Value)
+                    {
+                        __instance.HasFallen.Value = false;
+                    }
+                    ForceUprightAndLockConstraints(__instance, rb);
+                }
+                else
+                {
+                    DiveRecoveryImmunityUntil.Remove(id);
+                }
+            }
 
             // -----------------------------------------------------------------
             // 1. SLOW DOWN SPRINT STAMINA DEPLETION WHEN RUNNING
@@ -5067,14 +5120,12 @@ namespace PuckUltimateFrisbeeMod
             if (!UltimateDiveMod.DiveStartedAt.TryGetValue(id, out var t0)) return;
 
             float elapsed = Time.time - t0;
-            Rigidbody rb = __instance.Rigidbody;
             bool hasFallen = __instance.HasFallen != null && __instance.HasFallen.Value;
 
-            // Prevent sideways barrel-rolling on the grass during a layout (keep chest facing the ground)
-            if (rb != null && hasFallen && elapsed < 1.15f)
+            // Prevent sideways barrel-rolling on the grass during a layout
+            if (rb != null && hasFallen && elapsed < 1.05f)
             {
                 Vector3 angVel = rb.angularVelocity;
-                // Dampen sideways roll/yaw spin once pitched forward
                 rb.angularVelocity = new Vector3(angVel.x * 0.85f, angVel.y * 0.2f, angVel.z * 0.2f);
             }
 
@@ -5095,40 +5146,29 @@ namespace PuckUltimateFrisbeeMod
 
             float horizSpeed = rb != null ? new Vector2(rb.linearVelocity.x, rb.linearVelocity.z).magnitude : 0f;
 
-            // Fast athletic recovery: Stand the player back up after 1.15s (or after 0.80s if slide speed < 1.5 m/s)
-            bool shouldFastRecover = (elapsed >= 1.15f) || (elapsed >= 0.80f && horizSpeed < 1.5f);
+            // Fast athletic recovery: Stand the player back up after 1.05s (or after 0.75s if slide speed < 1.5 m/s)
+            bool shouldFastRecover = (elapsed >= 1.05f) || (elapsed >= 0.75f && horizSpeed < 1.5f);
 
             if (hasFallen && shouldFastRecover)
             {
-                if (_standUpMethod != null && _standUpMethod.GetParameters().Length == 0)
+                // Grant 0.55s of post-dive upright lock so vanilla PlayerBody cannot trigger a 2nd fall!
+                DiveRecoveryImmunityUntil[id] = Time.time + 0.55f;
+
+                if (_recoverMethod != null && _recoverMethod.GetParameters().Length == 0)
                 {
-                    _standUpMethod.Invoke(__instance, null);
+                    try { _recoverMethod.Invoke(__instance, null); } catch { }
                 }
-                else
+
+                if (__instance.HasFallen != null)
                 {
                     __instance.HasFallen.Value = false;
                 }
 
-                // Right the physics capsule smoothly back to vertical keeping current yaw
-                if (rb != null)
-                {
-                    Vector3 forwardFlat = Vector3.ProjectOnPlane(__instance.transform.forward, Vector3.up);
-                    if (forwardFlat.sqrMagnitude < 0.01f)
-                        forwardFlat = Vector3.ProjectOnPlane(__instance.transform.up, Vector3.up);
-                    if (forwardFlat.sqrMagnitude < 0.01f)
-                        forwardFlat = Vector3.forward;
-
-                    Quaternion uprightRot = Quaternion.LookRotation(forwardFlat.normalized, Vector3.up);
-                    rb.MoveRotation(uprightRot);
-                    __instance.transform.rotation = uprightRot;
-                    rb.angularVelocity = Vector3.zero;
-                }
-
+                ForceUprightAndLockConstraints(__instance, rb);
                 UltimateDiveMod.ClearDiveState(player);
                 return;
             }
 
-            // Also clear dive state if the player is already upright/grounded
             if (!hasFallen && __instance.IsGrounded)
             {
                 UltimateDiveMod.ClearDiveState(player);
@@ -5150,6 +5190,7 @@ namespace PuckUltimateFrisbeeMod
             UltimateDiveMod.DiveToggled.Remove(id);
             UltimateDiveMod.DiveStartedAt.Remove(id);
             PlayerBody_DiveAutoClearAndDrag_Patch.PrevStamina.Remove(id);
+            PlayerBody_DiveAutoClearAndDrag_Patch.DiveRecoveryImmunityUntil.Remove(id);
         }
     }
     
