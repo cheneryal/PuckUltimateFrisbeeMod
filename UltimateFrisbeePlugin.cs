@@ -435,11 +435,30 @@ namespace PuckUltimateFrisbeeMod
         public static bool IsPlayerHoldingAnyDisc(ulong clientId)
         {
             if (clientId == ulong.MaxValue) return false;
+
+            // Server-authoritative check against live spawned Pucks first
+            if (NetworkRoles.IsServer)
+            {
+                if (!UltimateRulesManager.IsWarmup)
+                {
+                    return UltimateRulesManager.Holder != null && UltimateRulesManager.Holder.OwnerClientId == clientId;
+                }
+
+                foreach (var kvp in UltimateRulesManager.DiscStates)
+                {
+                    if (kvp.Key != null && kvp.Key.IsSpawned && kvp.Value.Holder != null && kvp.Value.Holder.OwnerClientId == clientId)
+                    {
+                        return true;
+                    }
+                }
+                return false;
+            }
+
             foreach (var kvp in ClientDiscStates)
             {
                 if (kvp.Value.HolderClientId == clientId) return true;
             }
-            return ClientSyncedHolderId == clientId;
+            return !UltimateRulesManager.IsWarmup && ClientSyncedHolderId == clientId;
         }
 
         public static void EnsureRegistered()
@@ -464,8 +483,39 @@ namespace PuckUltimateFrisbeeMod
             ClientDiscStates.Clear();
         }
 
+        public static void ServerBroadcastClearAllHolders()
+        {
+            ClientSyncedHolderId = ulong.MaxValue;
+            ClientSyncedThrowStyle = 0;
+            ClientDiscStates.Clear();
+
+            var nm = NetworkManager.Singleton;
+            if (nm == null || !nm.IsServer || nm.CustomMessagingManager == null) return;
+            if (nm.ConnectedClientsIds == null || nm.ConnectedClientsIds.Count == 0) return;
+
+            // discNetId = ulong.MaxValue signals clients to clear ALL held disc states
+            var writer = new FastBufferWriter(24, Allocator.Temp);
+            try
+            {
+                writer.WriteValueSafe(ulong.MaxValue);
+                writer.WriteValueSafe(ulong.MaxValue);
+                writer.WriteValueSafe((sbyte)0);
+                nm.CustomMessagingManager.SendNamedMessageToAll(StateMessageName, writer, NetworkDelivery.Reliable);
+            }
+            finally
+            {
+                writer.Dispose();
+            }
+        }
+
         public static void ServerBroadcastHolderState(Player holder, sbyte throwStyle, Puck disc = null)
         {
+            if (disc == null && holder == null)
+            {
+                ServerBroadcastClearAllHolders();
+                return;
+            }
+
             ulong discNetId = (disc != null && disc.NetworkObject != null) ? disc.NetworkObjectId : 0UL;
             ulong holderId = holder != null ? holder.OwnerClientId : ulong.MaxValue;
 
@@ -499,6 +549,14 @@ namespace PuckUltimateFrisbeeMod
                 reader.ReadValueSafe(out ulong discNetId);
                 reader.ReadValueSafe(out ulong holderId);
                 reader.ReadValueSafe(out sbyte throwStyle);
+
+                if (discNetId == ulong.MaxValue)
+                {
+                    ClientSyncedHolderId = ulong.MaxValue;
+                    ClientSyncedThrowStyle = 0;
+                    ClientDiscStates.Clear();
+                    return;
+                }
 
                 ClientSyncedHolderId = holderId;
                 ClientSyncedThrowStyle = throwStyle;
@@ -1604,6 +1662,37 @@ namespace PuckUltimateFrisbeeMod
         }
     }
 
+    [HarmonyPatch(typeof(Puck), "OnNetworkDespawn")]
+    public static class Puck_OnNetworkDespawn_Cleanup_Patch
+    {
+        [HarmonyPrefix]
+        public static void Prefix(Puck __instance)
+        {
+            if (__instance == null) return;
+
+            ulong discNetId = (__instance.NetworkObject != null) ? __instance.NetworkObjectId : 0UL;
+            UltimateNetworkSync.ClientDiscStates.Remove(discNetId);
+
+            if (UltimateRulesManager.DiscStates.TryGetValue(__instance, out var ds))
+            {
+                if (NetworkRoles.IsServer && ds.Holder != null && ds.Holder.PlayerBody != null)
+                {
+                    ds.Holder.PlayerBody.Server_Unfreeze();
+                }
+                UltimateRulesManager.DiscStates.Remove(__instance);
+            }
+
+            if (NetworkRoles.IsServer && UltimateRulesManager.Holder != null)
+            {
+                if (UltimateRulesManager.Holder.PlayerBody != null)
+                {
+                    UltimateRulesManager.Holder.PlayerBody.Server_Unfreeze();
+                }
+                UltimateRulesManager.Holder = null;
+            }
+        }
+    }
+
     // =========================================================================
      // 8. SERVER DISC PHYSICS, STAMINA-POWERED THROWS & RULES (Puck.FixedUpdate)
     // =========================================================================
@@ -2380,6 +2469,25 @@ namespace PuckUltimateFrisbeeMod
         private static void OnGamePhaseChanged(Puck disc, GamePhase prevPhase, GamePhase newPhase)
         {
             Level_GrassStadiumSetup_Patch.MoveSpawnPositionsToGoalLines();
+
+            if (newPhase == GamePhase.Warmup)
+            {
+                UltimateRulesManager.ResetPlayState();
+                if (MonoBehaviourSingleton<PlayerManager>.Instance != null)
+                {
+                    foreach (var p in MonoBehaviourSingleton<PlayerManager>.Instance.GetPlayers(false))
+                    {
+                        if (p != null && p.IsCharacterSpawned && p.PlayerBody != null)
+                            p.PlayerBody.Server_Unfreeze();
+                    }
+                }
+                if (disc != null && disc.Rigidbody != null)
+                {
+                    disc.Rigidbody.isKinematic = false;
+                    disc.Server_Unfreeze();
+                }
+                return;
+            }
 
             if (newPhase == GamePhase.FaceOff)
             {
@@ -3846,6 +3954,34 @@ namespace PuckUltimateFrisbeeMod
                 return;
             }
 
+            if (phase == GamePhase.Warmup)
+            {
+                UltimateRulesManager.ResetPlayState();
+
+                if (MonoBehaviourSingleton<PlayerManager>.Instance != null)
+                {
+                    foreach (var p in MonoBehaviourSingleton<PlayerManager>.Instance.GetPlayers(false))
+                    {
+                        if (p != null && p.IsCharacterSpawned && p.PlayerBody != null)
+                            p.PlayerBody.Server_Unfreeze();
+                    }
+                }
+
+                // Spread out existing warmup discs along the field so players can grab them easily
+                for (int i = 0; i < pucks.Count; i++)
+                {
+                    if (pucks[i] == null || pucks[i].Rigidbody == null) continue;
+                    pucks[i].Rigidbody.isKinematic = false;
+                    pucks[i].Server_Unfreeze();
+                    float xSpread = ((i % 5) - 2) * 5.0f;
+                    float zSpread = ((i / 5) - 1) * 8.0f;
+                    Vector3 warmupSpot = new Vector3(xSpread, UltimateVisualTuning.DiscHalfThickness + 0.05f, zSpread);
+                    pucks[i].Rigidbody.position = warmupSpot;
+                    pucks[i].transform.position = warmupSpot;
+                }
+                return;
+            }
+
             // During FaceOff or Play, keep ONLY the single match Frisbee and despawn extras!
             for (int i = 1; i < pucks.Count; i++)
             {
@@ -4882,6 +5018,8 @@ namespace PuckUltimateFrisbeeMod
         private static readonly FieldInfo _ambientDragField = AccessTools.Field(typeof(Movement), "ambientDrag")
                                                            ?? AccessTools.Field(typeof(Movement), "drag");
         private static readonly PropertyInfo _ambientDragProp = AccessTools.Property(typeof(Movement), "AmbientDrag");
+        private static readonly MethodInfo _standUpMethod = AccessTools.Method(typeof(PlayerBody), "Server_StandUp")
+                                                         ?? AccessTools.Method(typeof(PlayerBody), "StandUp");
 
         // Tracks previous tick stamina per player so we can scale down sprinting stamina drain
         internal static readonly Dictionary<ulong, float> PrevStamina = new Dictionary<ulong, float>();
@@ -4923,13 +5061,25 @@ namespace PuckUltimateFrisbeeMod
             }
 
             // -----------------------------------------------------------------
-            // 2. DIVE DRAG & AUTO-CLEAR LOGIC
+            // 2. DIVE DRAG, ANTI-ROLL STABILIZATION & FAST STAND-UP RECOVERY
             // -----------------------------------------------------------------
             if (!UltimateDiveMod.DiveToggled.Contains(id)) return;
             if (!UltimateDiveMod.DiveStartedAt.TryGetValue(id, out var t0)) return;
 
-            // Apply extra turf drag when player has fallen after diving
-            if (UltimateDiveMod.EnableDiveFallenDrag && __instance.HasFallen != null && __instance.HasFallen.Value && __instance.Movement != null)
+            float elapsed = Time.time - t0;
+            Rigidbody rb = __instance.Rigidbody;
+            bool hasFallen = __instance.HasFallen != null && __instance.HasFallen.Value;
+
+            // Prevent sideways barrel-rolling on the grass during a layout (keep chest facing the ground)
+            if (rb != null && hasFallen && elapsed < 1.15f)
+            {
+                Vector3 angVel = rb.angularVelocity;
+                // Dampen sideways roll/yaw spin once pitched forward
+                rb.angularVelocity = new Vector3(angVel.x * 0.85f, angVel.y * 0.2f, angVel.z * 0.2f);
+            }
+
+            // Apply turf chest-slide drag when fallen
+            if (UltimateDiveMod.EnableDiveFallenDrag && hasFallen && __instance.Movement != null)
             {
                 if (_ambientDragProp != null && _ambientDragProp.CanWrite)
                 {
@@ -4941,11 +5091,45 @@ namespace PuckUltimateFrisbeeMod
                 }
             }
 
-            float elapsed = Time.time - t0;
             if (elapsed < UltimateDiveMod.DiveAutoClearIfNoFallSeconds) return;
 
-            // Never fell -> clear toggle so dive can be used again
-            if (__instance.IsGrounded && (__instance.HasFallen == null || !__instance.HasFallen.Value))
+            float horizSpeed = rb != null ? new Vector2(rb.linearVelocity.x, rb.linearVelocity.z).magnitude : 0f;
+
+            // Fast athletic recovery: Stand the player back up after 1.15s (or after 0.80s if slide speed < 1.5 m/s)
+            bool shouldFastRecover = (elapsed >= 1.15f) || (elapsed >= 0.80f && horizSpeed < 1.5f);
+
+            if (hasFallen && shouldFastRecover)
+            {
+                if (_standUpMethod != null && _standUpMethod.GetParameters().Length == 0)
+                {
+                    _standUpMethod.Invoke(__instance, null);
+                }
+                else
+                {
+                    __instance.HasFallen.Value = false;
+                }
+
+                // Right the physics capsule smoothly back to vertical keeping current yaw
+                if (rb != null)
+                {
+                    Vector3 forwardFlat = Vector3.ProjectOnPlane(__instance.transform.forward, Vector3.up);
+                    if (forwardFlat.sqrMagnitude < 0.01f)
+                        forwardFlat = Vector3.ProjectOnPlane(__instance.transform.up, Vector3.up);
+                    if (forwardFlat.sqrMagnitude < 0.01f)
+                        forwardFlat = Vector3.forward;
+
+                    Quaternion uprightRot = Quaternion.LookRotation(forwardFlat.normalized, Vector3.up);
+                    rb.MoveRotation(uprightRot);
+                    __instance.transform.rotation = uprightRot;
+                    rb.angularVelocity = Vector3.zero;
+                }
+
+                UltimateDiveMod.ClearDiveState(player);
+                return;
+            }
+
+            // Also clear dive state if the player is already upright/grounded
+            if (!hasFallen && __instance.IsGrounded)
             {
                 UltimateDiveMod.ClearDiveState(player);
             }
@@ -5124,9 +5308,10 @@ namespace PuckUltimateFrisbeeMod
         private Movement _movement;
         private Vector3 _lastPos;
         private float _smoothedSpeed;
+        private bool _wasHoldingDisc;
         private UltimatePlayerMarker _marker;
 
-         public void Initialize(Player player, PlayerBody body, Movement movement)
+        public void Initialize(Player player, PlayerBody body, Movement movement)
         {
             _animator = GetComponent<Animator>();
             if (_animator != null)
@@ -5155,23 +5340,63 @@ namespace PuckUltimateFrisbeeMod
                 }
             }
 
-            float targetSpeed = 0f;
-            if (_player.IsLocalPlayer && _body.Speed != null)
+            // Compute reliable horizontal speed from both Rigidbody velocity and world position delta
+            float rbHorizSpeed = 0f;
+            if (_body.Rigidbody != null)
             {
-                targetSpeed = _body.Speed.Value;
+                Vector3 v = _body.Rigidbody.linearVelocity;
+                rbHorizSpeed = new Vector2(v.x, v.z).magnitude;
             }
-            else if (Time.deltaTime > 0.0001f)
+
+            float posDeltaSpeed = 0f;
+            if (Time.deltaTime > 0.0001f)
             {
                 Vector3 curH = new Vector3(_body.transform.position.x, 0f, _body.transform.position.z);
                 Vector3 lastH = new Vector3(_lastPos.x, 0f, _lastPos.z);
-                targetSpeed = Vector3.Distance(curH, lastH) / Time.deltaTime;
+                posDeltaSpeed = Vector3.Distance(curH, lastH) / Time.deltaTime;
                 _lastPos = _body.transform.position;
             }
 
-            bool isHoldingDisc = UltimateNetworkSync.IsPlayerHoldingAnyDisc(_player.OwnerClientId);
-            if (isHoldingDisc) targetSpeed = 0f; // Pivot foot locked
+            float netVarSpeed = (_body.Speed != null) ? _body.Speed.Value : 0f;
+            float targetSpeed = Mathf.Max(rbHorizSpeed, posDeltaSpeed, _player.IsLocalPlayer ? netVarSpeed : 0f);
+            if (targetSpeed > 28f) targetSpeed = rbHorizSpeed; // Ignore teleport spikes
 
-            _smoothedSpeed = Mathf.Lerp(_smoothedSpeed, targetSpeed, Time.deltaTime * 10f);
+            bool isHoldingDisc = UltimateNetworkSync.IsPlayerHoldingAnyDisc(_player.OwnerClientId);
+            bool isSprinting = _body.IsSprinting != null && _body.IsSprinting.Value && !isHoldingDisc && targetSpeed > 1.5f;
+
+            if (isHoldingDisc)
+            {
+                targetSpeed = 0f; // Pivot foot locked
+            }
+            else if (isSprinting)
+            {
+                // Ensure BlendTree hits the top Sprint threshold (8.5) reliably when sprinting
+                targetSpeed = Mathf.Max(targetSpeed * 1.25f, 8.5f);
+            }
+            else if (targetSpeed > 0.35f)
+            {
+                // Ensure BlendTree enters the Jog/Run threshold (4.0+) cleanly instead of sliding in Idle
+                targetSpeed = Mathf.Max(targetSpeed * 1.15f, 3.8f);
+            }
+
+            _smoothedSpeed = Mathf.Lerp(_smoothedSpeed, targetSpeed, Time.deltaTime * 14f);
+
+            // Runtime fix for the 3.05s Pivot State exit transition in the Animator Controller:
+            // The instant a player releases the disc (or if they are moving while not holding a disc),
+            // snap out of Pivot State into Locomotion!
+            if (_wasHoldingDisc && !isHoldingDisc)
+            {
+                _animator.CrossFadeInFixedTime("Locomotion", 0.12f, 0);
+            }
+            else if (!isHoldingDisc && _smoothedSpeed > 1.0f)
+            {
+                AnimatorStateInfo stateInfo = _animator.GetCurrentAnimatorStateInfo(0);
+                if (stateInfo.IsName("Pivot State"))
+                {
+                    _animator.CrossFadeInFixedTime("Locomotion", 0.10f, 0);
+                }
+            }
+            _wasHoldingDisc = isHoldingDisc;
 
             float currentTurn = 0f;
             if (_player.IsLocalPlayer && _movement != null)
@@ -5179,14 +5404,38 @@ namespace PuckUltimateFrisbeeMod
                 currentTurn = _movement.TurnSpeed * (_movement.IsTurningLeft ? -1f : 1f);
             }
 
+            // Only trigger Crouching Idle if nearly stationary; sliding while running causes wide-stance skating!
+            bool isCrouchingIdle = _body.IsSliding != null && _body.IsSliding.Value && _smoothedSpeed < 2.0f;
+
             _animator.SetFloat("fSpeed", _smoothedSpeed);
             _animator.SetFloat("fTurn", currentTurn);
-            _animator.SetBool("bIsSprinting", _body.IsSprinting != null && _body.IsSprinting.Value && !isHoldingDisc);
-            _animator.SetBool("bIsSliding", _body.IsSliding != null && _body.IsSliding.Value);
+            _animator.SetBool("bIsSprinting", isSprinting);
+            _animator.SetBool("bIsSliding", isCrouchingIdle);
             _animator.SetBool("bIsJumping", _body.IsJumping);
             _animator.SetBool("bHasFallen", (_body.HasFallen != null && _body.HasFallen.Value) || UltimateDiveMod.IsPlayerDiving(_player));
             _animator.SetBool("bIsGrounded", _body.IsGrounded);
             _animator.SetBool("bIsHoldingDisc", isHoldingDisc);
+
+            bool isFallenOrDiving = (_body.HasFallen != null && _body.HasFallen.Value) || UltimateDiveMod.IsPlayerDiving(_player);
+            _animator.SetBool("bHasFallen", isFallenOrDiving);
+
+            // Counter-rotate the visual athlete mesh against the physics capsule's pitch/roll when fallen
+            // so the Layout/Prone animation doesn't double-rotate 90° + 90° = 180°!
+            if (isFallenOrDiving)
+            {
+                Vector3 flatForward = Vector3.ProjectOnPlane(_body.transform.forward, Vector3.up);
+                if (flatForward.sqrMagnitude < 0.01f)
+                    flatForward = Vector3.ProjectOnPlane(_body.transform.up, Vector3.up);
+                if (flatForward.sqrMagnitude > 0.01f)
+                {
+                    Quaternion worldYawOnly = Quaternion.LookRotation(flatForward.normalized, Vector3.up);
+                    transform.rotation = Quaternion.Slerp(transform.rotation, worldYawOnly, Time.deltaTime * 18f);
+                }
+            }
+            else
+            {
+                transform.localRotation = Quaternion.Slerp(transform.localRotation, Quaternion.identity, Time.deltaTime * 18f);
+            }
         }
     }
 
@@ -5233,37 +5482,47 @@ namespace PuckUltimateFrisbeeMod
 
             try
             {
+                bool isFallen = _body.HasFallen != null && _body.HasFallen.Value;
+                bool isDiving = UltimateDiveMod.IsPlayerDiving(_player);
+
+                // While initially launching into a layout dive, reach the catching hand out (weight = 0.85f),
+                // but once laying prone/standing up on the turf, release IK (weight = 0f) so arms don't point into the sky!
+                float ikWeight = isFallen ? (isDiving ? 0.5f : 0.0f) : 1.0f;
+                if (ikWeight <= 0.01f)
+                {
+                    _animator.SetIKPositionWeight(AvatarIKGoal.LeftHand, 0f);
+                    _animator.SetIKRotationWeight(AvatarIKGoal.LeftHand, 0f);
+                    _animator.SetIKPositionWeight(AvatarIKGoal.RightHand, 0f);
+                    _animator.SetIKRotationWeight(AvatarIKGoal.RightHand, 0f);
+                    return;
+                }
+
                 bool isLeft = _player.Handedness != null && _player.Handedness.Value == PlayerHandedness.Left;
                 AvatarIKGoal throwingHand = isLeft ? AvatarIKGoal.LeftHand : AvatarIKGoal.RightHand;
                 AvatarIKHint throwingElbow = isLeft ? AvatarIKHint.LeftElbow : AvatarIKHint.RightElbow;
                 AvatarIKGoal offHand = isLeft ? AvatarIKGoal.RightHand : AvatarIKGoal.LeftHand;
 
-                // 1. Dominant Hand IK -> Reaches to exact Frisbee Catch/Throw Position!
                 Vector3 handWorldPos = UltimateRulesManager.GetHandWorldPosition(_player.Stick, out Vector3 shoulderAnchor, out Vector3 shaftDir);
                 float wristRoll = _player.Stick.BladeAngle * UltimateVisualTuning.WristRollMultiplier;
                 Quaternion aimRot = Quaternion.LookRotation(shaftDir, Vector3.up) * Quaternion.Euler(0f, 0f, wristRoll);
 
-                // In our Blender T-Pose, LeftHand bone points +X (-90° yaw from +Z) and RightHand points -X (+90° yaw from +Z).
-                // Applying this offset aligns the avatar's fingers/palm with the Frisbee rim!
                 Quaternion handBoneAlign = Quaternion.Euler(0f, isLeft ? -90f : 90f, 0f);
                 Quaternion finalHandIKRot = aimRot * handBoneAlign;
 
-                _animator.SetIKPositionWeight(throwingHand, 1.0f);
-                _animator.SetIKRotationWeight(throwingHand, 1.0f);
+                _animator.SetIKPositionWeight(throwingHand, ikWeight);
+                _animator.SetIKRotationWeight(throwingHand, ikWeight);
                 _animator.SetIKPosition(throwingHand, handWorldPos);
                 _animator.SetIKRotation(throwingHand, finalHandIKRot);
 
-                // 2. Natural Elbow Hint -> Keeps the elbow tucked down/outward on Forehands & Backhands
                 Vector3 elbowHintPos = Vector3.Lerp(shoulderAnchor, handWorldPos, 0.45f)
                                      + Vector3.down * 0.25f
                                      + _body.transform.right * (isLeft ? -0.18f : 0.18f);
-                _animator.SetIKHintPositionWeight(throwingElbow, 0.65f);
+                _animator.SetIKHintPositionWeight(throwingElbow, 0.65f * ikWeight);
                 _animator.SetIKHintPosition(throwingElbow, elbowHintPos);
 
-                // 3. Off-Hand IK -> Athletic counterbalance pose
                 Vector3 offHandLocal = new Vector3(isLeft ? 0.28f : -0.28f, 1.05f, 0.14f);
                 Vector3 offHandWorld = _body.transform.TransformPoint(offHandLocal);
-                _animator.SetIKPositionWeight(offHand, 0.35f);
+                _animator.SetIKPositionWeight(offHand, 0.35f * ikWeight);
                 _animator.SetIKRotationWeight(offHand, 0f);
                 _animator.SetIKPosition(offHand, offHandWorld);
             }
@@ -5280,10 +5539,12 @@ namespace PuckUltimateFrisbeeMod
             Camera cam = Camera.main;
             if (cam == null) return true;
 
-            // In 1st-person, the camera sits at the head (~1.4m-1.8m above feet, < 0.85m horizontally from body).
-            // If the player switches to 3rd-person or free cam, the camera moves > 1.2m away!
-            Vector3 headPos = body.transform.position + Vector3.up * 1.6f;
-            return Vector3.Distance(cam.transform.position, headPos) < 1.15f;
+            // Use body.transform.up so when the player lays flat during a dive, the head offset rotates with them!
+            Vector3 localHeadPos = body.transform.position + body.transform.up * 1.5f;
+            float distToHead = Vector3.Distance(cam.transform.position, localHeadPos);
+            float distToCenter = Vector3.Distance(cam.transform.position, body.transform.position + Vector3.up * 0.8f);
+
+            return Mathf.Min(distToHead, distToCenter) < 1.85f;
         }
 
         private void LateUpdate()
