@@ -127,7 +127,7 @@ namespace PuckUltimateFrisbeeMod
 
         public static float DiscWorldRadius = 0.24f;
         public static float DiscHalfThickness = 0.035f;
-        public static float WristRollMultiplier = 1.35f;
+        public static float WristRollMultiplier = 3.25f;
 
         // Hard-coded from your in-game F8 fine-tuning:
         public static Vector3 HeldDiscHandOffset = new Vector3(-0.068f, 0.125f, 0.128f);
@@ -999,12 +999,13 @@ namespace PuckUltimateFrisbeeMod
             if (holder.PlayerInput != null)
             {
                 Vector2 stickAngle = holder.PlayerInput.StickRaycastOriginAngleInput.ServerValue;
-                if (stickAngle.x < -12f)
+                float effectiveRoll = Mathf.Abs(wristRoll * UltimateVisualTuning.WristRollMultiplier);
+                // Trigger Hammer/Scoober if aiming overhead OR if the wrist is rolled upside-down (> 105 deg)
+                if (stickAngle.x < -10f || effectiveRoll > 105f)
                 {
                     return UltimateThrowType.Hammer;
                 }
             }
-
             return isForehandSide ? UltimateThrowType.Forehand : UltimateThrowType.Backhand;
         }
 
@@ -2792,9 +2793,15 @@ namespace PuckUltimateFrisbeeMod
             launchDir.Normalize();
 
             float discHorizonPitchDeg = Mathf.Clamp(launchPitchDeg * 0.45f + 2.0f, -4f, 16f);
-            float initialRollDeg = (throwType == UltimateThrowType.Hammer)
-                ? 150f * spinSign
-                : Mathf.Clamp(hyzerAngle, -75f, 75f);
+
+            // Allow full -165 to +165 deg roll from mouse wheel so players can throw steep blades, Hammers, and Scoobers!
+            float initialRollDeg = Mathf.Clamp(hyzerAngle, -165f, 165f);
+            if (throwType == UltimateThrowType.Hammer && Mathf.Abs(initialRollDeg) < 110f)
+            {
+                // If throwing an overhead Hammer without manually rolling the mouse wheel all the way over,
+                // blend your mouse-wheel angle into the inverted Hammer release angle:
+                initialRollDeg = Mathf.Clamp((145f * spinSign) + (hyzerAngle * 0.25f), -170f, 170f);
+            }
 
             Quaternion launchRot = aimYawRot * Quaternion.Euler(-discHorizonPitchDeg, 0f, initialRollDeg);
 
@@ -4936,6 +4943,18 @@ namespace PuckUltimateFrisbeeMod
         internal static readonly Dictionary<ulong, float> DiveStartedAt = new Dictionary<ulong, float>();
         internal static readonly HashSet<ulong> DiveToggled = new HashSet<ulong>();
 
+        // --- Q/E STRAFING & CROUCH SKY-JUMP SETTINGS ---
+        internal static readonly Dictionary<ulong, sbyte> ClientStrafeState = new Dictionary<ulong, sbyte>();
+        internal static readonly Dictionary<ulong, float> LastCrouchTime = new Dictionary<ulong, float>();
+        internal static readonly Dictionary<ulong, float> LastSkyJumpTime = new Dictionary<ulong, float>();
+        internal static readonly Dictionary<ulong, bool> WasJumpingLastTick = new Dictionary<ulong, bool>();
+
+        public static float StrafeRunSpeed = 5.8f;          // Normal sideways run speed (m/s)
+        public static float StrafeSprintSpeed = 7.6f;       // Sprint sideways speed (m/s)
+        public static float StrafeResponsiveness = 18.0f;   // How quickly you reach strafe speed
+        public static float SkyJumpVerticalVelocity = 5.1f; // High vertical spring for sky battles!
+        public static float SkyJumpStaminaCost = 0.18f;     // Stamina used by a crouch-spring jump
+
         private static CustomMessagingManager _registeredCmm = null;
 
         public static void EnsureNetworkRegistered()
@@ -4958,6 +4977,10 @@ namespace PuckUltimateFrisbeeMod
             _registeredCmm = null;
             DiveStartedAt.Clear();
             DiveToggled.Clear();
+            ClientStrafeState.Clear();
+            LastCrouchTime.Clear();
+            LastSkyJumpTime.Clear();
+            WasJumpingLastTick.Clear();
         }
 
         public static void ClientSendDiveAction()
@@ -5006,6 +5029,46 @@ namespace PuckUltimateFrisbeeMod
             }
         }
 
+        public static void ClientSendStrafeState(sbyte strafeDir)
+        {
+            EnsureNetworkRegistered();
+            var nm = NetworkManager.Singleton;
+            if (nm == null || !nm.IsConnectedClient || nm.CustomMessagingManager == null) return;
+
+            if (NetworkRoles.IsServer)
+            {
+                ClientStrafeState[nm.LocalClientId] = strafeDir;
+                return;
+            }
+
+            using (var writer = new FastBufferWriter(4, Allocator.Temp))
+            {
+                writer.WriteValueSafe((byte)3); // 3 = Q/E Strafe State
+                writer.WriteValueSafe(strafeDir);
+                nm.CustomMessagingManager.SendNamedMessage(DiveMessageName, NetworkManager.ServerClientId, writer, NetworkDelivery.Reliable);
+            }
+        }
+
+        public static void ClientSendSkyJumpAction()
+        {
+            EnsureNetworkRegistered();
+            var nm = NetworkManager.Singleton;
+            if (nm == null || !nm.IsConnectedClient || nm.CustomMessagingManager == null) return;
+
+            if (NetworkRoles.IsServer)
+            {
+                Player localPlayer = MonoBehaviourSingleton<PlayerManager>.Instance?.GetPlayerByClientId(nm.LocalClientId);
+                if (localPlayer != null) ServerTrySkyJump(localPlayer);
+                return;
+            }
+
+            using (var writer = new FastBufferWriter(4, Allocator.Temp))
+            {
+                writer.WriteValueSafe((byte)4); // 4 = Crouch-Spring Sky Jump
+                nm.CustomMessagingManager.SendNamedMessage(DiveMessageName, NetworkManager.ServerClientId, writer, NetworkDelivery.Reliable);
+            }
+        }
+
         public static void ServerCancelPlayerThrow(Player player)
         {
             if (player == null) return;
@@ -5013,6 +5076,43 @@ namespace PuckUltimateFrisbeeMod
             {
                 tracker.CancelCharge(player.PlayerBody);
             }
+        }
+
+        public static void ServerTrySkyJump(Player player)
+        {
+            if (player == null || player.PlayerBody == null || player.PlayerBody.Rigidbody == null) return;
+            var body = player.PlayerBody;
+            var rb = body.Rigidbody;
+            ulong id = player.NetworkObjectId;
+
+            if (IsFaceOff() || !body.IsGrounded || (body.HasFallen != null && body.HasFallen.Value)) return;
+            if (UltimateRulesManager.Holder == player || UltimateNetworkSync.IsPlayerHoldingAnyDisc(player.OwnerClientId)) return;
+
+            // Cooldown check (0.65s between sky jumps)
+            if (LastSkyJumpTime.TryGetValue(id, out float lastJump) && (Time.time - lastJump) < 0.65f) return;
+
+            // Must currently be crouching (Ctrl) OR have released Ctrl within the last 0.30s
+            bool isCrouched = body.IsSliding != null && body.IsSliding.Value;
+            bool recentlyCrouched = LastCrouchTime.TryGetValue(id, out float crouchT) && (Time.time - crouchT) <= 0.30f;
+            if (!isCrouched && !recentlyCrouched) return;
+
+            if (body.Stamina != null && body.Stamina.Value < SkyJumpStaminaCost) return;
+
+            LastSkyJumpTime[id] = Time.time;
+            if (body.Stamina != null)
+            {
+                body.Stamina.Value = Mathf.Max(0f, body.Stamina.Value - SkyJumpStaminaCost);
+            }
+
+            // Un-crouch the player so they spring upright into the air
+            if (body.IsSliding != null) body.IsSliding.Value = false;
+
+            // Apply high vertical launch velocity while preserving horizontal run/strafe momentum!
+            Vector3 vel = rb.linearVelocity;
+            vel.y = SkyJumpVerticalVelocity;
+            rb.linearVelocity = vel;
+
+            UltimateAudioManager.ServerBroadcastSound(UltimateSoundType.Throw, body.transform.position, 0.45f, 1.15f);
         }
 
         private static void OnDiveMessageReceived(ulong senderClientId, FastBufferReader reader)
@@ -5023,12 +5123,27 @@ namespace PuckUltimateFrisbeeMod
             byte actionType = 1;
             try { reader.ReadValueSafe(out actionType); } catch { }
 
+            if (actionType == 3)
+            {
+                try
+                {
+                    reader.ReadValueSafe(out sbyte strafeDir);
+                    ClientStrafeState[senderClientId] = strafeDir;
+                }
+                catch { }
+                return;
+            }
+
             Player player = MonoBehaviourSingleton<PlayerManager>.Instance.GetPlayerByClientId(senderClientId);
             if (player == null) return;
 
             if (actionType == 2)
             {
                 ServerCancelPlayerThrow(player);
+            }
+            else if (actionType == 4)
+            {
+                ServerTrySkyJump(player);
             }
             else if (player.PlayerInput != null)
             {
@@ -5064,8 +5179,11 @@ namespace PuckUltimateFrisbeeMod
             }
 
             var move = input.MoveInput.ServerValue;
+            sbyte strafe = ClientStrafeState.TryGetValue(player.OwnerClientId, out sbyte s) ? s : (sbyte)0;
+            float horizAxis = Mathf.Abs(move.x) > MinAxis ? Mathf.Sign(move.x) : strafe;
+
             Vector3 dir = (Mathf.Abs(move.y) > MinAxis ? body.transform.forward * Mathf.Sign(move.y) : Vector3.zero)
-                        + (Mathf.Abs(move.x) > MinAxis ? body.transform.right * Mathf.Sign(move.x) : Vector3.zero);
+                        + (Mathf.Abs(horizAxis) > MinAxis ? body.transform.right * horizAxis : Vector3.zero);
             if (dir == Vector3.zero) dir = body.transform.forward;
             dir.Normalize();
 
@@ -5098,6 +5216,8 @@ namespace PuckUltimateFrisbeeMod
         public PlayerBody Body;
         private float _lastDiveSendTime = -999f;
         private const float ClientDiveCooldown = 0.5f;
+        private sbyte _lastSentStrafe = 0;
+        private float _lastLocalCrouchTime = -999f;
 
         private static bool IsTypingOrPaused()
         {
@@ -5117,12 +5237,34 @@ namespace PuckUltimateFrisbeeMod
         private void Update()
         {
             if (Body == null || Body.Player == null || !Body.Player.IsLocalPlayer) return;
-            if (IsTypingOrPaused()) return;
 
             var kb = UnityEngine.InputSystem.Keyboard.current;
             var mouse = UnityEngine.InputSystem.Mouse.current;
 
-            // If holding a disc: Right-Click, R key, or Spacebar cancels the throw windup (Pump Fake!)
+            if (IsTypingOrPaused())
+            {
+                if (_lastSentStrafe != 0)
+                {
+                    _lastSentStrafe = 0;
+                    UltimateDiveMod.ClientSendStrafeState(0);
+                }
+                return;
+            }
+
+            // --- 1. Q / E LATERAL STRAFE INPUT ---
+            sbyte currentStrafe = 0;
+            if (kb != null)
+            {
+                if (kb.qKey.isPressed) currentStrafe -= 1;
+                if (kb.eKey.isPressed) currentStrafe += 1;
+            }
+            if (currentStrafe != _lastSentStrafe)
+            {
+                _lastSentStrafe = currentStrafe;
+                UltimateDiveMod.ClientSendStrafeState(currentStrafe);
+            }
+
+            // --- 2. IF HOLDING DISC: PUMP FAKE (Right-Click / R / Space) ---
             if (UltimateNetworkSync.IsPlayerHoldingAnyDisc(Body.Player.OwnerClientId))
             {
                 bool cancelPressed = (kb != null && (kb.rKey.wasPressedThisFrame || kb.spaceKey.wasPressedThisFrame)) ||
@@ -5134,8 +5276,21 @@ namespace PuckUltimateFrisbeeMod
                 return;
             }
 
-            bool divePressed = (kb != null && kb.fKey.wasPressedThisFrame);
+            // --- 3. CROUCH + JUMP (CTRL + SPACE) SKY JUMP ---
+            bool isCrouchHeld = (kb != null && (kb.leftCtrlKey.isPressed || kb.rightCtrlKey.isPressed)) ||
+                                (Body.IsSliding != null && Body.IsSliding.Value);
+            if (isCrouchHeld)
+            {
+                _lastLocalCrouchTime = Time.unscaledTime;
+            }
 
+            if (kb != null && kb.spaceKey.wasPressedThisFrame && (Time.unscaledTime - _lastLocalCrouchTime) <= 0.30f)
+            {
+                UltimateDiveMod.ClientSendSkyJumpAction();
+            }
+
+            // --- 4. F KEY DIVE / LAYOUT ---
+            bool divePressed = (kb != null && kb.fKey.wasPressedThisFrame);
             if (divePressed && (Time.unscaledTime - _lastDiveSendTime) >= ClientDiveCooldown)
             {
                 _lastDiveSendTime = Time.unscaledTime;
@@ -5144,13 +5299,14 @@ namespace PuckUltimateFrisbeeMod
         }
     }
 
-   // Slow down sprint stamina drain, auto-clear dive state, and apply turf slide drag when fallen
+    // Slow down sprint stamina drain, auto-clear dive state, and apply turf slide drag when fallen
     [HarmonyPatch(typeof(PlayerBody), "FixedUpdate")]
     public static class PlayerBody_DiveAutoClearAndDrag_Patch
     {
         private static readonly FieldInfo _ambientDragField = AccessTools.Field(typeof(Movement), "ambientDrag")
                                                            ?? AccessTools.Field(typeof(Movement), "drag");
         private static readonly PropertyInfo _ambientDragProp = AccessTools.Property(typeof(Movement), "AmbientDrag");
+        private static readonly FieldInfo _skateTractionField = AccessTools.Field(typeof(Skate), "traction");
 
         private static readonly MethodInfo _recoverMethod =
             AccessTools.Method(typeof(PlayerBody), "Server_Recover") ??
@@ -5159,11 +5315,23 @@ namespace PuckUltimateFrisbeeMod
             AccessTools.Method(typeof(PlayerBody), "StandUp") ??
             AccessTools.Method(typeof(PlayerBody), "OnStandUp");
 
-        // Tracks previous tick stamina per player so we can scale down sprinting stamina drain
         internal static readonly Dictionary<ulong, float> PrevStamina = new Dictionary<ulong, float>();
-
-        // Gently damps residual angular velocity right after standing up WITHOUT locking RigidbodyConstraints
         internal static readonly Dictionary<ulong, float> PostDiveStabilizeUntil = new Dictionary<ulong, float>();
+        internal static readonly Dictionary<ulong, Skate[]> CachedSkates = new Dictionary<ulong, Skate[]>();
+
+        private static void SetPlayerSkateTraction(ulong id, PlayerBody body, float tractionValue)
+        {
+            if (_skateTractionField == null || body == null) return;
+            if (!CachedSkates.TryGetValue(id, out Skate[] skates) || skates == null)
+            {
+                skates = body.GetComponentsInChildren<Skate>(true);
+                CachedSkates[id] = skates;
+            }
+            for (int i = 0; i < skates.Length; i++)
+            {
+                if (skates[i] != null) _skateTractionField.SetValue(skates[i], tractionValue);
+            }
+        }
 
         [HarmonyPostfix]
         public static void Postfix(PlayerBody __instance)
@@ -5175,16 +5343,13 @@ namespace PuckUltimateFrisbeeMod
             Rigidbody rb = __instance.Rigidbody;
 
             // -----------------------------------------------------------------
-            // 0. POST-DIVE ANGULAR DAMPING (Prevents double-trip WITHOUT locking constraints!)
+            // 0. POST-DIVE ANGULAR DAMPING
             // -----------------------------------------------------------------
             if (PostDiveStabilizeUntil.TryGetValue(id, out float stabilizeUntil))
             {
                 if (Time.time < stabilizeUntil && rb != null)
                 {
-                    // Ensure X/Z rotation constraints are NEVER left locked from anything else
                     rb.constraints &= ~(RigidbodyConstraints.FreezeRotationX | RigidbodyConstraints.FreezeRotationZ);
-
-                    // Dampen pitch/roll angular velocity so the stand-up impulse doesn't re-tip the player
                     Vector3 av = rb.angularVelocity;
                     rb.angularVelocity = new Vector3(av.x * 0.25f, av.y, av.z * 0.25f);
                 }
@@ -5194,22 +5359,83 @@ namespace PuckUltimateFrisbeeMod
                 }
             }
 
+            bool isHoldingDisc = (UltimateRulesManager.Holder == player) ||
+                                 UltimateNetworkSync.IsPlayerHoldingAnyDisc(player.OwnerClientId);
+            bool isDiving = UltimateDiveMod.DiveToggled.Contains(id);
+            bool isSprinting = __instance.IsSprinting != null && __instance.IsSprinting.Value;
+            bool hasFallen = __instance.HasFallen != null && __instance.HasFallen.Value;
+            bool isFaceOff = NetworkBehaviourSingleton<GameManager>.Instance != null &&
+                             NetworkBehaviourSingleton<GameManager>.Instance.Phase == GamePhase.FaceOff;
+
             // -----------------------------------------------------------------
-            // 1. SLOW DOWN SPRINT STAMINA DEPLETION WHEN RUNNING
+            // 1. TRACK CROUCH (SLIDING) & VANILLA JUMP TRANSITION FOR SKY JUMPS
+            // -----------------------------------------------------------------
+            if (__instance.IsSliding != null && __instance.IsSliding.Value)
+            {
+                UltimateDiveMod.LastCrouchTime[id] = Time.time;
+            }
+
+            bool isJumpingNow = __instance.IsJumping;
+            bool wasJumping = UltimateDiveMod.WasJumpingLastTick.TryGetValue(id, out bool wj) && wj;
+            UltimateDiveMod.WasJumpingLastTick[id] = isJumpingNow;
+
+            // If vanilla jump just fired within 0.30s of crouching, upgrade it to a Sky Jump!
+            if (isJumpingNow && !wasJumping &&
+                UltimateDiveMod.LastCrouchTime.TryGetValue(id, out float lastCrouchT) &&
+                (Time.time - lastCrouchT) <= 0.30f)
+            {
+                UltimateDiveMod.ServerTrySkyJump(player);
+            }
+
+            // -----------------------------------------------------------------
+            // 1B. Q / E LATERAL RUNNING (BYPASSES SKATE TRACTION!)
+            // -----------------------------------------------------------------
+            sbyte strafeDir = 0;
+            if (UltimateDiveMod.ClientStrafeState.TryGetValue(player.OwnerClientId, out sbyte sd))
+            {
+                strafeDir = sd;
+            }
+
+            if (rb != null && strafeDir != 0 && !isFaceOff && !isHoldingDisc && !hasFallen && !isDiving && __instance.IsGrounded)
+            {
+                // Disable Skate lateral traction while holding Q/E so Skate doesn't brake our sideways velocity!
+                SetPlayerSkateTraction(id, __instance, 0f);
+
+                Vector3 rightDir = Vector3.ProjectOnPlane(__instance.transform.right, Vector3.up).normalized;
+                Vector3 forwardDir = Vector3.ProjectOnPlane(__instance.transform.forward, Vector3.up).normalized;
+
+                Vector3 vel = rb.linearVelocity;
+                float forwardSpeed = Vector3.Dot(vel, forwardDir);
+                float currentRightSpeed = Vector3.Dot(vel, rightDir);
+
+                float targetRightSpeed = strafeDir * (isSprinting ? UltimateDiveMod.StrafeSprintSpeed : UltimateDiveMod.StrafeRunSpeed);
+                float newRightSpeed = Mathf.MoveTowards(
+                    currentRightSpeed,
+                    targetRightSpeed,
+                    UltimateDiveMod.StrafeResponsiveness * Time.fixedDeltaTime
+                );
+
+                // Reconstruct velocity keeping forward/backward speed & vertical speed intact
+                Vector3 newVel = (forwardDir * forwardSpeed) + (rightDir * newRightSpeed);
+                newVel.y = vel.y;
+                rb.linearVelocity = newVel;
+            }
+            else
+            {
+                // Restore normal turf traction when not actively strafing
+                SetPlayerSkateTraction(id, __instance, 2.5f);
+            }
+
+            // -----------------------------------------------------------------
+            // 1C. SLOW DOWN SPRINT STAMINA DEPLETION WHEN RUNNING
             // -----------------------------------------------------------------
             if (__instance.Stamina != null)
             {
                 float currentStamina = __instance.Stamina.Value;
-                bool isHoldingDisc = (UltimateRulesManager.Holder == player) ||
-                                     UltimateNetworkSync.IsPlayerHoldingAnyDisc(player.OwnerClientId);
-                bool isDiving = UltimateDiveMod.DiveToggled.Contains(id);
-                bool isSprinting = __instance.IsSprinting != null && __instance.IsSprinting.Value;
 
                 if (PrevStamina.TryGetValue(id, out float prevStamina))
                 {
                     float drain = prevStamina - currentStamina;
-
-                    // Only refund gradual sprinting drain (ignores instant 0f dive cost & throw wind-up meter)
                     if (isSprinting && !isHoldingDisc && !isDiving && drain > 0f && drain < 0.15f)
                     {
                         float mult = Mathf.Clamp(UltimateRulesManager.SprintStaminaDrainMultiplier, 0.05f, 1.0f);
@@ -5229,16 +5455,13 @@ namespace PuckUltimateFrisbeeMod
             if (!UltimateDiveMod.DiveStartedAt.TryGetValue(id, out var t0)) return;
 
             float elapsed = Time.time - t0;
-            bool hasFallen = __instance.HasFallen != null && __instance.HasFallen.Value;
 
-            // Prevent sideways barrel-rolling on the grass during a layout while allowing forward pitch
             if (rb != null && hasFallen && elapsed < 1.35f)
             {
                 Vector3 angVel = rb.angularVelocity;
                 rb.angularVelocity = new Vector3(angVel.x * 0.85f, angVel.y * 0.25f, angVel.z * 0.25f);
             }
 
-            // Apply turf chest-slide drag when fallen
             if (UltimateDiveMod.EnableDiveFallenDrag && hasFallen && __instance.Movement != null)
             {
                 if (_ambientDragProp != null && _ambientDragProp.CanWrite)
@@ -5254,8 +5477,6 @@ namespace PuckUltimateFrisbeeMod
             if (elapsed < UltimateDiveMod.DiveAutoClearIfNoFallSeconds) return;
 
             float horizSpeed = rb != null ? new Vector2(rb.linearVelocity.x, rb.linearVelocity.z).magnitude : 0f;
-
-            // Allow full layout animation & chest slide to finish (~1.35s, or 1.10s once slide slows down)
             bool shouldRecover = (elapsed >= 1.45f) || (elapsed >= 1.15f && horizSpeed < 1.0f);
 
             if (hasFallen && shouldRecover)
@@ -5272,8 +5493,6 @@ namespace PuckUltimateFrisbeeMod
 
                 if (rb != null)
                 {
-                    // Kill leftover tumbling spin so vanilla upright spring smoothly stands the capsule up
-                    // without popping into the air or locking RigidbodyConstraints!
                     rb.angularVelocity = Vector3.zero;
                 }
 
@@ -5304,6 +5523,11 @@ namespace PuckUltimateFrisbeeMod
             UltimateDiveMod.DiveStartedAt.Remove(id);
             PlayerBody_DiveAutoClearAndDrag_Patch.PrevStamina.Remove(id);
             PlayerBody_DiveAutoClearAndDrag_Patch.PostDiveStabilizeUntil.Remove(id);
+            UltimateDiveMod.ClientStrafeState.Remove(player.OwnerClientId);
+            UltimateDiveMod.LastCrouchTime.Remove(id);
+            UltimateDiveMod.LastSkyJumpTime.Remove(id);
+            UltimateDiveMod.WasJumpingLastTick.Remove(id);
+            PlayerBody_DiveAutoClearAndDrag_Patch.CachedSkates.Remove(id);
         }
     }
     
