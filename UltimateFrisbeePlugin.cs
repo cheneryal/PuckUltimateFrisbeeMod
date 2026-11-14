@@ -6883,6 +6883,36 @@ namespace PuckUltimateFrisbeeMod
         private Texture2D _softGlowTex;
         private Texture2D _leafTex;
 
+        // --- MINIMALIST CONTROLS HUD STATE & STYLES ---
+        private bool _showControlsHud = true;
+        private GUIStyle _hudTitleStyle;
+        private GUIStyle _hudHintStyle;
+        private GUIStyle _hudActionStyle;
+        private GUIStyle _hudKeyTextStyle;
+        private GUIStyle _hudPillTextStyle;
+
+        private static readonly (string Action, string Key)[] _runningControls = new[]
+        {
+            ("Sprint / Charge", "Hold Shift"),
+            ("Layout Dive",     "F"),
+            ("Sky Jump",        "Ctrl + Space"),
+            ("Strafe Run",      "Q / E"),
+            ("Wrist Angle",     "Scroll Wheel"),
+            ("Cancel Charge",   "RMB / Space"),
+            ("Track Disc",      "Hold LMB")
+        };
+
+        private static readonly (string Action, string Key)[] _holdingDiscControls = new[]
+        {
+            ("Power + Whip",     "Hold + Release Shift"),
+            ("Pump Fake",        "RMB / Space / R"),
+            ("Back / Forehand",  "Mouse L / R"),
+            ("Hyzer / Blade",    "Scroll Wheel"),
+            ("Hammer / Scoober", "Aim High / Flip"),
+            ("Pivot Step",       "W / A / S / D"),
+            ("Track Disc",       "Hold LMB")
+        };
+
         private void Start()
         {
             SetupAmbientWindAudio();
@@ -7226,6 +7256,13 @@ namespace PuckUltimateFrisbeeMod
 
         private void Update()
         {
+            // Toggle Minimalist Controls HUD with F1
+            if (UnityEngine.InputSystem.Keyboard.current != null &&
+                UnityEngine.InputSystem.Keyboard.current.f1Key.wasPressedThisFrame)
+            {
+                _showControlsHud = !_showControlsHud;
+            }
+
             UltimateWindManager.ClientUpdate(Time.deltaTime);
 
             Vector3 wind = UltimateWindManager.CurrentWindVelocity;
@@ -7364,6 +7401,169 @@ namespace PuckUltimateFrisbeeMod
             };
             subStyle.normal.textColor = new Color(0.9f, 0.92f, 0.95f, 0.85f);
             GUI.Label(new Rect(panelRect.x, dialCenter.y + dialRadius + 20f, boxW, 18f), relLabel, subStyle);
+            // Draw the Bottom-Right Context-Aware Minimalist Controls HUD
+            DrawMinimalistControlsHUD();
+        }
+
+        private void EnsureControlsHudStyles()
+        {
+            if (_hudTitleStyle != null) return;
+
+            _hudTitleStyle = new GUIStyle(GUI.skin.label)
+            {
+                alignment = TextAnchor.MiddleLeft,
+                fontSize = 11,
+                fontStyle = FontStyle.Bold
+            };
+
+            _hudHintStyle = new GUIStyle(GUI.skin.label)
+            {
+                alignment = TextAnchor.MiddleRight,
+                fontSize = 10,
+                fontStyle = FontStyle.Normal
+            };
+            _hudHintStyle.normal.textColor = new Color(0.68f, 0.74f, 0.80f, 0.75f);
+
+            _hudActionStyle = new GUIStyle(GUI.skin.label)
+            {
+                alignment = TextAnchor.MiddleLeft,
+                fontSize = 11,
+                fontStyle = FontStyle.Normal
+            };
+            _hudActionStyle.normal.textColor = new Color(0.90f, 0.93f, 0.96f, 0.92f);
+
+            _hudKeyTextStyle = new GUIStyle(GUI.skin.label)
+            {
+                alignment = TextAnchor.MiddleCenter,
+                fontSize = 10,
+                fontStyle = FontStyle.Bold
+            };
+
+            _hudPillTextStyle = new GUIStyle(GUI.skin.label)
+            {
+                alignment = TextAnchor.MiddleCenter,
+                fontSize = 11,
+                fontStyle = FontStyle.Bold
+            };
+            _hudPillTextStyle.normal.textColor = new Color(0.90f, 0.94f, 0.98f, 0.90f);
+        }
+
+        private void DrawSolidRect(Rect rect, Color color)
+        {
+            if (_whiteTex == null) return;
+            Color prev = GUI.color;
+            GUI.color = color;
+            GUI.DrawTexture(rect, _whiteTex);
+            GUI.color = prev;
+        }
+
+        private void DrawMinimalistControlsHUD()
+        {
+            if (_whiteTex == null) return;
+            EnsureControlsHudStyles();
+
+            // Check if the local player is currently holding any disc
+            bool isHoldingDisc = false;
+            var nm = NetworkManager.Singleton;
+            if (nm != null && nm.IsClient)
+            {
+                isHoldingDisc = UltimateNetworkSync.IsPlayerHoldingAnyDisc(nm.LocalClientId);
+            }
+
+            // Blue Accent when Running / Defending, Green Accent when Holding Disc
+            Color accentColor = isHoldingDisc
+                ? new Color(0.18f, 0.85f, 0.48f, 0.95f)  // Green Accent
+                : new Color(0.28f, 0.68f, 1.00f, 0.95f); // Blue Accent
+
+            float margin = 22f;
+
+            // -----------------------------------------------------------------
+            // 1. COLLAPSED PILL STATE: "[F1] Show Controls" in bottom-right
+            // -----------------------------------------------------------------
+            if (!_showControlsHud)
+            {
+                float pillW = 148f;
+                float pillH = 26f;
+                Rect pillRect = new Rect(Screen.width - pillW - margin, Screen.height - pillH - margin, pillW, pillH);
+
+                // Dark translucent pill background + subtle border + left accent bar
+                DrawSolidRect(pillRect, new Color(0.06f, 0.09f, 0.13f, 0.72f));
+                DrawSolidRect(new Rect(pillRect.x, pillRect.y, 3f, pillRect.height), accentColor);
+                DrawSolidRect(new Rect(pillRect.x, pillRect.y, pillRect.width, 1f), new Color(1f, 1f, 1f, 0.12f));
+                DrawSolidRect(new Rect(pillRect.x, pillRect.yMax - 1f, pillRect.width, 1f), new Color(1f, 1f, 1f, 0.12f));
+
+                GUI.Label(pillRect, "[F1] Show Controls", _hudPillTextStyle);
+                return;
+            }
+
+            // -----------------------------------------------------------------
+            // 2. EXPANDED CONTEXT-AWARE CONTROLS HUD
+            // -----------------------------------------------------------------
+            var controls = isHoldingDisc ? _holdingDiscControls : _runningControls;
+            string modeTitle = isHoldingDisc ? "HOLDING DISC" : "RUNNING / DEFENSE";
+
+            float panelW = 262f;
+            float headerH = 26f;
+            float rowH = 21f;
+            float padBottom = 8f;
+            float panelH = headerH + (controls.Length * rowH) + padBottom;
+
+            Rect panelRect = new Rect(
+                Screen.width - panelW - margin,
+                Screen.height - panelH - margin,
+                panelW,
+                panelH
+            );
+
+            // Outer translucent dark slate backdrop
+            DrawSolidRect(panelRect, new Color(0.05f, 0.08f, 0.12f, 0.72f));
+
+            // Subtle top/bottom/right 1px border
+            Color borderCol = new Color(1f, 1f, 1f, 0.10f);
+            DrawSolidRect(new Rect(panelRect.x, panelRect.y, panelRect.width, 1f), borderCol);
+            DrawSolidRect(new Rect(panelRect.x, panelRect.yMax - 1f, panelRect.width, 1f), borderCol);
+            DrawSolidRect(new Rect(panelRect.xMax - 1f, panelRect.y, 1f, panelRect.height), borderCol);
+
+            // Left context-colored accent stripe (3.5px wide)
+            DrawSolidRect(new Rect(panelRect.x, panelRect.y, 3.5f, panelRect.height), accentColor);
+
+            // Header bar tint & divider line
+            DrawSolidRect(new Rect(panelRect.x + 3.5f, panelRect.y, panelRect.width - 3.5f, headerH), new Color(accentColor.r, accentColor.g, accentColor.b, 0.12f));
+            DrawSolidRect(new Rect(panelRect.x + 10f, panelRect.y + headerH, panelRect.width - 20f, 1f), new Color(1f, 1f, 1f, 0.08f));
+
+            // Header Title & "[F1] Hide" Hint
+            _hudTitleStyle.normal.textColor = accentColor;
+            GUI.Label(new Rect(panelRect.x + 12f, panelRect.y + 3f, 165f, 20f), modeTitle, _hudTitleStyle);
+            GUI.Label(new Rect(panelRect.xMax - 80f, panelRect.y + 3f, 70f, 20f), "[F1] Hide", _hudHintStyle);
+
+            // Rows
+            float y = panelRect.y + headerH + 4f;
+            _hudKeyTextStyle.normal.textColor = new Color(
+                Mathf.Lerp(accentColor.r, 1f, 0.45f),
+                Mathf.Lerp(accentColor.g, 1f, 0.45f),
+                Mathf.Lerp(accentColor.b, 1f, 0.45f),
+                0.98f
+            );
+
+            for (int i = 0; i < controls.Length; i++)
+            {
+                var item = controls[i];
+
+                // Action Name on the left
+                GUI.Label(new Rect(panelRect.x + 12f, y, 122f, rowH - 2f), item.Action, _hudActionStyle);
+
+                // Keybind Badge on the right
+                float badgeW = Mathf.Max(46f, item.Key.Length * 6.2f + 14f);
+                float badgeH = 16f;
+                Rect badgeRect = new Rect(panelRect.xMax - badgeW - 10f, y + 2f, badgeW, badgeH);
+
+                DrawSolidRect(badgeRect, new Color(1f, 1f, 1f, 0.08f));
+                DrawSolidRect(new Rect(badgeRect.x, badgeRect.y, badgeRect.width, 1f), new Color(accentColor.r, accentColor.g, accentColor.b, 0.28f));
+
+                GUI.Label(badgeRect, item.Key, _hudKeyTextStyle);
+
+                y += rowH;
+            }
         }
 
         private static string GetRelativeWindDescription(float relAngleDeg, float kph)
