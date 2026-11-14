@@ -4936,7 +4936,7 @@ namespace PuckUltimateFrisbeeMod
         public static float MinAxis = 0.1f;
         public static float DiveVelocity = 7.5f;                 // Forward layout burst speed (m/s)
         public static float DiveTorque = 13.5f;                  // Forward pitch torque that tips the player horizontal
-        public static float DiveAutoClearIfNoFallSeconds = 0.65f;
+        public static float DiveAutoClearIfNoFallSeconds = 0.45f;
         public static bool EnableDiveFallenDrag = true;
         public static float DiveFallenDragAmount = 2.8f;         // Turf chest-slide drag while fallen
 
@@ -5686,6 +5686,9 @@ namespace PuckUltimateFrisbeeMod
         private Movement _movement;
         private Vector3 _lastPos;
         private float _smoothedSpeed;
+        private float _smoothedStrafe;     // -1 (Left) to +1 (Right) for 2D Blend Trees
+        private float _smoothedForward;    // Signed forward speed for 2D Blend Trees
+        private float _strafeYawOffset;    // Angles hips into the strafe if using 1D Blend Tree
         private bool _wasHoldingDisc;
         private UltimatePlayerMarker _marker;
 
@@ -5705,7 +5708,6 @@ namespace PuckUltimateFrisbeeMod
             if (_animator != null)
             {
                 _animator.applyRootMotion = false;
-                // Keep bone transforms & Blend Tree updating even when 1st-person mesh is hidden!
                 _animator.cullingMode = AnimatorCullingMode.AlwaysAnimate;
 
                 if (_animator.isHuman)
@@ -5735,49 +5737,82 @@ namespace PuckUltimateFrisbeeMod
                 }
             }
 
-            float rbHorizSpeed = 0f;
-            if (_body.Rigidbody != null)
-            {
-                Vector3 v = _body.Rigidbody.linearVelocity;
-                rbHorizSpeed = new Vector2(v.x, v.z).magnitude;
-            }
-
-            float posDeltaSpeed = 0f;
+            // 1. Calculate World & Local Velocity Vectors (works for both Local and Remote players!)
+            Vector3 worldVel = Vector3.zero;
             if (Time.deltaTime > 0.0001f)
             {
-                Vector3 curH = new Vector3(_body.transform.position.x, 0f, _body.transform.position.z);
-                Vector3 lastH = new Vector3(_lastPos.x, 0f, _lastPos.z);
-                posDeltaSpeed = Vector3.Distance(curH, lastH) / Time.deltaTime;
+                Vector3 posDelta = _body.transform.position - _lastPos;
+                posDelta.y = 0f;
+                worldVel = posDelta / Time.deltaTime;
                 _lastPos = _body.transform.position;
             }
 
-            float netVarSpeed = (_body.Speed != null) ? _body.Speed.Value : 0f;
-            float rawSpeed = Mathf.Max(rbHorizSpeed, posDeltaSpeed, _player.IsLocalPlayer ? netVarSpeed : 0f);
-            if (rawSpeed > 28f) rawSpeed = rbHorizSpeed;
+            if (_body.Rigidbody != null)
+            {
+                Vector3 rbVel = _body.Rigidbody.linearVelocity;
+                rbVel.y = 0f;
+                if (rbVel.sqrMagnitude > worldVel.sqrMagnitude)
+                {
+                    worldVel = rbVel;
+                }
+            }
+
+            if (worldVel.magnitude > 28f) worldVel = Vector3.zero; // Ignore teleport spikes
+
+            // Convert world velocity into the player's local space (X = Strafe Left/Right, Z = Forward/Back)
+            Vector3 localVel = _body.transform.InverseTransformDirection(worldVel);
+            float rawSpeed = new Vector2(localVel.x, localVel.z).magnitude;
 
             bool isHoldingDisc = UltimateNetworkSync.IsPlayerHoldingAnyDisc(_player.OwnerClientId);
             bool isSprinting = _body.IsSprinting != null && _body.IsSprinting.Value && !isHoldingDisc && rawSpeed > 1.5f;
 
-            // Map speed directly to your Blend Tree thresholds (0 = Idle, 2.2 = Jogging, 6.5 = Sprint)
+            // 2. Determine Strafe Direction (-1f = Left/Q, +1f = Right/E)
+            float targetStrafe = 0f;
+            if (!isHoldingDisc)
+            {
+                // Local player: also check immediate Q/E or Server dictionary for instant responsiveness
+                if (_player.IsLocalPlayer && UnityEngine.InputSystem.Keyboard.current != null)
+                {
+                    var kb = UnityEngine.InputSystem.Keyboard.current;
+                    if (kb.qKey.isPressed) targetStrafe -= 1f;
+                    if (kb.eKey.isPressed) targetStrafe += 1f;
+                }
+                else if (UltimateDiveMod.ClientStrafeState.TryGetValue(_player.OwnerClientId, out sbyte syncedStrafe) && syncedStrafe != 0)
+                {
+                    targetStrafe = syncedStrafe;
+                }
+
+                // Fallback / Remote client detection via local X velocity
+                if (Mathf.Abs(targetStrafe) < 0.01f && Mathf.Abs(localVel.x) > 0.45f)
+                {
+                    float maxStrafeSpd = isSprinting ? UltimateDiveMod.StrafeSprintSpeed : UltimateDiveMod.StrafeRunSpeed;
+                    targetStrafe = Mathf.Clamp(localVel.x / Mathf.Max(1f, maxStrafeSpd), -1f, 1f);
+                }
+            }
+
+            // 3. Map overall speed to your Blend Tree thresholds (0 = Idle, 2.2 = Jogging, 6.5 = Sprint)
             float targetBlendSpeed = 0f;
             if (isHoldingDisc || rawSpeed < 0.25f)
             {
                 targetBlendSpeed = 0f;
+                targetStrafe = 0f;
             }
             else if (isSprinting)
             {
-                // Smoothly reach 6.5 Sprint threshold
                 float sprintT = Mathf.Clamp01((rawSpeed - 4.0f) / 3.5f);
                 targetBlendSpeed = Mathf.Lerp(4.2f, 6.5f, sprintT);
             }
             else
             {
-                // Map normal running around the 2.2 Jogging threshold
                 float jogT = Mathf.Clamp01((rawSpeed - 0.25f) / 4.5f);
                 targetBlendSpeed = Mathf.Lerp(0.8f, 3.2f, jogT);
             }
 
             _smoothedSpeed = Mathf.Lerp(_smoothedSpeed, targetBlendSpeed, Time.deltaTime * 14f);
+            _smoothedStrafe = Mathf.Lerp(_smoothedStrafe, targetStrafe, Time.deltaTime * 12f);
+
+            float forwardSign = localVel.z < -0.5f ? -1f : 1f;
+            _smoothedForward = Mathf.Lerp(_smoothedForward, targetBlendSpeed * forwardSign, Time.deltaTime * 14f);
 
             if (_wasHoldingDisc && !isHoldingDisc)
             {
@@ -5801,8 +5836,13 @@ namespace PuckUltimateFrisbeeMod
 
             bool isCrouchingIdle = _body.IsSliding != null && _body.IsSliding.Value && _smoothedSpeed < 1.2f;
             bool isFallenOrDiving = (_body.HasFallen != null && _body.HasFallen.Value) || UltimateDiveMod.IsPlayerDiving(_player);
+            bool isStrafing = Mathf.Abs(_smoothedStrafe) > 0.15f && _smoothedSpeed > 0.5f;
 
+            // 4. Send Parameters to Animator
             _animator.SetFloat("fSpeed", _smoothedSpeed);
+            _animator.SetFloat("fForward", _smoothedForward); // Optional: Signed forward speed (-6.5 to +6.5)
+            _animator.SetFloat("fStrafe", _smoothedStrafe);   // -1.0 (Left) to +1.0 (Right)
+            _animator.SetBool("bIsStrafing", isStrafing);
             _animator.SetFloat("fTurn", currentTurn);
             _animator.SetBool("bIsSprinting", isSprinting);
             _animator.SetBool("bIsSliding", isCrouchingIdle);
@@ -5811,6 +5851,7 @@ namespace PuckUltimateFrisbeeMod
             _animator.SetBool("bIsGrounded", _body.IsGrounded);
             _animator.SetBool("bIsHoldingDisc", isHoldingDisc);
 
+            // 5. Body Orientation (with subtle hip twist when strafing)
             if (isFallenOrDiving)
             {
                 Vector3 flatForward = Vector3.ProjectOnPlane(_body.transform.forward, Vector3.up);
@@ -5824,10 +5865,13 @@ namespace PuckUltimateFrisbeeMod
             }
             else
             {
-                transform.localRotation = Quaternion.Slerp(transform.localRotation, Quaternion.identity, Time.deltaTime * 18f);
+                // Slightly angle the lower body into the strafe direction (up to 25 degrees) for natural footwork
+                float targetYaw = isStrafing ? (_smoothedStrafe * 25f) : 0f;
+                _strafeYawOffset = Mathf.Lerp(_strafeYawOffset, targetYaw, Time.deltaTime * 12f);
+                Quaternion targetLocalRot = Quaternion.Euler(0f, _strafeYawOffset, 0f);
+                transform.localRotation = Quaternion.Slerp(transform.localRotation, targetLocalRot, Time.deltaTime * 18f);
             }
 
-            // --- ANIMATION-SYNCED FOOTSTEPS ---
             UpdateAnimationSyncedFootsteps(isHoldingDisc, isFallenOrDiving);
         }
 
