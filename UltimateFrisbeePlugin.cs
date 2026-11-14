@@ -430,9 +430,88 @@ namespace PuckUltimateFrisbeeMod
         // Maps Puck.NetworkObjectId -> Holder & Spin state (supports unlimited Warmup discs!)
         public static readonly Dictionary<ulong, DiscSyncEntry> ClientDiscStates = new Dictionary<ulong, DiscSyncEntry>();
 
+        // Tracks the most recently touched/held/targeted disc per player (ClientId -> Disc NetworkObjectId)
+        public static readonly Dictionary<ulong, ulong> ClientPreferredDiscId = new Dictionary<ulong, ulong>();
+        public static readonly Dictionary<ulong, Puck> ServerPlayerPreferredDisc = new Dictionary<ulong, Puck>();
+
         // Legacy fallback properties for single-disc checks
         public static ulong ClientSyncedHolderId = ulong.MaxValue;
         public static sbyte ClientSyncedThrowStyle = 0;
+
+        public static void RecordPlayerDiscInteraction(Player player, Puck disc)
+        {
+            if (player == null || disc == null) return;
+            ulong clientId = player.OwnerClientId;
+            ServerPlayerPreferredDisc[clientId] = disc;
+            if (disc.NetworkObject != null)
+            {
+                ClientPreferredDiscId[clientId] = disc.NetworkObjectId;
+            }
+        }
+
+        public static Puck GetPreferredDiscForClient(ulong clientId)
+        {
+            if (MonoBehaviourSingleton<PuckManager>.Instance == null) return null;
+            var pucks = MonoBehaviourSingleton<PuckManager>.Instance.GetPucks(false);
+            if (pucks == null || pucks.Count == 0) return null;
+
+            // In an actual match (Single Disc), always return the match disc
+            if (!UltimateRulesManager.IsWarmup || pucks.Count == 1)
+            {
+                return pucks[0];
+            }
+
+            // 1. If this player is currently holding a disc, always track that disc
+            foreach (var p in pucks)
+            {
+                if (p == null || p.NetworkObject == null) continue;
+                if (ClientDiscStates.TryGetValue(p.NetworkObjectId, out var entry) && entry.HolderClientId == clientId)
+                {
+                    ClientPreferredDiscId[clientId] = p.NetworkObjectId;
+                    return p;
+                }
+            }
+
+            // 2. Server-side direct reference check
+            if (NetworkRoles.IsServer && ServerPlayerPreferredDisc.TryGetValue(clientId, out Puck serverPref) && serverPref != null && serverPref.IsSpawned)
+            {
+                return serverPref;
+            }
+
+            // 3. Client-side synced preferred disc ID (from last catch, pickup, throw, or tip)
+            if (ClientPreferredDiscId.TryGetValue(clientId, out ulong prefDiscNetId))
+            {
+                foreach (var p in pucks)
+                {
+                    if (p != null && p.NetworkObject != null && p.NetworkObjectId == prefDiscNetId)
+                    {
+                        return p;
+                    }
+                }
+            }
+
+            // 4. Fallback: Find the closest disc to this player
+            Player player = MonoBehaviourSingleton<PlayerManager>.Instance?.GetPlayerByClientId(clientId);
+            if (player != null && player.PlayerBody != null)
+            {
+                Vector3 playerPos = player.PlayerBody.transform.position;
+                Puck closest = null;
+                float minDist = float.MaxValue;
+                foreach (var p in pucks)
+                {
+                    if (p == null) continue;
+                    float d = Vector3.Distance(playerPos, p.transform.position);
+                    if (d < minDist)
+                    {
+                        minDist = d;
+                        closest = p;
+                    }
+                }
+                if (closest != null) return closest;
+            }
+
+            return pucks[0];
+        }
 
         public static bool IsPlayerHoldingAnyDisc(ulong clientId)
         {
@@ -483,6 +562,8 @@ namespace PuckUltimateFrisbeeMod
             _registeredCmm = null;
             ClientSyncedHolderId = ulong.MaxValue;
             ClientDiscStates.Clear();
+            ClientPreferredDiscId.Clear();
+            ServerPlayerPreferredDisc.Clear();
         }
 
         public static void ServerBroadcastClearAllHolders()
@@ -510,7 +591,7 @@ namespace PuckUltimateFrisbeeMod
             }
         }
 
-        public static void ServerBroadcastHolderState(Player holder, sbyte throwStyle, Puck disc = null)
+        public static void ServerBroadcastHolderState(Player holder, sbyte throwStyle, Puck disc = null, Player focusPlayerOverride = null)
         {
             if (disc == null && holder == null)
             {
@@ -521,6 +602,13 @@ namespace PuckUltimateFrisbeeMod
             ulong discNetId = (disc != null && disc.NetworkObject != null) ? disc.NetworkObjectId : 0UL;
             ulong holderId = holder != null ? holder.OwnerClientId : ulong.MaxValue;
 
+            Player focusPlayer = focusPlayerOverride ?? holder;
+            if (focusPlayer != null && disc != null)
+            {
+                RecordPlayerDiscInteraction(focusPlayer, disc);
+            }
+            ulong focusClientId = focusPlayer != null ? focusPlayer.OwnerClientId : ulong.MaxValue;
+
             ClientSyncedHolderId = holderId;
             ClientSyncedThrowStyle = throwStyle;
             ClientDiscStates[discNetId] = new DiscSyncEntry { HolderClientId = holderId, ThrowStyle = throwStyle };
@@ -529,12 +617,13 @@ namespace PuckUltimateFrisbeeMod
             if (nm == null || !nm.IsServer || nm.CustomMessagingManager == null) return;
             if (nm.ConnectedClientsIds == null || nm.ConnectedClientsIds.Count == 0) return;
 
-            var writer = new FastBufferWriter(24, Allocator.Temp);
+            var writer = new FastBufferWriter(32, Allocator.Temp);
             try
             {
                 writer.WriteValueSafe(discNetId);
                 writer.WriteValueSafe(holderId);
                 writer.WriteValueSafe(throwStyle);
+                writer.WriteValueSafe(focusClientId);
                 nm.CustomMessagingManager.SendNamedMessageToAll(StateMessageName, writer, NetworkDelivery.Reliable);
             }
             finally
@@ -552,6 +641,12 @@ namespace PuckUltimateFrisbeeMod
                 reader.ReadValueSafe(out ulong holderId);
                 reader.ReadValueSafe(out sbyte throwStyle);
 
+                ulong focusClientId = ulong.MaxValue;
+                if (reader.Position < reader.Length)
+                {
+                    reader.ReadValueSafe(out focusClientId);
+                }
+
                 if (discNetId == ulong.MaxValue)
                 {
                     ClientSyncedHolderId = ulong.MaxValue;
@@ -563,6 +658,15 @@ namespace PuckUltimateFrisbeeMod
                 ClientSyncedHolderId = holderId;
                 ClientSyncedThrowStyle = throwStyle;
                 ClientDiscStates[discNetId] = new DiscSyncEntry { HolderClientId = holderId, ThrowStyle = throwStyle };
+
+                if (holderId != ulong.MaxValue)
+                {
+                    ClientPreferredDiscId[holderId] = discNetId;
+                }
+                if (focusClientId != ulong.MaxValue)
+                {
+                    ClientPreferredDiscId[focusClientId] = discNetId;
+                }
             }
             catch { }
         }
@@ -2175,8 +2279,11 @@ namespace PuckUltimateFrisbeeMod
                             float horizFootDist = Vector2.Distance(
                                 new Vector2(discPos.x, discPos.z),
                                 new Vector2(bodyBasePos.x, bodyBasePos.z));
+                            float horizHandDist = Vector2.Distance(
+                                new Vector2(discPos.x, discPos.z),
+                                new Vector2(handPos.x, handPos.z));
 
-                            if (sweptHandDist <= 1.25f || horizFootDist <= 1.25f)
+                            if (sweptHandDist <= 1.45f || horizHandDist <= 1.35f || horizFootDist <= 1.45f)
                             {
                                 bool canPickup = false;
                                 if (isWarmup)
@@ -3011,6 +3118,35 @@ namespace PuckUltimateFrisbeeMod
             UltimateRulesManager.LastPreStallAnnounced = 0;
 
             sbyte spinByte = (sbyte)(spinSign >= 0f ? 1 : -1);
+
+            // If in Warmup, also check if this throw is aimed toward a partner so their Mouse1 tracks it too!
+            Player warmupReceiver = null;
+            if (UltimateRulesManager.IsWarmup && MonoBehaviourSingleton<PlayerManager>.Instance != null)
+            {
+                float bestScore = float.MaxValue;
+                foreach (var p in MonoBehaviourSingleton<PlayerManager>.Instance.GetPlayers(false))
+                {
+                    if (p == null || p == thrower || !p.IsCharacterSpawned || p.PlayerBody == null) continue;
+                    // Don't override a player who is currently holding a different disc
+                    if (UltimateNetworkSync.IsPlayerHoldingAnyDisc(p.OwnerClientId)) continue;
+
+                    Vector3 toPlayer = p.PlayerBody.transform.position - launchPos;
+                    toPlayer.y = 0f;
+                    float dist = toPlayer.magnitude;
+                    if (dist > 2.0f && dist < 65.0f)
+                    {
+                        float angle = Vector3.Angle( new Vector3(launchDir.x, 0f, launchDir.z), toPlayer.normalized);
+                        if (angle < 28f && angle < bestScore)
+                        {
+                            bestScore = angle;
+                            warmupReceiver = p;
+                        }
+                    }
+                }
+            }
+
+            UltimateNetworkSync.RecordPlayerDiscInteraction(thrower, disc);
+            UltimateNetworkSync.ServerBroadcastHolderState(null, spinByte, disc, warmupReceiver ?? thrower);
             UltimateNetworkSync.ServerBroadcastHolderState(null, spinByte, disc);
 
             float throwVol = Mathf.Lerp(0.55f, 1.0f, combinedPower);
@@ -3041,6 +3177,8 @@ namespace PuckUltimateFrisbeeMod
             UltimateRulesManager.WasDefensiveBlock = isDefensivePlay;
             UltimateRulesManager.LastDeflector = deflector;
             UltimateRulesManager.LastDeflectionTime = Time.time;
+            UltimateNetworkSync.RecordPlayerDiscInteraction(deflector, disc);
+            UltimateNetworkSync.ServerBroadcastHolderState(null, (sbyte)(UltimateRulesManager.ActiveFlightSpinSign >= 0f ? 1 : -1), disc, deflector);
 
             Vector3 discPos = disc.transform.position;
             Vector3 incomingVel = rb.linearVelocity;
@@ -3439,7 +3577,7 @@ namespace PuckUltimateFrisbeeMod
 
                 Transform existingGrassRoot = __instance.transform.Find("UltimateGrassFieldRoot");
 
-                // 2. Sweep ALL objects in the scene:
+                // 2. Sweep ALL objects in the scene and disable ALL vanilla arena/rink colliders & renderers:
                 var allObjects = Resources.FindObjectsOfTypeAll<GameObject>();
                 foreach (var obj in allObjects)
                 {
@@ -3453,11 +3591,11 @@ namespace PuckUltimateFrisbeeMod
 
                     if (obj.GetComponentInParent<Player>() != null || obj.GetComponentInParent<PlayerBody>() != null) continue;
                     if (obj.GetComponentInParent<Puck>() != null || obj.GetComponentInParent<Stick>() != null) continue;
+                    if (obj.GetComponentInParent<StickPositioner>() != null || obj.GetComponentInParent<PlayerPosition>() != null) continue;
 
                     string nameLower = obj.name.ToLowerInvariant();
 
                     // A. Capture Ice layer, material, and surface height from vanilla Ice, then disable its small rink collider
-                    // so our massive 350m x 350m un-rotated Ice floor handles 100% of ground physics without any edge drop-offs!
                     if (obj.name == "Ice" || obj.name == "Ice Bottom" || obj.name == "Ice Top" || obj.layer == iceLayer)
                     {
                         if (obj.layer != 0) iceLayer = obj.layer;
@@ -3472,23 +3610,14 @@ namespace PuckUltimateFrisbeeMod
                             if (Mathf.Abs(col.bounds.max.y) < 5f)
                                 iceSurfaceY = col.bounds.max.y;
 
-                            // Disable the vanilla rink-sized Ice collider so its edge at +/-30m never trips players!
                             col.enabled = false;
                         }
                         continue;
                     }
 
-                    // B. Capture the exact physics layer & material used by the vanilla Rink Barriers/Boards before hiding them!
-                    bool isRinkStructure = nameLower.Contains("barrier") || nameLower.Contains("border") ||
-                                           nameLower.Contains("glass") || nameLower.Contains("board") ||
-                                           nameLower.Contains("goal") || nameLower.Contains("net") ||
-                                           nameLower.Contains("roof") || nameLower.Contains("ceiling") ||
-                                           nameLower.Contains("bleacher") || nameLower.Contains("rink") ||
-                                           nameLower.Contains("arena") || nameLower.Contains("stadium") ||
-                                           nameLower.Contains("wall") || nameLower.Contains("pillar") ||
-                                           nameLower.Contains("rafter") || nameLower.Contains("truss");
-
-                    if (isRinkStructure)
+                    // B. Capture the physics layer & material from Rink Barriers before disabling them
+                    if (nameLower.Contains("barrier") || nameLower.Contains("border") ||
+                        nameLower.Contains("glass") || nameLower.Contains("board") || nameLower.Contains("wall"))
                     {
                         foreach (var col in obj.GetComponentsInChildren<Collider>(true))
                         {
@@ -3500,19 +3629,20 @@ namespace PuckUltimateFrisbeeMod
                                     _cachedBarrierMaterial = col.sharedMaterial;
                             }
                         }
+                    }
 
+                    // C. Unconditionally disable ALL remaining vanilla scene colliders (including Goal triggers,
+                    //    StickRaycast boards at Z=+/-30m, offside/icing triggers, etc.) so NOTHING blocks the field lines!
+                    foreach (var col in obj.GetComponentsInChildren<Collider>(true))
+                    {
+                        if (existingGrassRoot != null && col.transform.IsChildOf(existingGrassRoot)) continue;
+                        col.enabled = false;
+                    }
+
+                    if (!IsCriticalObject(obj))
+                    {
                         DisableRenderersAndNonGroundColliders(obj, iceSurfaceY, existingGrassRoot);
                     }
-                }
-
-                // 3. Also sweep all direct children of Level
-                foreach (Transform child in __instance.transform)
-                {
-                    if (child.name == "UltimateGrassFieldRoot") continue;
-                    if (child.name.Contains("Ice")) continue;
-                    if (IsCriticalObject(child.gameObject)) continue;
-
-                    DisableRenderersAndNonGroundColliders(child.gameObject, iceSurfaceY, existingGrassRoot);
                 }
 
                 int barrierLayer = ResolvePlayerBlockingLayer(iceLayer);
@@ -3774,7 +3904,6 @@ namespace PuckUltimateFrisbeeMod
 
             int fenceSegmentsBuilt = 0;
 
-            // Iterate ONLY over individual MeshRenderers inside the Fence hierarchy (never parent containers!)
             foreach (MeshRenderer rend in customFieldRoot.GetComponentsInChildren<MeshRenderer>(true))
             {
                 if (rend == null || !IsFenceTransform(rend.transform)) continue;
@@ -3782,17 +3911,19 @@ namespace PuckUltimateFrisbeeMod
                 Bounds worldBounds = rend.bounds;
                 if (worldBounds.size.sqrMagnitude < 0.05f) continue;
 
-                // Safety check: Never build a fence collider inside the playable field + 2m runoff margin!
-                // (Playable field is X: +/-18.5m, Z: +/-50m. If a bounds center is inside X: +/-19m and Z: +/-50.5m, skip it!)
-                Vector3 c = worldBounds.center;
-                if (Mathf.Abs(c.x) < UltimateRulesManager.FieldHalfWidth + 0.5f &&
-                    Mathf.Abs(c.z) < UltimateRulesManager.FieldHalfLength + 0.5f)
+                // Skip any combined parent mesh that spans across the field
+                if (worldBounds.size.x > 35f && worldBounds.size.z > 35f)
                 {
                     continue;
                 }
 
-                // Also skip any huge combined bounding box that spans across both sides of the field
-                if (worldBounds.size.x > 35f && worldBounds.size.z > 35f)
+                // Make sure the closest point of this fence mesh is at least 1.5m outside the playable field lines!
+                // (Playable field is X: +/-18.5m, Z: +/-50.0m).
+                Bounds playAreaWithMargin = new Bounds(
+                    Vector3.zero,
+                    new Vector3((UltimateRulesManager.FieldHalfWidth + 1.5f) * 2f, 50f, (UltimateRulesManager.FieldHalfLength + 1.5f) * 2f)
+                );
+                if (playAreaWithMargin.Intersects(worldBounds))
                 {
                     continue;
                 }
@@ -7242,6 +7373,104 @@ namespace PuckUltimateFrisbeeMod
             if (absAngle < 35f) return "Tailwind";
             if (absAngle > 145f) return "Headwind";
             return relAngleDeg > 0f ? "Cross (L -> R)" : "Cross (R -> L)";
+        }
+    }
+// =========================================================================
+    // 18. PER-PLAYER MOUSE1 DISC CAMERA TRACKING IN WARMUP
+    // =========================================================================
+    [HarmonyPatch]
+    public static class PuckManager_GetPlayerPuck_Patch
+    {
+        private static MethodBase _targetMethod;
+
+        [HarmonyPrepare]
+        public static bool Prepare()
+        {
+            // Find any method on PuckManager that returns a single Puck and takes a ulong or Player
+            foreach (var m in AccessTools.GetDeclaredMethods(typeof(PuckManager)))
+            {
+                if (m.ReturnType == typeof(Puck) && m.Name.Contains("PlayerPuck"))
+                {
+                    _targetMethod = m;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        [HarmonyTargetMethod]
+        public static MethodBase TargetMethod() => _targetMethod;
+
+        [HarmonyPrefix]
+        public static bool Prefix(object[] __args, ref Puck __result)
+        {
+            if (__args != null && __args.Length > 0)
+            {
+                ulong clientId = ulong.MaxValue;
+                if (__args[0] is ulong id)
+                {
+                    clientId = id;
+                }
+                else if (__args[0] is Player p)
+                {
+                    clientId = p.OwnerClientId;
+                }
+
+                if (clientId != ulong.MaxValue)
+                {
+                    Puck preferred = UltimateNetworkSync.GetPreferredDiscForClient(clientId);
+                    if (preferred != null)
+                    {
+                        __result = preferred;
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+    }
+
+    [HarmonyPatch]
+    public static class PuckManager_GetPuck_Patch
+    {
+        private static MethodBase _targetMethod;
+
+        [HarmonyPrepare]
+        public static bool Prepare()
+        {
+            // Safely find GetPuck (e.g., GetPuck(bool isReplay = false)) without crashing if signature varies
+            foreach (var m in AccessTools.GetDeclaredMethods(typeof(PuckManager)))
+            {
+                if (m.ReturnType == typeof(Puck) && m.Name == "GetPuck")
+                {
+                    _targetMethod = m;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        [HarmonyTargetMethod]
+        public static MethodBase TargetMethod() => _targetMethod;
+
+        [HarmonyPrefix]
+        public static bool Prefix(ref Puck __result)
+        {
+            if (!UltimateRulesManager.IsWarmup) return true;
+
+            // Only override on Client for the LocalPlayer's camera/UI tracking;
+            // let Server calls return normally unless it's a Listen Server Host in LateUpdate
+            var nm = NetworkManager.Singleton;
+            if (nm != null && nm.IsClient && (!nm.IsServer || !Time.inFixedTimeStep))
+            {
+                Puck preferred = UltimateNetworkSync.GetPreferredDiscForClient(nm.LocalClientId);
+                if (preferred != null)
+                {
+                    __result = preferred;
+                    return false;
+                }
+            }
+            return true;
         }
     }
 }
