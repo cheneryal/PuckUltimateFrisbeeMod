@@ -628,6 +628,13 @@ namespace PuckUltimateFrisbeeMod
         public static Player ActiveMarker = null;
         public static float LastDoubleTeamWarningTime = 0f;
 
+        // --- PRE-STALL / DELAY OF GAME TRACKING (Anti-Clock Drain) ---
+        public static float DiscStationaryStartTime = 0f;
+        public static int LastPreStallAnnounced = 0;
+        public static int LastPullHoldAnnounced = 0;
+        public static float PreStallDuration = 12.0f;     // 12s for offense to pick up a grounded disc
+        public static float PullPreStallDuration = 15.0f; // 15s for pulling team to pick up the pull
+
         // Per-Disc state so multiple discs in Warmup can fly, tumble, and be held independently!
         public class DiscFlightState
         {
@@ -957,6 +964,9 @@ namespace PuckUltimateFrisbeeMod
             LastDeflectionTime = 0f;
             LastTurnoverTeam = PlayerTeam.None;
             WentOutOfBoundsInFlight = false;
+            DiscStationaryStartTime = 0f;
+            LastPreStallAnnounced = 0;
+            UltimateRulesManager.LastPullHoldAnnounced = 0;
             UltimateNetworkSync.ServerBroadcastHolderState(null, 0);
             foreach (var kvp in DiscStates)
             {
@@ -1728,6 +1738,106 @@ namespace PuckUltimateFrisbeeMod
 
         private static float _lastWindTickTime = -1f;
 
+        private static void UpdateGroundedDiscPreStall(Puck disc, Rigidbody rb)
+        {
+            if (UltimateRulesManager.IsWarmup || UltimateRulesManager.Holder != null || UltimateRulesManager.IsDiscInFlight)
+            {
+                UltimateRulesManager.DiscStationaryStartTime = 0f;
+                UltimateRulesManager.LastPreStallAnnounced = 0;
+                return;
+            }
+
+            // Determine which team is currently responsible for picking up the disc
+            PlayerTeam responsibleTeam = UltimateRulesManager.IsPullPlay
+                ? UltimateRulesManager.PullingTeam
+                : UltimateRulesManager.OffensiveTeam;
+
+            if (responsibleTeam != PlayerTeam.Blue && responsibleTeam != PlayerTeam.Red)
+                return;
+
+            // Only tick the clock if the responsible team actually has at least 1 spawned player on the field
+            if (MonoBehaviourSingleton<PlayerManager>.Instance != null)
+            {
+                bool hasActiveTeamMember = MonoBehaviourSingleton<PlayerManager>.Instance
+                    .GetPlayers(false)
+                    .Any(p => p != null && p.IsCharacterSpawned && UltimateRulesManager.GetTeam(p) == responsibleTeam);
+
+                if (!hasActiveTeamMember)
+                {
+                    UltimateRulesManager.DiscStationaryStartTime = Time.time;
+                    return;
+                }
+            }
+
+            if (UltimateRulesManager.DiscStationaryStartTime <= 0f)
+            {
+                UltimateRulesManager.DiscStationaryStartTime = Time.time;
+                UltimateRulesManager.LastPreStallAnnounced = 0;
+            }
+
+            float maxAllowedTime = UltimateRulesManager.IsPullPlay
+                ? UltimateRulesManager.PullPreStallDuration
+                : UltimateRulesManager.PreStallDuration;
+
+            float elapsed = Time.time - UltimateRulesManager.DiscStationaryStartTime;
+            int remainingSec = Mathf.CeilToInt(maxAllowedTime - elapsed);
+
+            // Announce countdown warnings at 5, 3, 2, 1 seconds left
+            if (remainingSec <= 5 && remainingSec >= 1 && remainingSec != UltimateRulesManager.LastPreStallAnnounced)
+            {
+                if (remainingSec == 5 || remainingSec <= 3)
+                {
+                    UltimateRulesManager.LastPreStallAnnounced = remainingSec;
+                    string actionText = UltimateRulesManager.IsPullPlay ? "pick up to Pull" : "pick up the disc";
+                    UltimateRulesManager.BroadcastAnnouncement(
+                        $"DELAY OF GAME WARNING: {responsibleTeam} has {remainingSec}s to {actionText}!",
+                        "#f39c12");
+                }
+            }
+
+            // Time expired -> Enforce Delay of Game Turnover!
+            if (elapsed >= maxAllowedTime)
+            {
+                UltimateRulesManager.DiscStationaryStartTime = Time.time;
+                UltimateRulesManager.LastPreStallAnnounced = 0;
+
+                PlayerTeam? opposingTeam = Utils.GetOpposingTeam(responsibleTeam);
+                if (opposingTeam == null) return;
+
+                if (UltimateRulesManager.IsPullPlay)
+                {
+                    // If the Pulling team refuses to pick up the Pull, award the disc to the receiving team at the ATTACKING Brick Mark!
+                    UltimateRulesManager.IsPullPlay = false;
+                    UltimateRulesManager.IsCurrentThrowPull = false;
+                    UltimateRulesManager.LastTurnoverTeam = responsibleTeam;
+                    UltimateRulesManager.OffensiveTeam = opposingTeam.Value;
+
+                    // Blue attacks -Z (-14m), Red attacks +Z (+14m)
+                    float attackingBrickZ = (opposingTeam.Value == PlayerTeam.Blue)
+                        ? -UltimateRulesManager.BrickMarkZ
+                        : UltimateRulesManager.BrickMarkZ;
+                    Vector3 penaltySpot = new Vector3(0f, UltimateVisualTuning.DiscHalfThickness + 0.01f, attackingBrickZ);
+
+                    FlattenAndFreezeDiscOnGround(disc, rb, penaltySpot);
+                    UltimateRulesManager.BroadcastAnnouncement(
+                        $"DELAY OF GAME on {responsibleTeam} (Failed to Pull)! {opposingTeam.Value} awarded disc at Attacking Brick Mark!",
+                        "#e74c3c");
+                }
+                else
+                {
+                    // Live play turnover: flip possession to the other team right where the disc lies!
+                    UltimateRulesManager.LastTurnoverTeam = responsibleTeam;
+                    UltimateRulesManager.OffensiveTeam = opposingTeam.Value;
+                    UltimateRulesManager.LastThrower = null;
+                    UltimateRulesManager.SecondLastThrower = null;
+
+                    UltimateRulesManager.BroadcastAnnouncement(
+                        $"DELAY OF GAME! {responsibleTeam} failed to pick up the disc in {maxAllowedTime:F0}s -> TURNOVER! {opposingTeam.Value} Disc!",
+                        "#e74c3c");
+                }
+            }
+        }
+
         private static void SaveDiscState(UltimateRulesManager.DiscFlightState ds)
         {
             if (ds == null) return;
@@ -1935,8 +2045,58 @@ namespace PuckUltimateFrisbeeMod
                     {
                         UpdateMarkerAndStallCount(__instance, holder, tracker, aimForward, spinByte, rb);
                     }
+                    else if (!isWarmup && UltimateRulesManager.IsPullPlay && holdTime > 0.5f)
+                    {
+                        // Give the puller 15 seconds after picking up the disc to throw the Pull!
+                        const float maxPullHoldTime = 15.0f;
+                        int pullRemaining = Mathf.CeilToInt(maxPullHoldTime - holdTime);
+
+                        if (pullRemaining <= 5 && pullRemaining >= 1 && pullRemaining != UltimateRulesManager.LastPullHoldAnnounced)
+                        {
+                            if (pullRemaining == 5 || pullRemaining <= 3)
+                            {
+                                UltimateRulesManager.LastPullHoldAnnounced = pullRemaining;
+                                UltimateRulesManager.BroadcastAnnouncement($"PULL CLOCK: {pullRemaining}s to throw the Pull!", "#e67e22");
+                            }
+                        }
+
+                        if (holdTime >= maxPullHoldTime)
+                        {
+                            UltimateRulesManager.LastPullHoldAnnounced = 0;
+                            tracker.Reset(holder.PlayerBody);
+                            holder.PlayerBody.Server_Unfreeze();
+
+                            PlayerTeam pullerTeam = UltimateRulesManager.GetTeam(holder);
+                            PlayerTeam? receivingTeam = Utils.GetOpposingTeam(pullerTeam);
+
+                            UltimateRulesManager.Holder = null;
+                            UltimateRulesManager.IsHolderPivotLocked = false;
+                            UltimateRulesManager.IsPullPlay = false;
+                            UltimateRulesManager.IsCurrentThrowPull = false;
+                            UltimateRulesManager.LastTurnoverTeam = pullerTeam;
+                            UltimateRulesManager.OffensiveTeam = receivingTeam ?? PlayerTeam.None;
+                            UltimateRulesManager.ReleaseTime = Time.time;
+                            UltimateNetworkSync.ServerBroadcastHolderState(null, spinByte, __instance);
+
+                            // Spot at the ATTACKING Brick Mark (18m in front of the pulling team's endzone!)
+                            float attackingBrickZ = (receivingTeam == PlayerTeam.Blue)
+                                ? -UltimateRulesManager.BrickMarkZ
+                                : UltimateRulesManager.BrickMarkZ;
+                            Vector3 penaltySpot = new Vector3(0f, UltimateVisualTuning.DiscHalfThickness + 0.01f, attackingBrickZ);
+
+                            FlattenAndFreezeDiscOnGround(__instance, rb, penaltySpot);
+                            UltimateRulesManager.BroadcastAnnouncement(
+                                $"DELAY OF GAME on {pullerTeam} (Held Pull > 15s)! {UltimateRulesManager.OffensiveTeam} awarded disc at Attacking Brick Mark!",
+                                "#e74c3c");
+                            return;
+                        }
+                    }
+
+                    // CRITICAL: Always return here when UltimateRulesManager.Holder != null
+                    // so execution NEVER falls through to Section C (Ground Pickup)!
                     return;
                 }
+
 
                 // -----------------------------------------------------------------
                 // B. TRACK IN-BOUNDS FLIGHT CROSSING POINT FOR ACCURATE OOB SPOTS
@@ -2009,6 +2169,9 @@ namespace PuckUltimateFrisbeeMod
                         // 1. GROUND PICKUP
                         if (!isAirborne)
                         {
+                            // Prevent machine-gun re-pickup on the exact frame a disc is released/dropped!
+                            if (player == UltimateRulesManager.LastThrower && timeSinceRelease < 0.35f)
+                                continue;
                             float horizFootDist = Vector2.Distance(
                                 new Vector2(discPos.x, discPos.z),
                                 new Vector2(bodyBasePos.x, bodyBasePos.z));
@@ -2229,6 +2392,11 @@ namespace PuckUltimateFrisbeeMod
                         : GetLegalFieldSpotAfterTurnover(discPos);
 
                     FlattenAndFreezeDiscOnGround(__instance, rb, restSpot);
+
+                    if (!isWarmup)
+                    {
+                        UpdateGroundedDiscPreStall(__instance, rb);
+                    }
                     return;
                 }
 
@@ -2758,6 +2926,13 @@ namespace PuckUltimateFrisbeeMod
             rb.rotation = flatRot;
             disc.transform.SetPositionAndRotation(groundSpot, flatRot);
             disc.Server_Freeze(RigidbodyConstraints.FreezeAll);
+
+            // Start the Delay-of-Game / Pre-Stall clock as soon as the disc is stationary on the ground!
+            if (UltimateRulesManager.DiscStationaryStartTime <= 0f)
+            {
+                UltimateRulesManager.DiscStationaryStartTime = Time.time;
+                UltimateRulesManager.LastPreStallAnnounced = 0;
+            }
         }
 
         private static void ExecuteStaminaThrow(
@@ -2832,6 +3007,8 @@ namespace PuckUltimateFrisbeeMod
             UltimateRulesManager.ReleaseTime = Time.time;
             UltimateRulesManager.StallCount = 0f;
             UltimateRulesManager.LastStallAnnounced = 0;
+            UltimateRulesManager.DiscStationaryStartTime = 0f;
+            UltimateRulesManager.LastPreStallAnnounced = 0;
 
             sbyte spinByte = (sbyte)(spinSign >= 0f ? 1 : -1);
             UltimateNetworkSync.ServerBroadcastHolderState(null, spinByte, disc);
@@ -3002,6 +3179,7 @@ namespace PuckUltimateFrisbeeMod
             UltimateRulesManager.WasDefensiveBlock = false;
             UltimateRulesManager.LastDeflector = null;
             UltimateRulesManager.LastTurnoverTeam = PlayerTeam.None;
+            UltimateRulesManager.LastPullHoldAnnounced = 0;
 
             if (!UltimateRulesManager.WindupTrackers.TryGetValue(catcher.OwnerClientId, out var tracker))
             {
