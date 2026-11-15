@@ -9,10 +9,13 @@ using UnityEngine.InputSystem;
 
 namespace PuckUltimateFrisbeeMod
 {
-    public enum UltimateGender : byte
+    public enum UltimateBodyBuild : byte
     {
-        Masculine = 0,
-        Feminine = 1
+        AthleticMasculine = 0,
+        AthleticFeminine = 1,
+        HeavyDadBod = 2,
+        StockyPowerhouse = 3,
+        LeanSprinter = 4
     }
 
     public enum UltimateHairStyle : byte
@@ -22,7 +25,19 @@ namespace PuckUltimateFrisbeeMod
         Ponytail = 2,
         LongFlow = 3,
         AfroCrown = 4,
-        TopBun = 5
+        TopBun = 5,
+        Mohawk = 6,
+        TwinBraids = 7
+    }
+
+    public enum UltimateFacialHair : byte
+    {
+        None = 0,
+        Mustache = 1,
+        Goatee = 2,
+        FullBeard = 3,
+        MuttonChops = 4,
+        Chinstrap = 5
     }
 
     public enum UltimateHeadGear : byte
@@ -32,30 +47,34 @@ namespace PuckUltimateFrisbeeMod
         ForwardCap = 2,
         SunVisor = 3,
         Headband = 4,
-        Beanie = 5
+        Beanie = 5,
+        BucketHat = 6
     }
 
     [Serializable]
     public struct PlayerAppearanceData : IEquatable<PlayerAppearanceData>
     {
-        public byte Gender;
+        public byte BodyBuild;
         public byte HairStyle;
+        public byte FacialHair;
         public byte HeadGear;
         public byte SkinToneIndex;
         public byte HairColorIndex;
 
         public static PlayerAppearanceData Default => new PlayerAppearanceData
         {
-            Gender = (byte)UltimateGender.Masculine,
+            BodyBuild = (byte)UltimateBodyBuild.AthleticMasculine,
             HairStyle = (byte)UltimateHairStyle.ShortFlow,
+            FacialHair = (byte)UltimateFacialHair.None,
             HeadGear = (byte)UltimateHeadGear.BackwardCap,
             SkinToneIndex = 0,
             HairColorIndex = 0
         };
 
         public bool Equals(PlayerAppearanceData other) =>
-            Gender == other.Gender &&
+            BodyBuild == other.BodyBuild &&
             HairStyle == other.HairStyle &&
+            FacialHair == other.FacialHair &&
             HeadGear == other.HeadGear &&
             SkinToneIndex == other.SkinToneIndex &&
             HairColorIndex == other.HairColorIndex;
@@ -74,9 +93,10 @@ namespace PuckUltimateFrisbeeMod
         public static PlayerAppearanceData LocalAppearance = PlayerAppearanceData.Default;
         public static readonly Dictionary<ulong, PlayerAppearanceData> SyncedAppearances = new Dictionary<ulong, PlayerAppearanceData>();
 
-        public static readonly string[] GenderNames = { "Masculine", "Feminine" };
-        public static readonly string[] HairNames   = { "Bald / None", "Short Flow", "Ponytail", "Long Flow", "Afro Crown", "Top Bun" };
-        public static readonly string[] GearNames   = { "None", "Backward Cap", "Forward Cap", "Sun Visor", "Sweatband", "Knit Beanie" };
+        public static readonly string[] BuildNames = { "Masculine", "Feminine", "Heavy / Dad-Bod", "Stocky / Buff", "Lean Sprinter" };
+        public static readonly string[] HairNames  = { "Bald / None", "Short Flow", "Ponytail", "Long Flow", "Afro Crown", "Top Bun", "Mohawk", "Twin Braids" };
+        public static readonly string[] BeardNames = { "Clean Shaven", "Mustache", "Goatee", "Full Beard", "Mutton Chops", "Chinstrap" };
+        public static readonly string[] GearNames  = { "None", "Backward Cap", "Forward Cap", "Sun Visor", "Sweatband", "Knit Beanie", "Bucket Hat" };
 
         public static readonly string[] SkinToneNames = { "Game Default", "Fair", "Warm Peach", "Light Olive", "Golden Tan", "Caramel", "Rich Umber", "Deep Espresso" };
         public static readonly Color[] SkinTonePalette =
@@ -301,8 +321,9 @@ namespace PuckUltimateFrisbeeMod
 
         private static void WriteAppearance(FastBufferWriter writer, PlayerAppearanceData d)
         {
-            writer.WriteValueSafe(d.Gender);
+            writer.WriteValueSafe(d.BodyBuild);
             writer.WriteValueSafe(d.HairStyle);
+            writer.WriteValueSafe(d.FacialHair);
             writer.WriteValueSafe(d.HeadGear);
             writer.WriteValueSafe(d.SkinToneIndex);
             writer.WriteValueSafe(d.HairColorIndex);
@@ -310,15 +331,17 @@ namespace PuckUltimateFrisbeeMod
 
         private static PlayerAppearanceData ReadAppearance(FastBufferReader reader)
         {
-            reader.ReadValueSafe(out byte gender);
+            reader.ReadValueSafe(out byte build);
             reader.ReadValueSafe(out byte hair);
+            reader.ReadValueSafe(out byte beard);
             reader.ReadValueSafe(out byte gear);
             reader.ReadValueSafe(out byte skinIdx);
             reader.ReadValueSafe(out byte hairColIdx);
             return new PlayerAppearanceData
             {
-                Gender = gender,
+                BodyBuild = build,
                 HairStyle = hair,
+                FacialHair = beard,
                 HeadGear = gear,
                 SkinToneIndex = skinIdx,
                 HairColorIndex = hairColIdx
@@ -735,7 +758,7 @@ namespace PuckUltimateFrisbeeMod
             DrawRect(new Rect(0, 0, Screen.width, Screen.height), BackdropCol);
 
             float panelW = 940f;
-            float panelH = 520f;
+            float panelH = 580f; // Increased to fit 6 rows
             Rect panelRect = new Rect((Screen.width - panelW) * 0.5f, (Screen.height - panelH) * 0.5f, panelW, panelH);
 
             DrawRect(panelRect, PanelBg);
@@ -760,7 +783,7 @@ namespace PuckUltimateFrisbeeMod
             // =================================================================
             // LEFT COLUMN: CUSTOMIZATION CONTROLS
             // =================================================================
-            float secH = 360f;
+            float secH = 420f; // Increased to fit 6 rows
             Rect secRect = new Rect(x, y, leftColW, secH);
             DrawRect(secRect, SectionBg);
             DrawBorder(secRect, PanelBorder, 1f);
@@ -772,19 +795,25 @@ namespace PuckUltimateFrisbeeMod
             var d = UltimateAppearanceManager.LocalAppearance;
 
             DrawStepperRow(new Rect(x + 12f, rowY, leftColW - 24f, 54f),
-                "Body Build / Gender", "Switches between Masculine V-taper and Feminine contoured frame.",
-                UltimateAppearanceManager.GenderNames, null, d.Gender,
-                next => { d.Gender = (byte)next; ApplyAndSync(d); });
+                "Body Build", "Masculine, Feminine, Heavy / Dad-Bod, Stocky, or Lean Sprinter.",
+                UltimateAppearanceManager.BuildNames, null, d.BodyBuild,
+                next => { d.BodyBuild = (byte)next; ApplyAndSync(d); });
             rowY += 60f;
 
             DrawStepperRow(new Rect(x + 12f, rowY, leftColW - 24f, 54f),
-                "Hairstyle", "Select hair mesh. Tall styles automatically tuck under closed-top caps.",
+                "Hairstyle", "8 styles. Crowns automatically tuck under closed-top caps & beanies.",
                 UltimateAppearanceManager.HairNames, null, d.HairStyle,
                 next => { d.HairStyle = (byte)next; ApplyAndSync(d); });
             rowY += 60f;
 
             DrawStepperRow(new Rect(x + 12f, rowY, leftColW - 24f, 54f),
-                "Headgear", "Caps, visors, sweatbands, and beanies tinted to your team color.",
+                "Facial Hair", "Clean shaven, mustache, goatee, full lumberjack beard, or chops.",
+                UltimateAppearanceManager.BeardNames, null, d.FacialHair,
+                next => { d.FacialHair = (byte)next; ApplyAndSync(d); });
+            rowY += 60f;
+
+            DrawStepperRow(new Rect(x + 12f, rowY, leftColW - 24f, 54f),
+                "Headgear", "Caps, visors, sweatbands, beanies, and bucket hats in team colors.",
                 UltimateAppearanceManager.GearNames, null, d.HeadGear,
                 next => { d.HeadGear = (byte)next; ApplyAndSync(d); });
             rowY += 60f;
@@ -796,7 +825,7 @@ namespace PuckUltimateFrisbeeMod
             rowY += 60f;
 
             DrawStepperRow(new Rect(x + 12f, rowY, leftColW - 24f, 54f),
-                "Hair Color", "Applies to all hairstyles.",
+                "Hair & Beard Color", "Applies to both hairstyles and facial hair.",
                 UltimateAppearanceManager.HairColorNames, UltimateAppearanceManager.HairColorPalette, d.HairColorIndex,
                 next => { d.HairColorIndex = (byte)next; ApplyAndSync(d); });
 
@@ -871,8 +900,9 @@ namespace PuckUltimateFrisbeeMod
             {
                 ApplyAndSync(new PlayerAppearanceData
                 {
-                    Gender = (byte)UnityEngine.Random.Range(0, UltimateAppearanceManager.GenderNames.Length),
+                    BodyBuild = (byte)UnityEngine.Random.Range(0, UltimateAppearanceManager.BuildNames.Length),
                     HairStyle = (byte)UnityEngine.Random.Range(0, UltimateAppearanceManager.HairNames.Length),
+                    FacialHair = (byte)UnityEngine.Random.Range(0, UltimateAppearanceManager.BeardNames.Length),
                     HeadGear = (byte)UnityEngine.Random.Range(0, UltimateAppearanceManager.GearNames.Length),
                     SkinToneIndex = (byte)UnityEngine.Random.Range(1, UltimateAppearanceManager.SkinToneNames.Length),
                     HairColorIndex = (byte)UnityEngine.Random.Range(1, UltimateAppearanceManager.HairColorNames.Length)

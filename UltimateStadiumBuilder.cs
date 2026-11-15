@@ -339,7 +339,7 @@ namespace PuckUltimateFrisbeeMod
 
         public static void ApplyCameraLongDistanceSettings(Camera cam, float[] emptyCullDistances = null)
         {
-            if (cam == null) return;
+            if (cam == null || cam.name == "PreviewCamera") return;
 
             // 1. Extend Far Clip Plane to 20,000 meters so distant mountains never get cut off
             if (cam.farClipPlane < 20000f)
