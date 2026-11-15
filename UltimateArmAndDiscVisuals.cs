@@ -560,6 +560,8 @@ namespace PuckUltimateFrisbeeMod
                         foreach (var bodyCol in p.PlayerBody.GetComponentsInChildren<Collider>(true))
                         {
                             Physics.IgnoreCollision(__instance.IceCollider, bodyCol, true);
+                            // Let the Frisbee fly freely through/over the sideline fences for Outside-In (OI) curves!
+                            Level_GrassStadiumSetup_Patch.IgnoreFenceCollisionsForDisc(__instance);
                         }
                     }
                 }
