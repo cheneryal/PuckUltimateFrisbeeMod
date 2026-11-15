@@ -135,6 +135,112 @@ namespace PuckUltimateFrisbeeMod
             }
         }
 
+        /// <summary>
+        /// Applies modular meshes (M/F, Hair, Headgear) and Skin/Hair colors to ANY character instance
+        /// (works for both live players and the 3D UI Preview Mannequin!).
+        /// </summary>
+        public static void ApplyToTarget(Transform targetRoot, PlayerAppearanceData data, PlayerHead fallbackVanillaHead = null)
+        {
+            if (targetRoot == null) return;
+
+            Color skinCol = UltimateAppearanceManager.SkinTonePalette[0];
+            Color hairCol = UltimateAppearanceManager.HairColorPalette[0];
+
+            if (fallbackVanillaHead != null && (data.SkinToneIndex == 0 || data.HairColorIndex == 0))
+            {
+                bool foundSkin = false, foundHair = false;
+                foreach (var r in fallbackVanillaHead.GetComponentsInChildren<Renderer>(true))
+                {
+                    if (r == null || r.sharedMaterial == null) continue;
+                    string n = (r.gameObject.name + "_" + r.sharedMaterial.name).ToLowerInvariant();
+                    Material m = r.sharedMaterial;
+                    Color c = m.HasProperty("_BaseColor") ? m.GetColor("_BaseColor")
+                            : m.HasProperty("_Color") ? m.GetColor("_Color") : m.color;
+
+                    if (!foundHair && (n.Contains("hair") || n.Contains("beard") || n.Contains("mustache") || n.Contains("brow")))
+                    {
+                        if (data.HairColorIndex == 0) hairCol = c;
+                        foundHair = true;
+                    }
+                    else if (!foundSkin && (n.Contains("head") || n.Contains("skin") || n.Contains("face")))
+                    {
+                        if (data.SkinToneIndex == 0) skinCol = c;
+                        foundSkin = true;
+                    }
+                }
+            }
+
+            if (data.SkinToneIndex > 0 && data.SkinToneIndex < UltimateAppearanceManager.SkinTonePalette.Length)
+                skinCol = UltimateAppearanceManager.SkinTonePalette[data.SkinToneIndex];
+
+            if (data.HairColorIndex > 0 && data.HairColorIndex < UltimateAppearanceManager.HairColorPalette.Length)
+                hairCol = UltimateAppearanceManager.HairColorPalette[data.HairColorIndex];
+
+            // 1. Toggle Modular Gender, Hair & Headgear Meshes
+            bool isFem = (UltimateGender)data.Gender == UltimateGender.Feminine;
+            UltimateHairStyle hair = (UltimateHairStyle)data.HairStyle;
+            UltimateHeadGear gear  = (UltimateHeadGear)data.HeadGear;
+
+            bool isClosedTopHat = (gear == UltimateHeadGear.BackwardCap ||
+                                   gear == UltimateHeadGear.ForwardCap ||
+                                   gear == UltimateHeadGear.Beanie);
+
+            bool hasModularTorso = targetRoot.Find("Torso_M") != null || targetRoot.Find("Torso_F") != null;
+            bool hasModularHair  = targetRoot.Find("Hair_1_Short") != null;
+            bool hasModularGear  = targetRoot.Find("Gear_1_BackCap_Band_Dome") != null;
+
+            foreach (Transform child in targetRoot)
+            {
+                string n = child.name;
+
+                if (hasModularTorso)
+                {
+                    if (n.EndsWith("_M", StringComparison.Ordinal)) { child.gameObject.SetActive(!isFem); continue; }
+                    if (n.EndsWith("_F", StringComparison.Ordinal)) { child.gameObject.SetActive(isFem); continue; }
+                }
+
+                if (n.StartsWith("Hair_", StringComparison.Ordinal))
+                {
+                    bool show = false;
+                    if (hair != UltimateHairStyle.None)
+                    {
+                        string prefix = $"Hair_{(int)hair}_";
+                        if (n.StartsWith(prefix, StringComparison.Ordinal))
+                        {
+                            show = true;
+                            if (isClosedTopHat && n.Contains("BunTop")) show = false;
+                        }
+                        else if (isClosedTopHat && hair == UltimateHairStyle.AfroCrown && n == "Hair_1_Short")
+                        {
+                            show = true;
+                        }
+                    }
+                    child.gameObject.SetActive(show);
+                    continue;
+                }
+                else if (n == "Custom_Hair" && !hasModularHair)
+                {
+                    child.gameObject.SetActive(hair != UltimateHairStyle.None);
+                    continue;
+                }
+
+                if (n.StartsWith("Gear_", StringComparison.Ordinal))
+                {
+                    string prefix = $"Gear_{(int)gear}_";
+                    child.gameObject.SetActive(gear != UltimateHeadGear.None && n.StartsWith(prefix, StringComparison.Ordinal));
+                    continue;
+                }
+                else if ((n == "Cap_Band_Dome" || n == "Cap_Band_Brim") && !hasModularGear)
+                {
+                    child.gameObject.SetActive(gear != UltimateHeadGear.None);
+                    continue;
+                }
+            }
+
+            // 2. Apply Skin & Hair Colors
+            ApplySkinAndHairColorsToHierarchy(targetRoot, skinCol, hairCol);
+        }
+
         private void ApplyModularMeshVisibility(PlayerAppearanceData data)
         {
             bool isFem = (UltimateGender)data.Gender == UltimateGender.Feminine;

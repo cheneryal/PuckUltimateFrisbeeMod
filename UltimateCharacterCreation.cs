@@ -350,7 +350,18 @@ namespace PuckUltimateFrisbeeMod
         private bool _prevIsMouseRequired;
 
         private Texture2D _whiteTex;
-        private GUIStyle _titleStyle, _subStyle, _secStyle, _rowLabelStyle, _rowDescStyle, _valStyle, _btnStyle;
+        private GUIStyle _titleStyle, _subStyle, _secStyle, _rowLabelStyle, _rowDescStyle, _valStyle, _hintOverlayStyle;
+
+        // --- 3D PREVIEW BOOTH OBJECTS ---
+        private GameObject _boothRoot;
+        private Camera _previewCam;
+        private RenderTexture _previewRT;
+        private GameObject _previewAvatar;
+        private UltimatePlayerMarker _previewMarker;
+        private float _previewYaw = 155f; // Angled slightly so you see face + cap brim
+        private float _previewZoom = 0f;  // 0 = Full Body, 1 = Head/Upper Torso Closeup
+        private bool _isDraggingPreview = false;
+        private PlayerTeam _previewTeam = PlayerTeam.Blue;
 
         // MapHack Dark Slate & Blue Accent Palette
         private static readonly Color BackdropCol = new Color32(0, 0, 0, 145);
@@ -392,6 +403,7 @@ namespace PuckUltimateFrisbeeMod
         {
             if (Instance == this) Instance = null;
             if (_isVisible) Hide();
+            DestroyPreviewBooth();
         }
 
         private void Update()
@@ -410,6 +422,27 @@ namespace PuckUltimateFrisbeeMod
             {
                 Hide();
             }
+
+            if (_isVisible && _previewAvatar != null)
+            {
+                // Slowly turntable-rotate when not actively dragging
+                if (!_isDraggingPreview)
+                {
+                    _previewYaw = (_previewYaw + Time.unscaledDeltaTime * 14f) % 360f;
+                }
+                _previewAvatar.transform.localRotation = Quaternion.Euler(0f, _previewYaw, 0f);
+
+                // Smoothly interpolate camera between Full Body (zoom=0) and Head/Torso Closeup (zoom=1)
+                if (_previewCam != null)
+                {
+                    Vector3 fullBodyCamPos = new Vector3(0f, 0.96f, -3.45f);
+                    Vector3 closeupCamPos  = new Vector3(0f, 1.58f, -1.35f);
+                    _previewCam.transform.localPosition = Vector3.Lerp(fullBodyCamPos, closeupCamPos, _previewZoom);
+
+                    Vector3 lookTarget = _boothRoot.transform.position + new Vector3(0f, Mathf.Lerp(0.94f, 1.55f, _previewZoom), 0f);
+                    _previewCam.transform.LookAt(lookTarget, Vector3.up);
+                }
+            }
         }
 
         private static bool IsChatOpen()
@@ -420,6 +453,171 @@ namespace PuckUltimateFrisbeeMod
                 return chat != null && chat.IsFocused;
             }
             catch { return false; }
+        }
+
+        // =====================================================================
+        // 3D PREVIEW BOOTH CREATION & POSE SETUP
+        // =====================================================================
+        private void EnsurePreviewBooth()
+        {
+            if (UltimateAssetLoader.CustomPlayerPrefab == null) return;
+
+            if (_previewRT == null)
+            {
+                _previewRT = new RenderTexture(500, 600, 24, RenderTextureFormat.ARGB32)
+                {
+                    antiAliasing = 4,
+                    name = "UltimatePreviewRT"
+                };
+                _previewRT.Create();
+            }
+
+            if (_boothRoot == null)
+            {
+                _boothRoot = new GameObject("__Ultimate3DPreviewBooth__");
+                DontDestroyOnLoad(_boothRoot);
+                // Place 500m underground so it never overlaps the stadium or players
+                _boothRoot.transform.position = new Vector3(0f, -500f, 0f);
+
+                // Studio Camera
+                GameObject camObj = new GameObject("PreviewCamera");
+                camObj.transform.SetParent(_boothRoot.transform, false);
+                _previewCam = camObj.AddComponent<Camera>();
+                _previewCam.clearFlags = CameraClearFlags.SolidColor;
+                _previewCam.backgroundColor = new Color(0.08f, 0.09f, 0.12f, 1f);
+                _previewCam.fieldOfView = 38f;
+                _previewCam.nearClipPlane = 0.1f;
+                _previewCam.farClipPlane = 15f;
+                _previewCam.targetTexture = _previewRT;
+                _previewCam.useOcclusionCulling = false;
+
+                // Studio Key Light
+                GameObject keyLightObj = new GameObject("PreviewKeyLight");
+                keyLightObj.transform.SetParent(_boothRoot.transform, false);
+                keyLightObj.transform.localPosition = new Vector3(1.5f, 2.6f, -2.2f);
+                keyLightObj.transform.LookAt(_boothRoot.transform.position + Vector3.up * 1.2f);
+                Light keyLight = keyLightObj.AddComponent<Light>();
+                keyLight.type = LightType.Point;
+                keyLight.range = 12f;
+                keyLight.intensity = 2.2f;
+                keyLight.color = new Color(1.0f, 0.98f, 0.94f);
+                keyLight.shadows = LightShadows.None;
+
+                // Studio Rim/Fill Light
+                GameObject fillLightObj = new GameObject("PreviewFillLight");
+                fillLightObj.transform.SetParent(_boothRoot.transform, false);
+                fillLightObj.transform.localPosition = new Vector3(-1.8f, 1.5f, -1.5f);
+                Light fillLight = fillLightObj.AddComponent<Light>();
+                fillLight.type = LightType.Point;
+                fillLight.range = 10f;
+                fillLight.intensity = 1.1f;
+                fillLight.color = new Color(0.65f, 0.80f, 1.0f);
+                fillLight.shadows = LightShadows.None;
+
+                // Instantiate the Modular Athlete Model
+                _previewAvatar = Instantiate(UltimateAssetLoader.CustomPlayerPrefab, _boothRoot.transform);
+                _previewAvatar.name = "PreviewAthleteMannequin";
+                _previewAvatar.transform.localPosition = Vector3.zero;
+                _previewAvatar.transform.localRotation = Quaternion.Euler(0f, _previewYaw, 0f);
+
+                UltimateAssetLoader.SmoothMeshNormals(_previewAvatar, 55f);
+                UltimateAssetLoader.ApplyRuntimeMaterials(_previewAvatar, 0.15f);
+
+                foreach (var smr in _previewAvatar.GetComponentsInChildren<SkinnedMeshRenderer>(true))
+                {
+                    smr.updateWhenOffscreen = true;
+                }
+
+                // Relax the T-Pose arms into a natural athletic standing stance if no Animator is playing
+                RelaxTPoseArms(_previewAvatar.transform);
+
+                _previewMarker = _previewAvatar.AddComponent<UltimatePlayerMarker>();
+            }
+
+            // Detect local player's current team if spawned
+            var nm = NetworkManager.Singleton;
+            if (nm != null && nm.IsClient)
+            {
+                Player localP = MonoBehaviourSingleton<PlayerManager>.Instance?.GetPlayerByClientId(nm.LocalClientId);
+                if (localP != null)
+                {
+                    PlayerTeam t = UltimateRulesManager.GetTeam(localP);
+                    if (t == PlayerTeam.Blue || t == PlayerTeam.Red) _previewTeam = t;
+                }
+            }
+
+            _boothRoot.SetActive(true);
+            RefreshPreviewMannequin();
+        }
+
+        private static void RelaxTPoseArms(Transform avatarRoot)
+        {
+            // Disable Animator if it has no controller or is stuck in T-Pose
+            Animator anim = avatarRoot.GetComponent<Animator>();
+            if (anim != null && anim.runtimeAnimatorController == null)
+            {
+                anim.enabled = false;
+            }
+
+            // Rotate LeftArm and RightArm down from horizontal T-Pose (~68 degrees) for a clean athletic stance
+            Transform leftArm = FindBone(avatarRoot, "mixamorig:LeftArm");
+            Transform rightArm = FindBone(avatarRoot, "mixamorig:RightArm");
+            Transform leftForeArm = FindBone(avatarRoot, "mixamorig:LeftForeArm");
+            Transform rightForeArm = FindBone(avatarRoot, "mixamorig:RightForeArm");
+
+            if (leftArm != null) leftArm.localRotation *= Quaternion.Euler(0f, 0f, -66f);
+            if (rightArm != null) rightArm.localRotation *= Quaternion.Euler(0f, 0f, 66f);
+            if (leftForeArm != null) leftForeArm.localRotation *= Quaternion.Euler(14f, 0f, -12f);
+            if (rightForeArm != null) rightForeArm.localRotation *= Quaternion.Euler(14f, 0f, 12f);
+        }
+
+        private static Transform FindBone(Transform parent, string name)
+        {
+            foreach (Transform child in parent)
+            {
+                if (child.name == name) return child;
+                Transform found = FindBone(child, name);
+                if (found != null) return found;
+            }
+            return null;
+        }
+
+        public void RefreshPreviewMannequin()
+        {
+            if (_previewAvatar == null) return;
+
+            PlayerHead fallbackHead = null;
+            var nm = NetworkManager.Singleton;
+            if (nm != null && nm.IsClient)
+            {
+                Player localP = MonoBehaviourSingleton<PlayerManager>.Instance?.GetPlayerByClientId(nm.LocalClientId);
+                fallbackHead = localP?.PlayerBody?.PlayerMesh?.PlayerHead;
+            }
+
+            // 1. Apply Gender, Hair, Headgear, Skin Color & Hair Color
+            UltimateSkinAndTeamSync.ApplyToTarget(_previewAvatar.transform, UltimateAppearanceManager.LocalAppearance, fallbackHead);
+
+            // 2. Re-apply Team Color (since enabling/disabling new headgear meshes needs team tinting)
+            if (_previewMarker != null)
+            {
+                _previewMarker.LastAppliedTeam = null;
+                UltimatePlayerRigManager.ApplyTeamColors(_previewMarker, _previewTeam);
+            }
+        }
+
+        private void DestroyPreviewBooth()
+        {
+            if (_boothRoot != null)
+            {
+                Destroy(_boothRoot);
+                _boothRoot = null;
+            }
+            if (_previewRT != null)
+            {
+                _previewRT.Release();
+                Destroy(_previewRT);
+                _previewRT = null;
+            }
         }
 
         public void Show()
@@ -447,6 +645,7 @@ namespace PuckUltimateFrisbeeMod
             }
             catch { }
 
+            EnsurePreviewBooth();
             _isVisible = true;
         }
 
@@ -454,6 +653,9 @@ namespace PuckUltimateFrisbeeMod
         {
             if (!_isVisible) return;
             _isVisible = false;
+            _isDraggingPreview = false;
+
+            if (_boothRoot != null) _boothRoot.SetActive(false);
 
             if (_savedMouseRequired)
             {
@@ -489,8 +691,8 @@ namespace PuckUltimateFrisbeeMod
             _valStyle = new GUIStyle(GUI.skin.label) { fontSize = 12, fontStyle = FontStyle.Bold, alignment = TextAnchor.MiddleCenter };
             _valStyle.normal.textColor = Accent;
 
-            _btnStyle = new GUIStyle(GUI.skin.button) { fontSize = 12, fontStyle = FontStyle.Bold, alignment = TextAnchor.MiddleCenter };
-            _btnStyle.normal.textColor = TextPrimary;
+            _hintOverlayStyle = new GUIStyle(GUI.skin.label) { fontSize = 11, alignment = TextAnchor.MiddleCenter };
+            _hintOverlayStyle.normal.textColor = new Color(0.85f, 0.88f, 0.92f, 0.70f);
         }
 
         private void DrawRect(Rect r, Color c)
@@ -509,12 +711,19 @@ namespace PuckUltimateFrisbeeMod
             DrawRect(new Rect(r.xMax - t, r.y, t, r.height), c);
         }
 
-        private bool DrawStyledButton(Rect r, string text)
+        private bool DrawStyledButton(Rect r, string text, Color? overrideBg = null)
         {
             bool hover = r.Contains(Event.current.mousePosition);
-            DrawRect(r, hover ? Color.Lerp(ButtonBg, Accent, 0.35f) : ButtonBg);
-            DrawBorder(r, hover ? Accent : PanelBorder, 1f);
-            return GUI.Button(r, text, _valStyle);
+            Color baseCol = overrideBg ?? ButtonBg;
+            DrawRect(r, hover ? Color.Lerp(baseCol, Accent, 0.35f) : baseCol);
+            DrawBorder(r, (hover || overrideBg.HasValue) ? Accent : PanelBorder, 1f);
+
+            Color prevTextCol = _valStyle.normal.textColor;
+            _valStyle.normal.textColor = (overrideBg.HasValue || hover) ? TextPrimary : Accent;
+            bool clicked = GUI.Button(r, text, _valStyle);
+            _valStyle.normal.textColor = prevTextCol;
+
+            return clicked;
         }
 
         private void OnGUI()
@@ -525,8 +734,8 @@ namespace PuckUltimateFrisbeeMod
             // Fullscreen dimmed backdrop
             DrawRect(new Rect(0, 0, Screen.width, Screen.height), BackdropCol);
 
-            float panelW = 680f;
-            float panelH = 510f;
+            float panelW = 940f;
+            float panelH = 520f;
             Rect panelRect = new Rect((Screen.width - panelW) * 0.5f, (Screen.height - panelH) * 0.5f, panelW, panelH);
 
             DrawRect(panelRect, PanelBg);
@@ -534,7 +743,9 @@ namespace PuckUltimateFrisbeeMod
 
             float x = panelRect.x + 22f;
             float y = panelRect.y + 18f;
-            float innerW = panelW - 44f;
+            float leftColW = 610f;
+            float rightColW = 272f;
+            float rightColX = x + leftColW + 14f;
 
             // Header
             _titleStyle.normal.textColor = TextPrimary;
@@ -543,58 +754,122 @@ namespace PuckUltimateFrisbeeMod
             GUI.Label(new Rect(x + 140f, y, 200f, 34f), "ATHLETE", _titleStyle);
             y += 34f;
 
-            GUI.Label(new Rect(x, y, innerW, 20f), $"Character appearance & gear  ·  Synced across server  ·  {ToggleKey} to toggle  ·  Esc to close", _subStyle);
+            GUI.Label(new Rect(x, y, panelW - 44f, 20f), $"Character appearance & gear  ·  Synced across server  ·  {ToggleKey} to toggle  ·  Esc to close", _subStyle);
             y += 28f;
 
-            // Section Card
-            float secH = 356f;
-            Rect secRect = new Rect(x, y, innerW, secH);
+            // =================================================================
+            // LEFT COLUMN: CUSTOMIZATION CONTROLS
+            // =================================================================
+            float secH = 360f;
+            Rect secRect = new Rect(x, y, leftColW, secH);
             DrawRect(secRect, SectionBg);
             DrawBorder(secRect, PanelBorder, 1f);
 
-            // Section Title Bar
             DrawRect(new Rect(x + 14f, y + 14f, 4f, 18f), Accent);
             GUI.Label(new Rect(x + 26f, y + 12f, 300f, 22f), "ATHLETE APPEARANCE", _secStyle);
-            y += 44f;
+            float rowY = y + 44f;
 
             var d = UltimateAppearanceManager.LocalAppearance;
 
-            DrawStepperRow(new Rect(x + 12f, y, innerW - 24f, 54f),
+            DrawStepperRow(new Rect(x + 12f, rowY, leftColW - 24f, 54f),
                 "Body Build / Gender", "Switches between Masculine V-taper and Feminine contoured frame.",
                 UltimateAppearanceManager.GenderNames, null, d.Gender,
-                next => { d.Gender = (byte)next; UltimateAppearanceManager.SetAndBroadcastLocalAppearance(d); });
-            y += 60f;
+                next => { d.Gender = (byte)next; ApplyAndSync(d); });
+            rowY += 60f;
 
-            DrawStepperRow(new Rect(x + 12f, y, innerW - 24f, 54f),
+            DrawStepperRow(new Rect(x + 12f, rowY, leftColW - 24f, 54f),
                 "Hairstyle", "Select hair mesh. Tall styles automatically tuck under closed-top caps.",
                 UltimateAppearanceManager.HairNames, null, d.HairStyle,
-                next => { d.HairStyle = (byte)next; UltimateAppearanceManager.SetAndBroadcastLocalAppearance(d); });
-            y += 60f;
+                next => { d.HairStyle = (byte)next; ApplyAndSync(d); });
+            rowY += 60f;
 
-            DrawStepperRow(new Rect(x + 12f, y, innerW - 24f, 54f),
+            DrawStepperRow(new Rect(x + 12f, rowY, leftColW - 24f, 54f),
                 "Headgear", "Caps, visors, sweatbands, and beanies tinted to your team color.",
                 UltimateAppearanceManager.GearNames, null, d.HeadGear,
-                next => { d.HeadGear = (byte)next; UltimateAppearanceManager.SetAndBroadcastLocalAppearance(d); });
-            y += 60f;
+                next => { d.HeadGear = (byte)next; ApplyAndSync(d); });
+            rowY += 60f;
 
-            DrawStepperRow(new Rect(x + 12f, y, innerW - 24f, 54f),
+            DrawStepperRow(new Rect(x + 12f, rowY, leftColW - 24f, 54f),
                 "Skin Tone", "Updates both your 3rd-person athlete and 1st-person catching arm.",
                 UltimateAppearanceManager.SkinToneNames, UltimateAppearanceManager.SkinTonePalette, d.SkinToneIndex,
-                next => { d.SkinToneIndex = (byte)next; UltimateAppearanceManager.SetAndBroadcastLocalAppearance(d); });
-            y += 60f;
+                next => { d.SkinToneIndex = (byte)next; ApplyAndSync(d); });
+            rowY += 60f;
 
-            DrawStepperRow(new Rect(x + 12f, y, innerW - 24f, 54f),
+            DrawStepperRow(new Rect(x + 12f, rowY, leftColW - 24f, 54f),
                 "Hair Color", "Applies to all hairstyles.",
                 UltimateAppearanceManager.HairColorNames, UltimateAppearanceManager.HairColorPalette, d.HairColorIndex,
-                next => { d.HairColorIndex = (byte)next; UltimateAppearanceManager.SetAndBroadcastLocalAppearance(d); });
+                next => { d.HairColorIndex = (byte)next; ApplyAndSync(d); });
 
-            // Footer Buttons
+            // =================================================================
+            // RIGHT COLUMN: LIVE 3D PREVIEW BOOTH
+            // =================================================================
+            Rect previewCard = new Rect(rightColX, y, rightColW, secH);
+            DrawRect(previewCard, SectionBg);
+            DrawBorder(previewCard, PanelBorder, 1f);
+
+            DrawRect(new Rect(rightColX + 14f, y + 14f, 4f, 18f), Accent);
+            GUI.Label(new Rect(rightColX + 26f, y + 12f, 140f, 22f), "3D PREVIEW", _secStyle);
+
+            // Team Kit Preview Toggle (BLUE / RED) in top-right of Preview Card
+            Rect blueBtn = new Rect(previewCard.xMax - 114f, y + 10f, 48f, 24f);
+            Rect redBtn  = new Rect(previewCard.xMax - 60f,  y + 10f, 48f, 24f);
+            if (DrawStyledButton(blueBtn, "BLUE", _previewTeam == PlayerTeam.Blue ? new Color(0.16f, 0.45f, 0.82f) : (Color?)null))
+            {
+                _previewTeam = PlayerTeam.Blue;
+                RefreshPreviewMannequin();
+            }
+            if (DrawStyledButton(redBtn, "RED", _previewTeam == PlayerTeam.Red ? new Color(0.80f, 0.20f, 0.20f) : (Color?)null))
+            {
+                _previewTeam = PlayerTeam.Red;
+                RefreshPreviewMannequin();
+            }
+
+            Rect viewportRect = new Rect(rightColX + 10f, y + 44f, rightColW - 20f, secH - 54f);
+            DrawRect(viewportRect, new Color(0.08f, 0.09f, 0.12f, 1f));
+
+            if (_previewRT != null)
+            {
+                GUI.DrawTexture(viewportRect, _previewRT, ScaleMode.ScaleToFit, false);
+            }
+            DrawBorder(viewportRect, PanelBorder, 1f);
+
+            // Handle Mouse Drag (Rotate) & Scroll Wheel (Zoom) inside the 3D Viewport
+            Event ev = Event.current;
+            if (ev != null)
+            {
+                if (ev.type == EventType.MouseDown && ev.button == 0 && viewportRect.Contains(ev.mousePosition))
+                {
+                    _isDraggingPreview = true;
+                    ev.Use();
+                }
+                else if (ev.type == EventType.MouseUp && ev.button == 0)
+                {
+                    _isDraggingPreview = false;
+                }
+                else if (ev.type == EventType.MouseDrag && _isDraggingPreview)
+                {
+                    _previewYaw = (_previewYaw - ev.delta.x * 1.15f) % 360f;
+                    ev.Use();
+                }
+                else if (ev.type == EventType.ScrollWheel && viewportRect.Contains(ev.mousePosition))
+                {
+                    _previewZoom = Mathf.Clamp01(_previewZoom - ev.delta.y * 0.08f);
+                    ev.Use();
+                }
+            }
+
+            GUI.Label(new Rect(viewportRect.x, viewportRect.yMax - 22f, viewportRect.width, 20f),
+                "Drag to Rotate  ·  Scroll to Zoom", _hintOverlayStyle);
+
+            // =================================================================
+            // FOOTER
+            // =================================================================
             float footerY = panelRect.yMax - 48f;
-            GUI.Label(new Rect(x, footerY + 6f, 320f, 22f), "Changes save automatically & sync live.", _subStyle);
+            GUI.Label(new Rect(x, footerY + 6f, 380f, 22f), "Changes save automatically & sync live to all players.", _subStyle);
 
             if (DrawStyledButton(new Rect(panelRect.xMax - 362f, footerY, 108f, 32f), "RANDOMIZE"))
             {
-                UltimateAppearanceManager.SetAndBroadcastLocalAppearance(new PlayerAppearanceData
+                ApplyAndSync(new PlayerAppearanceData
                 {
                     Gender = (byte)UnityEngine.Random.Range(0, UltimateAppearanceManager.GenderNames.Length),
                     HairStyle = (byte)UnityEngine.Random.Range(0, UltimateAppearanceManager.HairNames.Length),
@@ -606,13 +881,19 @@ namespace PuckUltimateFrisbeeMod
 
             if (DrawStyledButton(new Rect(panelRect.xMax - 246f, footerY, 108f, 32f), "RESET"))
             {
-                UltimateAppearanceManager.SetAndBroadcastLocalAppearance(PlayerAppearanceData.Default);
+                ApplyAndSync(PlayerAppearanceData.Default);
             }
 
             if (DrawStyledButton(new Rect(panelRect.xMax - 130f, footerY, 108f, 32f), "CLOSE"))
             {
                 Hide();
             }
+        }
+
+        private void ApplyAndSync(PlayerAppearanceData newData)
+        {
+            UltimateAppearanceManager.SetAndBroadcastLocalAppearance(newData);
+            RefreshPreviewMannequin();
         }
 
         private void DrawStepperRow(
@@ -626,8 +907,8 @@ namespace PuckUltimateFrisbeeMod
         {
             DrawRect(rowRect, RowBg);
 
-            GUI.Label(new Rect(rowRect.x + 14f, rowRect.y + 6f, 320f, 20f), title, _rowLabelStyle);
-            GUI.Label(new Rect(rowRect.x + 14f, rowRect.y + 26f, 340f, 20f), desc, _rowDescStyle);
+            GUI.Label(new Rect(rowRect.x + 14f, rowRect.y + 6f, 290f, 20f), title, _rowLabelStyle);
+            GUI.Label(new Rect(rowRect.x + 14f, rowRect.y + 26f, 310f, 20f), desc, _rowDescStyle);
 
             int safeIdx = Mathf.Clamp(currentIdx, 0, options.Length - 1);
 
