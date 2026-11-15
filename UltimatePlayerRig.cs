@@ -561,17 +561,20 @@ namespace PuckUltimateFrisbeeMod
             // Minimum time between consecutive footsteps to prevent double-triggers
             float minStepInterval = Mathf.Lerp(0.28f, 0.16f, speedFactor);
 
-            // Method 1: Exact 3D Foot Bone Plant Detection
+            // Method 1: Exact 3D Foot Bone Plant Detection (Scaled for 1.32f Athlete!)
             if (_leftFoot != null && _rightFoot != null)
             {
+                float scaleY = transform.localScale.y; // 1.32f
+                float unplantHeight = 0.16f * scaleY;  // ~0.211m
+                float plantHeight   = 0.11f * scaleY;  // ~0.145m
+
                 float leftLocalY = _body.transform.InverseTransformPoint(_leftFoot.position).y;
                 float rightLocalY = _body.transform.InverseTransformPoint(_rightFoot.position).y;
 
-                // Unplant foot when it lifts above 0.16m, trigger step when it descends below 0.11m
-                if (leftLocalY > 0.16f) _leftPlanted = false;
-                if (rightLocalY > 0.16f) _rightPlanted = false;
+                if (leftLocalY > unplantHeight) _leftPlanted = false;
+                if (rightLocalY > unplantHeight) _rightPlanted = false;
 
-                if (!_leftPlanted && leftLocalY <= 0.11f && leftLocalY <= _prevLeftY)
+                if (!_leftPlanted && leftLocalY <= plantHeight && leftLocalY <= _prevLeftY)
                 {
                     _leftPlanted = true;
                     if (Time.time - _lastStepTime >= minStepInterval)
@@ -581,7 +584,7 @@ namespace PuckUltimateFrisbeeMod
                     }
                 }
 
-                if (!_rightPlanted && rightLocalY <= 0.11f && rightLocalY <= _prevRightY)
+                if (!_rightPlanted && rightLocalY <= plantHeight && rightLocalY <= _prevRightY)
                 {
                     _rightPlanted = true;
                     if (Time.time - _lastStepTime >= minStepInterval)
@@ -596,11 +599,10 @@ namespace PuckUltimateFrisbeeMod
                 return;
             }
 
-            // Method 2: Fallback to Blend Tree Normalized Time (2 steps per full 1.0 animation loop)
+            // Method 2: Fallback to Blend Tree Normalized Time
             AnimatorStateInfo state = _animator.GetCurrentAnimatorStateInfo(0);
             if (state.IsName("Locomotion") || state.IsName("Blend Tree"))
             {
-                // Offset by 0.15 so footsteps align with the visual foot plant frames of each half-cycle
                 int currentHalfCycle = Mathf.FloorToInt((state.normalizedTime + 0.15f) * 2f);
                 if (currentHalfCycle != _lastNormalizedHalfCycle)
                 {
@@ -621,8 +623,13 @@ namespace PuckUltimateFrisbeeMod
         private Animator _animator;
         private Player _player;
         private PlayerBody _body;
+
         private Transform _headBone;
         private Transform _spineBone;
+
+        private Transform _leftArm, _leftForeArm, _leftHand;
+        private Transform _rightArm, _rightForeArm, _rightHand;
+
         private Quaternion _lastHeadRot = Quaternion.identity;
         private Quaternion _lastSpineRot = Quaternion.identity;
 
@@ -634,13 +641,18 @@ namespace PuckUltimateFrisbeeMod
             _player = player;
             _body = body;
 
-            if (_animator != null && _animator.isHuman)
-            {
-                _headBone = _animator.GetBoneTransform(HumanBodyBones.Head);
-                _spineBone = _animator.GetBoneTransform(HumanBodyBones.Spine);
-            }
+            // Find bones directly by name so it works 100% reliably on both Generic and Humanoid rigs!
+            _headBone  = FindBoneRecursive(transform, "mixamorig:Head");
+            _spineBone = FindBoneRecursive(transform, "mixamorig:Spine1") ?? FindBoneRecursive(transform, "mixamorig:Spine");
 
-            // Cache all renderers on the custom athlete body so we can cleanly hide them in 1st-person
+            _leftArm     = FindBoneRecursive(transform, "mixamorig:LeftArm");
+            _leftForeArm = FindBoneRecursive(transform, "mixamorig:LeftForeArm");
+            _leftHand    = FindBoneRecursive(transform, "mixamorig:LeftHand");
+
+            _rightArm     = FindBoneRecursive(transform, "mixamorig:RightArm");
+            _rightForeArm = FindBoneRecursive(transform, "mixamorig:RightForeArm");
+            _rightHand    = FindBoneRecursive(transform, "mixamorig:RightHand");
+
             var bodyList = new List<Renderer>();
             foreach (var r in GetComponentsInChildren<Renderer>(true))
             {
@@ -651,62 +663,15 @@ namespace PuckUltimateFrisbeeMod
             _allBodyRenderers = bodyList.ToArray();
         }
 
-        private void OnAnimatorIK(int layerIndex)
+        private static Transform FindBoneRecursive(Transform parent, string name)
         {
-            if (_animator == null || !_animator.isHuman || _player == null || _player.Stick == null || _body == null)
-                return;
-
-            try
+            foreach (Transform child in parent)
             {
-                bool isFallen = _body.HasFallen != null && _body.HasFallen.Value;
-                bool isDiving = UltimateDiveMod.IsPlayerDiving(_player);
-
-                // While initially launching into a layout dive, reach the catching hand out (weight = 0.85f),
-                // but once laying prone/standing up on the turf, release IK (weight = 0f) so arms don't point into the sky!
-                float ikWeight = isFallen ? (isDiving ? 0.5f : 0.0f) : 1.0f;
-                if (ikWeight <= 0.01f)
-                {
-                    _animator.SetIKPositionWeight(AvatarIKGoal.LeftHand, 0f);
-                    _animator.SetIKRotationWeight(AvatarIKGoal.LeftHand, 0f);
-                    _animator.SetIKPositionWeight(AvatarIKGoal.RightHand, 0f);
-                    _animator.SetIKRotationWeight(AvatarIKGoal.RightHand, 0f);
-                    return;
-                }
-
-                bool isLeft = _player.Handedness != null && _player.Handedness.Value == PlayerHandedness.Left;
-                AvatarIKGoal throwingHand = isLeft ? AvatarIKGoal.LeftHand : AvatarIKGoal.RightHand;
-                AvatarIKHint throwingElbow = isLeft ? AvatarIKHint.LeftElbow : AvatarIKHint.RightElbow;
-                AvatarIKGoal offHand = isLeft ? AvatarIKGoal.RightHand : AvatarIKGoal.LeftHand;
-
-                Vector3 handWorldPos = UltimateRulesManager.GetHandWorldPosition(_player.Stick, out Vector3 shoulderAnchor, out Vector3 shaftDir);
-                float wristRoll = _player.Stick.BladeAngle * UltimateVisualTuning.WristRollMultiplier;
-                Quaternion aimRot = Quaternion.LookRotation(shaftDir, Vector3.up) * Quaternion.Euler(0f, 0f, wristRoll);
-
-                Quaternion handBoneAlign = Quaternion.Euler(0f, isLeft ? -90f : 90f, 0f);
-                Quaternion finalHandIKRot = aimRot * handBoneAlign;
-
-                _animator.SetIKPositionWeight(throwingHand, ikWeight);
-                _animator.SetIKRotationWeight(throwingHand, ikWeight);
-                _animator.SetIKPosition(throwingHand, handWorldPos);
-                _animator.SetIKRotation(throwingHand, finalHandIKRot);
-
-                Vector3 elbowHintPos = Vector3.Lerp(shoulderAnchor, handWorldPos, 0.45f)
-                                     + Vector3.down * 0.25f
-                                     + _body.transform.right * (isLeft ? -0.18f : 0.18f);
-                _animator.SetIKHintPositionWeight(throwingElbow, 0.65f * ikWeight);
-                _animator.SetIKHintPosition(throwingElbow, elbowHintPos);
-
-                Vector3 offHandLocal = new Vector3(isLeft ? 0.28f : -0.28f, 1.05f, 0.14f);
-                Vector3 offHandWorld = _body.transform.TransformPoint(offHandLocal);
-                _animator.SetIKPositionWeight(offHand, 0.35f * ikWeight);
-                _animator.SetIKRotationWeight(offHand, 0f);
-                _animator.SetIKPosition(offHand, offHandWorld);
+                if (child.name == name) return child;
+                Transform res = FindBoneRecursive(child, name);
+                if (res != null) return res;
             }
-            catch
-            {
-                _animator.SetIKPositionWeight(AvatarIKGoal.LeftHand, 0f);
-                _animator.SetIKPositionWeight(AvatarIKGoal.RightHand, 0f);
-            }
+            return null;
         }
 
         public static bool IsLocalPlayerInFirstPerson(Player player, PlayerBody body)
@@ -715,7 +680,6 @@ namespace PuckUltimateFrisbeeMod
             Camera cam = Camera.main;
             if (cam == null) return true;
 
-            // Use body.transform.up so when the player lays flat during a dive, the head offset rotates with them!
             Vector3 localHeadPos = body.transform.position + body.transform.up * 1.5f;
             float distToHead = Vector3.Distance(cam.transform.position, localHeadPos);
             float distToCenter = Vector3.Distance(cam.transform.position, body.transform.position + Vector3.up * 0.8f);
@@ -723,13 +687,26 @@ namespace PuckUltimateFrisbeeMod
             return Mathf.Min(distToHead, distToCenter) < 1.85f;
         }
 
+        /// <summary>
+        /// Solves 3D arm IK immediately and returns the exact world position & rotation of the 3D character's throwing hand!
+        /// </summary>
+        public bool TryGetVisualHandGrip(out Vector3 palmWorldPos, out Quaternion aimRot)
+        {
+            palmWorldPos = Vector3.zero;
+            aimRot = Quaternion.identity;
+
+            if (_player == null || _player.Stick == null || _body == null) return false;
+
+            // Solve the arm IK right now so the bone transforms are up-to-date even if ClientDiscFollower.LateUpdate runs first!
+            SolveThrowingArmDirectIK(out palmWorldPos, out aimRot);
+            return palmWorldPos != Vector3.zero;
+        }
+
         private void LateUpdate()
         {
             if (_player == null || _body == null) return;
 
-            // Hide the custom body mesh on the LocalPlayer when in 1st-person so the collar/sleeves/torso
-            // never block the camera (just like SkaterMod's LocalPlayerVisibility)!
-            // If the player switches to 3rd-person camera, the full body automatically appears!
+            // 1. Hide 3rd-person body only when LocalPlayer is in 1st-person view
             if (_player.IsLocalPlayer && _allBodyRenderers != null)
             {
                 bool showBody = !IsLocalPlayerInFirstPerson(_player, _body);
@@ -743,6 +720,7 @@ namespace PuckUltimateFrisbeeMod
                 }
             }
 
+            // 2. Spine & Head Look Rotation
             if (_headBone != null && _spineBone != null && _player.PlayerInput != null)
             {
                 Vector2 lookAngle = _player.IsLocalPlayer
@@ -750,15 +728,83 @@ namespace PuckUltimateFrisbeeMod
                     : _player.PlayerInput.LookAngleInput.ServerValue;
 
                 float yaw = Mathf.Clamp(lookAngle.y, -85f, 85f);
-                Quaternion targetSpine = Quaternion.Euler(0f, yaw * 0.55f, 0f);
-                Quaternion targetHead = Quaternion.Euler(0f, yaw * 0.45f, 0f);
+                Quaternion targetSpine = Quaternion.Euler(0f, yaw * 0.45f, 0f);
+                Quaternion targetHead = Quaternion.Euler(0f, yaw * 0.40f, 0f);
 
                 _lastSpineRot = Quaternion.Lerp(_lastSpineRot, targetSpine, Time.deltaTime * 12f);
                 _lastHeadRot = Quaternion.Lerp(_lastHeadRot, targetHead, Time.deltaTime * 12f);
 
-                _spineBone.localRotation = _lastSpineRot;
-                _headBone.localRotation = _lastHeadRot;
+                _spineBone.localRotation *= _lastSpineRot;
+                _headBone.localRotation *= _lastHeadRot;
             }
+
+            // 3. Direct Two-Bone Arm IK toward the Stick/Hand Target
+            SolveThrowingArmDirectIK(out _, out _);
+        }
+
+        private void SolveThrowingArmDirectIK(out Vector3 finalPalmWorldPos, out Quaternion handAimRot)
+        {
+            finalPalmWorldPos = Vector3.zero;
+            handAimRot = Quaternion.identity;
+
+            if (_player == null || _player.Stick == null || _body == null) return;
+
+            bool isLeft = _player.Handedness != null && _player.Handedness.Value == PlayerHandedness.Left;
+            Transform upperArm = isLeft ? _leftArm : _rightArm;
+            Transform foreArm  = isLeft ? _leftForeArm : _rightForeArm;
+            Transform hand     = isLeft ? _leftHand : _rightHand;
+
+            if (upperArm == null || foreArm == null || hand == null) return;
+
+            Vector3 rawTarget = UltimateRulesManager.GetHandWorldPosition(_player.Stick, out _, out Vector3 shaftDir);
+            float wristRoll = _player.Stick.BladeAngle * UltimateVisualTuning.WristRollMultiplier;
+            handAimRot = Quaternion.LookRotation(shaftDir, Vector3.up) * Quaternion.Euler(0f, 0f, wristRoll);
+
+            bool isFallen = _body.HasFallen != null && _body.HasFallen.Value;
+            bool isDiving = UltimateDiveMod.IsPlayerDiving(_player);
+            if (isFallen && !isDiving)
+            {
+                finalPalmWorldPos = hand.position + hand.up * 0.08f;
+                return;
+            }
+
+            // Measure actual bone segment lengths on the scaled rig
+            Vector3 shoulderPos = upperArm.position;
+            float lenUpper = Vector3.Distance(upperArm.position, foreArm.position);
+            float lenFore  = Vector3.Distance(foreArm.position, hand.position);
+            float maxReach = Mathf.Max(0.1f, (lenUpper + lenFore) * 0.97f);
+
+            Vector3 toTarget = rawTarget - shoulderPos;
+            float dist = toTarget.magnitude;
+            Vector3 dirToTarget = dist > 0.001f ? (toTarget / dist) : _body.transform.forward;
+
+            // Clamp target to the arm's physical reach so the hand and disc always meet!
+            float clampedDist = Mathf.Clamp(dist, Mathf.Abs(lenUpper - lenFore) + 0.05f, maxReach);
+
+            // Law of Cosines for natural elbow bend angle
+            float cosAngle = Mathf.Clamp(
+                (lenUpper * lenUpper + clampedDist * clampedDist - lenFore * lenFore) / (2f * lenUpper * clampedDist),
+                -1f, 1f);
+            float bendAngleRad = Mathf.Acos(cosAngle);
+
+            // Elbow pole vector points down and slightly outward from torso
+            Vector3 poleDir = (-_body.transform.up + _body.transform.right * (isLeft ? -0.35f : 0.35f)).normalized;
+            Vector3 bendPlaneNormal = Vector3.Cross(dirToTarget, poleDir);
+            if (bendPlaneNormal.sqrMagnitude < 0.001f) bendPlaneNormal = _body.transform.right;
+            bendPlaneNormal.Normalize();
+
+            Vector3 upperArmDir = Quaternion.AngleAxis(bendAngleRad * Mathf.Rad2Deg, bendPlaneNormal) * dirToTarget;
+            Vector3 elbowWorldPos = shoulderPos + upperArmDir * lenUpper;
+            Vector3 clampedHandTarget = shoulderPos + dirToTarget * clampedDist;
+            Vector3 foreArmDir = (clampedHandTarget - elbowWorldPos).normalized;
+
+            // In Blender -> Unity bone space, the bone's longitudinal axis is its local +Y axis (Vector3.up)
+            upperArm.rotation = Quaternion.FromToRotation(Vector3.up, upperArmDir) * Quaternion.Euler(0f, _body.transform.eulerAngles.y, 0f);
+            foreArm.rotation  = Quaternion.FromToRotation(Vector3.up, foreArmDir) * Quaternion.Euler(0f, _body.transform.eulerAngles.y, 0f);
+            hand.rotation     = Quaternion.FromToRotation(Vector3.up, shaftDir) * Quaternion.Euler(0f, 0f, wristRoll);
+
+            // Return the fingertips/palm point right at the end of the 3D hand mesh
+            finalPalmWorldPos = hand.position + foreArmDir * (0.09f * transform.lossyScale.y);
         }
     }
 
@@ -788,6 +834,7 @@ namespace PuckUltimateFrisbeeMod
             athlete.name = "UltimateAthleteInstance";
             athlete.transform.localPosition = Vector3.zero;
             athlete.transform.localRotation = Quaternion.identity;
+            athlete.transform.localScale = Vector3.one * 1.30f; // <--- Scales character & arm reach to match field proportions!
 
             UltimateAssetLoader.SmoothMeshNormals(athlete, 55f);
             UltimateAssetLoader.ApplyRuntimeMaterials(athlete, 0.15f);

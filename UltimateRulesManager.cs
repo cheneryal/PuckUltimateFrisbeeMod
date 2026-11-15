@@ -914,15 +914,17 @@ namespace PuckUltimateFrisbeeMod
                 // B. TRACK IN-BOUNDS FLIGHT CROSSING POINT FOR ACCURATE OOB SPOTS
                 // -----------------------------------------------------------------
                 Vector3 discPos = __instance.transform.position;
-                bool isOutOfBounds = !isWarmup && UltimateRulesManager.IsPositionOutOfBounds(discPos);
+                bool isOutOfBounds = UltimateRulesManager.IsPositionOutOfBounds(discPos);
 
-                if (UltimateRulesManager.IsDiscInFlight)
+                if (UltimateRulesManager.IsDiscInFlight && !UltimateRulesManager.IsDiscTumblingOnGround)
                 {
                     if (!isOutOfBounds)
                     {
+                        // Disc is currently inside the field lines (even if it curved OOB earlier and came back in!)
                         UltimateRulesManager.LastInBoundsFlightPos = discPos;
+                        UltimateRulesManager.WentOutOfBoundsInFlight = false;
                     }
-                    else if (!UltimateRulesManager.WentOutOfBoundsInFlight)
+                    else
                     {
                         UltimateRulesManager.WentOutOfBoundsInFlight = true;
                     }
@@ -1104,7 +1106,8 @@ namespace PuckUltimateFrisbeeMod
                 // D. RIM GROUND COLLISION, TUMBLING, OOB PULLS & TURNOVER CHECK
                 // -----------------------------------------------------------------
                 float minCenterY = ClientDiscFollower.GetMinimumCenterHeightForRotation(__instance.transform.rotation);
-                bool rimTouchingGround = (discPos.y <= minCenterY + 0.015f) || (__instance.IsGrounded && timeSinceRelease > 0.15f);
+                // Only count as touching the ground when actually down at grass level!
+                bool rimTouchingGround = (discPos.y <= minCenterY + 0.025f);
 
                 if (rimTouchingGround)
                 {
@@ -1113,7 +1116,7 @@ namespace PuckUltimateFrisbeeMod
 
                 if (UltimateRulesManager.IsDiscInFlight)
                 {
-                    if (!isWarmup && isOutOfBounds && rimTouchingGround)
+                    if (isOutOfBounds && rimTouchingGround)
                     {
                         UltimateRulesManager.IsDiscInFlight = false;
                         UltimateRulesManager.IsDiscTumblingOnGround = false;
@@ -1121,6 +1124,13 @@ namespace PuckUltimateFrisbeeMod
                         Vector3 crossingSpot = UltimateRulesManager.WentOutOfBoundsInFlight
                             ? UltimateRulesManager.LastInBoundsFlightPos
                             : discPos;
+
+                        if (isWarmup)
+                        {
+                            // In Warmup: bring any disc that lands out of bounds / outside the fence back onto the sideline!
+                            FlattenAndFreezeDiscOnGround(__instance, rb, GetWarmupSidelineReturnSpot(discPos));
+                            return;
+                        }
 
                         bool wasPull = UltimateRulesManager.IsCurrentThrowPull;
                         bool wasDroppedPull = wasPull && UltimateRulesManager.WasTippedInFlight &&
@@ -1161,10 +1171,16 @@ namespace PuckUltimateFrisbeeMod
 
                 if (UltimateRulesManager.IsDiscTumblingOnGround)
                 {
-                    if (!isWarmup && isOutOfBounds)
+                    if (isOutOfBounds)
                     {
                         UltimateRulesManager.IsDiscInFlight = false;
                         UltimateRulesManager.IsDiscTumblingOnGround = false;
+
+                        if (isWarmup)
+                        {
+                            FlattenAndFreezeDiscOnGround(__instance, rb, GetWarmupSidelineReturnSpot(discPos));
+                            return;
+                        }
 
                         bool wasPull = UltimateRulesManager.IsCurrentThrowPull;
                         UltimateRulesManager.IsCurrentThrowPull = false;
@@ -1192,7 +1208,7 @@ namespace PuckUltimateFrisbeeMod
 
                         Vector3 finalPos = __instance.transform.position;
                         Vector3 restSpot = isWarmup
-                            ? new Vector3(finalPos.x, UltimateVisualTuning.DiscHalfThickness + 0.01f, finalPos.z)
+                            ? GetWarmupSidelineReturnSpot(finalPos)
                             : GetLegalFieldSpotAfterTurnover(finalPos);
 
                         FlattenAndFreezeDiscOnGround(__instance, rb, restSpot);
@@ -1202,9 +1218,9 @@ namespace PuckUltimateFrisbeeMod
                 else if (!UltimateRulesManager.IsDiscInFlight && rimTouchingGround && rb.linearVelocity.sqrMagnitude < 0.05f)
                 {
                     bool waitingForPullPickup = UltimateRulesManager.IsPullPlay && UltimateRulesManager.Holder == null;
-                    Vector3 restSpot = (isWarmup || waitingForPullPickup)
+                    Vector3 restSpot = waitingForPullPickup
                         ? new Vector3(discPos.x, UltimateVisualTuning.DiscHalfThickness + 0.01f, discPos.z)
-                        : GetLegalFieldSpotAfterTurnover(discPos);
+                        : (isWarmup ? GetWarmupSidelineReturnSpot(discPos) : GetLegalFieldSpotAfterTurnover(discPos));
 
                     FlattenAndFreezeDiscOnGround(__instance, rb, restSpot);
 
@@ -1721,11 +1737,36 @@ namespace PuckUltimateFrisbeeMod
 
         private static Vector3 GetLegalFieldSpotAfterTurnover(Vector3 rawSpot)
         {
-            float maxX = UltimateRulesManager.FieldHalfWidth - 0.5f;
-            float goalLineZ = UltimateRulesManager.EndzoneZThreshold;
+            float maxX = UltimateRulesManager.FieldHalfWidth - 0.5f;   // 18.0m (just inside sideline)
+            float maxZ = UltimateRulesManager.FieldHalfLength - 0.5f;  // 49.5m (keep Z along the sideline; WalkHolderToGoalLineIfInEndzone will walk the player up when they pick it up!)
 
             float legalX = Mathf.Clamp(rawSpot.x, -maxX, maxX);
-            float legalZ = Mathf.Clamp(rawSpot.z, -goalLineZ, goalLineZ);
+            float legalZ = Mathf.Clamp(rawSpot.z, -maxZ, maxZ);
+
+            return new Vector3(legalX, UltimateVisualTuning.DiscHalfThickness + 0.01f, legalZ);
+        }
+
+        private static bool IsOutsideFencePerimeter(Vector3 pos)
+        {
+            // The physical fence sits ~2.0m outside the 18.5m sideline and 50.0m backline
+            return Mathf.Abs(pos.x) > (UltimateRulesManager.FieldHalfWidth + 1.6f) ||
+                   Mathf.Abs(pos.z) > (UltimateRulesManager.FieldHalfLength + 1.6f);
+        }
+
+        private static Vector3 GetWarmupSidelineReturnSpot(Vector3 rawSpot)
+        {
+            // In Warmup, if the disc is still inside the physical fence, let it rest right where it is!
+            // Only snap it back onto the sideline if it flew over/outside the fence where players can't reach it.
+            if (!IsOutsideFencePerimeter(rawSpot))
+            {
+                return new Vector3(rawSpot.x, UltimateVisualTuning.DiscHalfThickness + 0.01f, rawSpot.z);
+            }
+
+            float sidelineX = UltimateRulesManager.FieldHalfWidth - 0.5f;   // 18.0m (just inside the sideline)
+            float backlineZ = UltimateRulesManager.FieldHalfLength - 0.5f;  // 49.5m (just inside the backline)
+
+            float legalX = Mathf.Clamp(rawSpot.x, -sidelineX, sidelineX);
+            float legalZ = Mathf.Clamp(rawSpot.z, -backlineZ, backlineZ);
 
             return new Vector3(legalX, UltimateVisualTuning.DiscHalfThickness + 0.01f, legalZ);
         }

@@ -370,7 +370,7 @@ namespace PuckUltimateFrisbeeMod
         private static void SetupFenceColliders(Transform customFieldRoot, Transform fieldRoot, int barrierLayer, int iceLayer, PhysicsMaterial wallMat)
         {
             Transform existingWalls = fieldRoot.Find("UltimateFenceCollidersRoot");
-            if (existingWalls != null) UnityEngine.Object.Destroy(existingWalls.gameObject);
+            if (existingWalls != null) UnityEngine.Object.DestroyImmediate(existingWalls.gameObject);
 
             GameObject wallRoot = new GameObject("UltimateFenceCollidersRoot");
             wallRoot.transform.SetParent(fieldRoot, false);
@@ -384,54 +384,80 @@ namespace PuckUltimateFrisbeeMod
                 Bounds worldBounds = rend.bounds;
                 if (worldBounds.size.sqrMagnitude < 0.05f) continue;
 
-                // Skip any combined parent mesh that spans across the field
                 if (worldBounds.size.x > 35f && worldBounds.size.z > 35f)
-                {
                     continue;
-                }
 
-                // Make sure the closest point of this fence mesh is at least 1.5m outside the playable field lines!
-                // (Playable field is X: +/-18.5m, Z: +/-50.0m).
                 Bounds playAreaWithMargin = new Bounds(
                     Vector3.zero,
                     new Vector3((UltimateRulesManager.FieldHalfWidth + 1.5f) * 2f, 50f, (UltimateRulesManager.FieldHalfLength + 1.5f) * 2f)
                 );
                 if (playAreaWithMargin.Intersects(worldBounds))
-                {
                     continue;
-                }
 
-                int[] layersToApply = (barrierLayer != iceLayer) ? new int[] { barrierLayer, iceLayer } : new int[] { barrierLayer };
+                // CRITICAL FIX: Only build fence colliders on barrierLayer (NEVER on iceLayer,
+                // because iceLayer tricks Puck.IsGrounded into thinking the disc hit the ground in mid-air!)
+                GameObject wallObj = new GameObject($"FenceBarrier_{rend.gameObject.name}");
+                wallObj.layer = barrierLayer;
+                wallObj.transform.SetParent(wallRoot.transform, true);
 
-                foreach (int layer in layersToApply)
-                {
-                    GameObject wallObj = new GameObject($"FenceBarrier_{rend.gameObject.name}_L{layer}");
-                    wallObj.layer = layer;
-                    wallObj.transform.SetParent(wallRoot.transform, true);
+                Vector3 center = worldBounds.center;
+                center.y = 1.0f; // Physical fence height instead of an 11m invisible sky-wall
+                wallObj.transform.position = center;
+                wallObj.transform.rotation = Quaternion.identity;
 
-                    Vector3 center = worldBounds.center;
-                    center.y = 4.5f;
-                    wallObj.transform.position = center;
-                    wallObj.transform.rotation = Quaternion.identity;
+                BoxCollider box = wallObj.AddComponent<BoxCollider>();
+                box.isTrigger = false;
+                if (wallMat != null) box.sharedMaterial = wallMat;
 
-                    BoxCollider box = wallObj.AddComponent<BoxCollider>();
-                    box.isTrigger = false;
-                    if (wallMat != null) box.sharedMaterial = wallMat;
+                Vector3 size = worldBounds.size;
+                if (size.x < size.z)
+                    size.x = Mathf.Max(size.x, 0.55f);
+                else
+                    size.z = Mathf.Max(size.z, 0.55f);
 
-                    Vector3 size = worldBounds.size;
-                    if (size.x < size.z)
-                        size.x = Mathf.Max(size.x, 0.55f);
-                    else
-                        size.z = Mathf.Max(size.z, 0.55f);
-
-                    size.y = 11.0f;
-                    box.size = size;
-                }
+                size.y = 2.2f; // Enough to block walking players, completely open in the air above the fence!
+                box.size = size;
 
                 fenceSegmentsBuilt++;
             }
 
-            UltimateFrisbeePlugin.ModLogger.Info($"Built {fenceSegmentsBuilt} solid Fence barrier colliders outside playable field.");
+            if (MonoBehaviourSingleton<PuckManager>.Instance != null)
+            {
+                foreach (var p in MonoBehaviourSingleton<PuckManager>.Instance.GetPucks(true))
+                {
+                    IgnoreFenceCollisionsForDisc(p);
+                }
+            }
+
+            UltimateFrisbeePlugin.ModLogger.Info($"Built {fenceSegmentsBuilt} low Fence barrier colliders (open air above fence for OI throws).");
+        }
+
+        public static void IgnoreFenceCollisionsForDisc(Puck disc)
+        {
+            if (disc == null) return;
+
+            Collider[] discCols = disc.GetComponentsInChildren<Collider>(true);
+            if (discCols == null || discCols.Length == 0) return;
+
+            foreach (GameObject go in UnityEngine.Object.FindObjectsByType<GameObject>(FindObjectsInactive.Include, FindObjectsSortMode.None))
+            {
+                if (go == null) continue;
+                // Ignore all FenceBarrier colliders AND any remaining non-turf colliders so the disc flies 100% freely!
+                if (go.name.StartsWith("FenceBarrier_", StringComparison.Ordinal))
+                {
+                    foreach (Collider fenceCol in go.GetComponentsInChildren<Collider>(true))
+                    {
+                        if (fenceCol == null) continue;
+                        for (int i = 0; i < discCols.Length; i++)
+                        {
+                            if (discCols[i] != null)
+                            {
+                                Physics.IgnoreCollision(discCols[i], fenceCol, true);
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         private static GameObject BuildGrassUltimateField(

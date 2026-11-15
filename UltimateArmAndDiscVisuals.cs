@@ -336,17 +336,34 @@ namespace PuckUltimateFrisbeeMod
             Stick stick = holder.Stick;
             bool isLeft = holder.Handedness != null && holder.Handedness.Value == PlayerHandedness.Left;
 
-            Vector3 bladeTip = UltimateRulesManager.GetHandWorldPosition(stick, out _, out Vector3 shaftDir);
+            // Check if this player is being viewed in 3rd-Person with our Full-Body Athlete Rig!
+            bool isFirstPersonLocal = UltimatePlayerIKBridge.IsLocalPlayerInFirstPerson(holder, holder.PlayerBody);
+            UltimatePlayerIKBridge ikBridge = (!isFirstPersonLocal && holder.PlayerBody != null)
+                ? holder.PlayerBody.GetComponentInChildren<UltimatePlayerIKBridge>(false)
+                : null;
 
-            Quaternion lookRot = Quaternion.LookRotation(shaftDir, Vector3.up);
-            float wristRoll = stick.BladeAngle * UltimateVisualTuning.WristRollMultiplier;
-            Quaternion handGripRot = lookRot * Quaternion.Euler(0f, 0f, wristRoll);
+            if (ikBridge != null && ikBridge.TryGetVisualHandGrip(out Vector3 palmWorldPos, out Quaternion handAimRot))
+            {
+                // 3RD-PERSON VIEW: Lock the disc directly to the 3D Athlete's actual Hand Bone!
+                Vector3 thirdPersonOffset = new Vector3(isLeft ? 0.04f : -0.04f, 0.02f, 0.14f);
+                discPos = palmWorldPos + (handAimRot * thirdPersonOffset);
+                discRot = handAimRot * Quaternion.Euler(UltimateVisualTuning.HeldDiscPitchOffset);
+            }
+            else
+            {
+                // 1ST-PERSON VIEW (or fallback): Use the 1st-person floating arm tip
+                Vector3 bladeTip = UltimateRulesManager.GetHandWorldPosition(stick, out _, out Vector3 shaftDir);
 
-            Vector3 localOffset = UltimateVisualTuning.HeldDiscHandOffset;
-            if (isLeft) localOffset.x = -localOffset.x;
+                Quaternion lookRot = Quaternion.LookRotation(shaftDir, Vector3.up);
+                float wristRoll = stick.BladeAngle * UltimateVisualTuning.WristRollMultiplier;
+                Quaternion handGripRot = lookRot * Quaternion.Euler(0f, 0f, wristRoll);
 
-            discPos = bladeTip + (handGripRot * localOffset);
-            discRot = handGripRot * Quaternion.Euler(UltimateVisualTuning.HeldDiscPitchOffset);
+                Vector3 localOffset = UltimateVisualTuning.HeldDiscHandOffset;
+                if (isLeft) localOffset.x = -localOffset.x;
+
+                discPos = bladeTip + (handGripRot * localOffset);
+                discRot = handGripRot * Quaternion.Euler(UltimateVisualTuning.HeldDiscPitchOffset);
+            }
 
             float minY = GetMinimumCenterHeightForRotation(discRot);
             if (discPos.y < minY) discPos.y = minY;
