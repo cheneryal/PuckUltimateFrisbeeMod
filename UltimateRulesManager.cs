@@ -1738,10 +1738,10 @@ namespace PuckUltimateFrisbeeMod
         private static Vector3 GetLegalFieldSpotAfterTurnover(Vector3 rawSpot)
         {
             float maxX = UltimateRulesManager.FieldHalfWidth - 0.5f;   // 18.0m (just inside sideline)
-            float maxZ = UltimateRulesManager.FieldHalfLength - 0.5f;  // 49.5m (keep Z along the sideline; WalkHolderToGoalLineIfInEndzone will walk the player up when they pick it up!)
+            float goalLineZ = UltimateRulesManager.EndzoneZThreshold;  // 32.0m (snaps endzone turnovers straight to the Goal Line!)
 
             float legalX = Mathf.Clamp(rawSpot.x, -maxX, maxX);
-            float legalZ = Mathf.Clamp(rawSpot.z, -maxZ, maxZ);
+            float legalZ = Mathf.Clamp(rawSpot.z, -goalLineZ, goalLineZ);
 
             return new Vector3(legalX, UltimateVisualTuning.DiscHalfThickness + 0.01f, legalZ);
         }
