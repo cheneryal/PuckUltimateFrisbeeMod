@@ -231,7 +231,7 @@ namespace PuckUltimateFrisbeeMod
         public static float StrafeSprintSpeed = 7.6f;       // Sprint sideways speed (m/s)
         public static float StrafeResponsiveness = 18.0f;   // How quickly you reach strafe speed
         public static float SkyJumpVerticalVelocity = 5.1f; // High vertical spring for sky battles!
-        public static float SkyJumpStaminaCost = 0.18f;     // Stamina used by a crouch-spring jump
+        public static float SkyJumpStaminaCost = 0.12f;     // Stamina used by a crouch-spring jump
 
         private static CustomMessagingManager _registeredCmm = null;
 
@@ -666,7 +666,7 @@ namespace PuckUltimateFrisbeeMod
             }
 
             // -----------------------------------------------------------------
-            // 1B. Q / E LATERAL RUNNING (BYPASSES SKATE TRACTION!)
+            // 1B. Q / E LATERAL RUNNING
             // -----------------------------------------------------------------
             sbyte strafeDir = 0;
             if (UltimateDiveMod.ClientStrafeState.TryGetValue(player.OwnerClientId, out sbyte sd))
@@ -676,7 +676,7 @@ namespace PuckUltimateFrisbeeMod
 
             if (rb != null && strafeDir != 0 && !isFaceOff && !isHoldingDisc && !hasFallen && !isDiving && __instance.IsGrounded)
             {
-                // Disable Skate lateral traction while holding Q/E so Skate doesn't brake our sideways velocity!
+                // Disable Skate lateral traction while holding Q/E so Skate doesn't brake our sideways velocity
                 SetPlayerSkateTraction(id, __instance, 0f);
 
                 Vector3 rightDir = Vector3.ProjectOnPlane(__instance.transform.right, Vector3.up).normalized;
@@ -686,17 +686,32 @@ namespace PuckUltimateFrisbeeMod
                 float forwardSpeed = Vector3.Dot(vel, forwardDir);
                 float currentRightSpeed = Vector3.Dot(vel, rightDir);
 
-                float targetRightSpeed = strafeDir * (isSprinting ? UltimateDiveMod.StrafeSprintSpeed : UltimateDiveMod.StrafeRunSpeed);
+                // Only grant Sprint strafe speed if the player actually has stamina and is actively sprinting
+                bool hasSprintStamina = __instance.Stamina == null || __instance.Stamina.Value > 0.01f;
+                float maxAllowedHorizSpeed = (isSprinting && hasSprintStamina)
+                    ? UltimateDiveMod.StrafeSprintSpeed
+                    : UltimateDiveMod.StrafeRunSpeed;
+
+                // If the player is also moving forward/backward (W/S), scale down target lateral speed
+                // so the diagonal vector magnitude never exceeds maxAllowedHorizSpeed!
+                float forwardRatio = Mathf.Clamp01(Mathf.Abs(forwardSpeed) / maxAllowedHorizSpeed);
+                float diagScale = Mathf.Sqrt(Mathf.Max(0.5f, 1f - (forwardRatio * forwardRatio * 0.5f)));
+
+                float targetRightSpeed = strafeDir * maxAllowedHorizSpeed * diagScale;
                 float newRightSpeed = Mathf.MoveTowards(
                     currentRightSpeed,
                     targetRightSpeed,
                     UltimateDiveMod.StrafeResponsiveness * Time.fixedDeltaTime
                 );
 
-                // Reconstruct velocity keeping forward/backward speed & vertical speed intact
-                Vector3 newVel = (forwardDir * forwardSpeed) + (rightDir * newRightSpeed);
-                newVel.y = vel.y;
-                rb.linearVelocity = newVel;
+                // Reconstruct horizontal velocity and strictly clamp total horizontal speed
+                Vector3 newHorizVel = (forwardDir * forwardSpeed) + (rightDir * newRightSpeed);
+                if (newHorizVel.magnitude > maxAllowedHorizSpeed)
+                {
+                    newHorizVel = newHorizVel.normalized * maxAllowedHorizSpeed;
+                }
+
+                rb.linearVelocity = new Vector3(newHorizVel.x, vel.y, newHorizVel.z);
             }
             else
             {

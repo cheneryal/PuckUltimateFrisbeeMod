@@ -69,10 +69,13 @@ namespace PuckUltimateFrisbeeMod
                 UnityEngine.Object.Destroy(_clientRuntimeObj);
                 _clientRuntimeObj = null;
             }
+            UltimateBroadcastPopupManager.UnregisterNetwork();
         }
 
         public static void EnsureNetworkRegistered()
         {
+            UltimateBroadcastPopupManager.EnsureNetworkRegistered();
+
             var nm = NetworkManager.Singleton;
             if (nm == null || nm.CustomMessagingManager == null) return;
             if (_registeredWindCmm == nm.CustomMessagingManager) return;
@@ -324,6 +327,347 @@ namespace PuckUltimateFrisbeeMod
                 float segPitch = (i == 0) ? baseDroopDeg : (baseDroopDeg * 0.12f) + segWave;
                 Segments[i].localRotation = Quaternion.Euler(segPitch, sideWave, 0f);
             }
+        }
+    }
+
+    // =========================================================================
+    // BROADCAST-STYLE UI POPUP & TICKER SYSTEM (Replaces Chat Alerts)
+    // =========================================================================
+    public static class UltimateBroadcastPopupManager
+    {
+        public const string AlertMessageName = "ULTIMATE/Alert";
+        private static CustomMessagingManager _registeredAlertCmm = null;
+
+        public class PopupItem
+        {
+            public string Badge;
+            public string Headline;
+            public Color AccentColor;
+            public float SpawnTime;
+            public float Duration;
+            public bool IsTicker;
+        }
+
+        private static readonly List<PopupItem> _majorPopups = new List<PopupItem>();
+        private static PopupItem _activeTicker = null;
+
+        private static GUIStyle _badgeStyle;
+        private static GUIStyle _headlineStyle;
+        private static GUIStyle _shadowStyle;
+
+        public static void EnsureNetworkRegistered()
+        {
+            var nm = NetworkManager.Singleton;
+            if (nm == null || nm.CustomMessagingManager == null) return;
+            if (_registeredAlertCmm == nm.CustomMessagingManager) return;
+
+            nm.CustomMessagingManager.UnregisterNamedMessageHandler(AlertMessageName);
+            nm.CustomMessagingManager.RegisterNamedMessageHandler(AlertMessageName, OnAlertMessageReceived);
+            _registeredAlertCmm = nm.CustomMessagingManager;
+        }
+
+        public static void UnregisterNetwork()
+        {
+            if (_registeredAlertCmm != null)
+            {
+                _registeredAlertCmm.UnregisterNamedMessageHandler(AlertMessageName);
+                _registeredAlertCmm = null;
+            }
+            _majorPopups.Clear();
+            _activeTicker = null;
+        }
+
+        public static void ServerSendPopupAlert(string message, string hexColor)
+        {
+            if (string.IsNullOrEmpty(message)) return;
+
+            EnsureNetworkRegistered();
+
+            // Always show locally on Listen Server / Host immediately
+            if (!UltimateFrisbeePlugin.IsHeadlessServer)
+            {
+                EnqueueLocalPopup(message, hexColor);
+            }
+
+            var nm = NetworkManager.Singleton;
+            if (nm == null || !nm.IsServer || nm.CustomMessagingManager == null) return;
+            if (nm.ConnectedClientsIds == null || nm.ConnectedClientsIds.Count == 0) return;
+
+            try
+            {
+                // Truncate safely to fit FixedString128Bytes (max ~120 UTF-8 bytes)
+                string safeMsg = message.Length > 115 ? message.Substring(0, 115) : message;
+                string safeCol = string.IsNullOrEmpty(hexColor) ? "#ffe97f" : hexColor;
+
+                FixedString128Bytes fsMsg = new FixedString128Bytes(safeMsg);
+                FixedString32Bytes fsCol = new FixedString32Bytes(safeCol);
+
+                using (var writer = new FastBufferWriter(256, Allocator.Temp))
+                {
+                    writer.WriteValueSafe(fsMsg);
+                    writer.WriteValueSafe(fsCol);
+                    nm.CustomMessagingManager.SendNamedMessageToAll(AlertMessageName, writer, NetworkDelivery.Reliable);
+                }
+            }
+            catch (Exception ex)
+            {
+                UltimateFrisbeePlugin.ModLogger.Error($"[UltimateBroadcastPopupManager] Send error: {ex}");
+            }
+        }
+
+        private static void OnAlertMessageReceived(ulong senderId, FastBufferReader reader)
+        {
+            if (NetworkRoles.IsServer) return;
+            try
+            {
+                reader.ReadValueSafe(out FixedString128Bytes fsMsg);
+                reader.ReadValueSafe(out FixedString32Bytes fsCol);
+                EnqueueLocalPopup(fsMsg.ToString(), fsCol.ToString());
+            }
+            catch (Exception ex)
+            {
+                UltimateFrisbeePlugin.ModLogger.Error($"[UltimateBroadcastPopupManager] Receive error: {ex}");
+            }
+        }
+
+        public static void EnqueueLocalPopup(string rawMessage, string hexColor)
+        {
+            if (UltimateFrisbeePlugin.IsHeadlessServer || string.IsNullOrEmpty(rawMessage)) return;
+
+            if (!ColorUtility.TryParseHtmlString(hexColor, out Color accent))
+            {
+                accent = new Color(1f, 0.91f, 0.5f);
+            }
+
+            ParseBadgeAndHeadline(rawMessage, out string badge, out string headline, out bool isTicker, out float duration);
+
+            var item = new PopupItem
+            {
+                Badge = badge,
+                Headline = headline,
+                AccentColor = accent,
+                SpawnTime = Time.unscaledTime,
+                Duration = duration,
+                IsTicker = isTicker
+            };
+
+            if (isTicker)
+            {
+                _activeTicker = item;
+            }
+            else
+            {
+                if (badge == "GOAL" || badge == "CALLAHAN" || badge == "TURNOVER" || badge == "OUT OF BOUNDS" || badge == "PULL")
+                {
+                    _activeTicker = null;
+                }
+
+                _majorPopups.Insert(0, item);
+                if (_majorPopups.Count > 2)
+                {
+                    _majorPopups.RemoveRange(2, _majorPopups.Count - 2);
+                }
+            }
+        }
+
+        private static void ParseBadgeAndHeadline(string msg, out string badge, out string headline, out bool isTicker, out float duration)
+        {
+            isTicker = false;
+            duration = 3.6f;
+            badge = "ULTIMATE";
+            headline = msg;
+
+            if (msg.StartsWith("STALL 10!", StringComparison.OrdinalIgnoreCase))
+            {
+                badge = "STALL OUT";
+                headline = msg.Substring("STALL 10!".Length).Trim();
+                duration = 4.2f;
+            }
+            else if (msg.StartsWith("STALL ", StringComparison.OrdinalIgnoreCase))
+            {
+                badge = "STALL COUNT";
+                headline = msg;
+                isTicker = true;
+                duration = 1.6f;
+            }
+            else if (msg.StartsWith("DOUBLE TEAM!", StringComparison.OrdinalIgnoreCase))
+            {
+                badge = "VIOLATION";
+                headline = msg;
+                isTicker = true;
+                duration = 2.6f;
+            }
+            else if (msg.StartsWith("PULL CLOCK:", StringComparison.OrdinalIgnoreCase) ||
+                     msg.StartsWith("DELAY OF GAME WARNING:", StringComparison.OrdinalIgnoreCase))
+            {
+                badge = "CLOCK WARNING";
+                headline = msg.Replace("DELAY OF GAME WARNING:", "").Trim();
+                isTicker = true;
+                duration = 1.8f;
+            }
+            else if (msg.StartsWith("CALLAHAN GOAL!", StringComparison.OrdinalIgnoreCase))
+            {
+                badge = "CALLAHAN";
+                headline = msg.Substring("CALLAHAN GOAL!".Length).Trim();
+                duration = 5.0f;
+            }
+            else if (msg.StartsWith("GOAL!", StringComparison.OrdinalIgnoreCase))
+            {
+                badge = "GOAL";
+                headline = msg.Substring("GOAL!".Length).Trim();
+                duration = 5.0f;
+            }
+            else if (msg.IndexOf("INTERCEPTION", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                badge = "INTERCEPTION";
+                duration = 3.8f;
+            }
+            else if (msg.IndexOf("HAND BLOCK", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                     msg.IndexOf("BODY BLOCK", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                badge = "DEFENSIVE BLOCK";
+                duration = 3.2f;
+            }
+            else if (msg.IndexOf("BOBBLED", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                     msg.IndexOf("DEFLECTION", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                     msg.IndexOf("SECOND-CHANCE", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                badge = "TIPPED DISC";
+                duration = 3.0f;
+            }
+            else if (msg.IndexOf("OUT OF BOUNDS", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                badge = "OUT OF BOUNDS";
+                duration = 3.8f;
+            }
+            else if (msg.IndexOf("TURNOVER", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                     msg.IndexOf("DELAY OF GAME", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                badge = "TURNOVER";
+                duration = 3.8f;
+            }
+            else if (msg.IndexOf("pulls (", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                     msg.StartsWith("PULL", StringComparison.OrdinalIgnoreCase) ||
+                     msg.IndexOf("picked up the disc to Pull", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                     msg.IndexOf("Line up on the Goal Lines", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                badge = "PULL";
+                duration = 3.6f;
+            }
+        }
+
+        private static void EnsureStyles()
+        {
+            if (_badgeStyle != null) return;
+
+            _badgeStyle = new GUIStyle(GUI.skin.label)
+            {
+                alignment = TextAnchor.MiddleCenter,
+                fontSize = 11,
+                fontStyle = FontStyle.Bold
+            };
+
+            _headlineStyle = new GUIStyle(GUI.skin.label)
+            {
+                alignment = TextAnchor.MiddleLeft,
+                fontSize = 14,
+                fontStyle = FontStyle.Bold,
+                wordWrap = false
+            };
+
+            _shadowStyle = new GUIStyle(_headlineStyle);
+        }
+
+        public static void DrawPopups(Texture2D whiteTex)
+        {
+            if (whiteTex == null) return;
+            EnsureStyles();
+
+            float now = Time.unscaledTime;
+            float centerX = Screen.width * 0.5f;
+            float currentY = 72f; // Placed cleanly below the top-center scoreboard!
+
+            for (int i = _majorPopups.Count - 1; i >= 0; i--)
+            {
+                if (now - _majorPopups[i].SpawnTime >= _majorPopups[i].Duration)
+                {
+                    _majorPopups.RemoveAt(i);
+                }
+            }
+
+            for (int i = 0; i < _majorPopups.Count; i++)
+            {
+                DrawSingleCard(_majorPopups[i], now, centerX, ref currentY, whiteTex, isCompact: false);
+            }
+
+            if (_activeTicker != null)
+            {
+                if (now - _activeTicker.SpawnTime >= _activeTicker.Duration)
+                {
+                    _activeTicker = null;
+                }
+                else
+                {
+                    DrawSingleCard(_activeTicker, now, centerX, ref currentY, whiteTex, isCompact: true);
+                }
+            }
+        }
+
+        private static void DrawSingleCard(PopupItem item, float now, float centerX, ref float y, Texture2D whiteTex, bool isCompact)
+        {
+            float age = now - item.SpawnTime;
+            float fadeIn = Mathf.Clamp01(age / 0.14f);
+            float fadeOut = Mathf.Clamp01((item.Duration - age) / 0.35f);
+            float alpha = Mathf.SmoothStep(0f, 1f, Mathf.Min(fadeIn, fadeOut));
+
+            float slideOffset = (1f - fadeIn) * -12f;
+
+            float badgeW = Mathf.Max(92f, item.Badge.Length * 7.8f + 20f);
+            float textW = Mathf.Max(180f, item.Headline.Length * 7.6f + 28f);
+            float cardW = Mathf.Clamp(badgeW + textW + 24f, 320f, 760f);
+            float cardH = isCompact ? 32f : 40f;
+
+            Rect cardRect = new Rect(centerX - cardW * 0.5f, y + slideOffset, cardW, cardH);
+
+            DrawRect(whiteTex, new Rect(cardRect.x + 2f, cardRect.y + 3f, cardRect.width, cardRect.height), new Color(0f, 0f, 0f, 0.45f * alpha));
+            DrawRect(whiteTex, cardRect, new Color(0.06f, 0.08f, 0.12f, 0.88f * alpha));
+
+            Color borderCol = new Color(1f, 1f, 1f, 0.12f * alpha);
+            DrawRect(whiteTex, new Rect(cardRect.x, cardRect.y, cardRect.width, 1f), borderCol);
+            DrawRect(whiteTex, new Rect(cardRect.x, cardRect.yMax - 1f, cardRect.width, 1f), borderCol);
+
+            Color accent = new Color(item.AccentColor.r, item.AccentColor.g, item.AccentColor.b, alpha);
+            Rect badgeRect = new Rect(cardRect.x, cardRect.y, badgeW, cardH);
+            DrawRect(whiteTex, badgeRect, new Color(accent.r * 0.22f, accent.g * 0.22f, accent.b * 0.22f, 0.95f * alpha));
+            DrawRect(whiteTex, new Rect(cardRect.x, cardRect.y, 4f, cardH), accent);
+            DrawRect(whiteTex, new Rect(badgeRect.xMax - 1f, cardRect.y + 5f, 1f, cardH - 10f), new Color(accent.r, accent.g, accent.b, 0.45f * alpha));
+
+            _badgeStyle.normal.textColor = new Color(
+                Mathf.Lerp(accent.r, 1f, 0.35f),
+                Mathf.Lerp(accent.g, 1f, 0.35f),
+                Mathf.Lerp(accent.b, 1f, 0.35f),
+                alpha);
+            GUI.Label(badgeRect, item.Badge, _badgeStyle);
+
+            Rect textRect = new Rect(badgeRect.xMax + 14f, cardRect.y, cardRect.width - badgeW - 22f, cardH);
+            _headlineStyle.fontSize = isCompact ? 13 : 14;
+            _shadowStyle.fontSize = _headlineStyle.fontSize;
+
+            _shadowStyle.normal.textColor = new Color(0f, 0f, 0f, 0.8f * alpha);
+            GUI.Label(new Rect(textRect.x + 1f, textRect.y + 1f, textRect.width, textRect.height), item.Headline, _shadowStyle);
+
+            _headlineStyle.normal.textColor = new Color(0.95f, 0.97f, 1.0f, alpha);
+            GUI.Label(textRect, item.Headline, _headlineStyle);
+
+            y += cardH + 7f;
+        }
+
+        private static void DrawRect(Texture2D tex, Rect r, Color c)
+        {
+            Color prev = GUI.color;
+            GUI.color = c;
+            GUI.DrawTexture(r, tex);
+            GUI.color = prev;
         }
     }
 
@@ -713,6 +1057,7 @@ namespace PuckUltimateFrisbeeMod
 
         private void Update()
         {
+            UltimateBroadcastPopupManager.EnsureNetworkRegistered();
             // Toggle Minimalist Controls HUD with F1
             if (UnityEngine.InputSystem.Keyboard.current != null &&
                 UnityEngine.InputSystem.Keyboard.current.f1Key.wasPressedThisFrame)
@@ -784,6 +1129,8 @@ namespace PuckUltimateFrisbeeMod
 
         private void OnGUI()
         {
+            // Draw Broadcast Popups FIRST so they appear even if Camera.main is switching during goals/replays!
+            UltimateBroadcastPopupManager.DrawPopups(_whiteTex);
             Camera cam = Camera.main;
             if (cam == null) return;
 
@@ -860,6 +1207,8 @@ namespace PuckUltimateFrisbeeMod
             GUI.Label(new Rect(panelRect.x, dialCenter.y + dialRadius + 20f, boxW, 18f), relLabel, subStyle);
             // Draw the Bottom-Right Context-Aware Minimalist Controls HUD
             DrawMinimalistControlsHUD();
+            // Draw the Top-Center Broadcast UI Popups (Goals, Turnovers, Pulls, Stall Count, Blocks)
+            UltimateBroadcastPopupManager.DrawPopups(_whiteTex);
         }
 
         private void EnsureControlsHudStyles()

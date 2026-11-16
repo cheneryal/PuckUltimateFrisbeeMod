@@ -116,8 +116,7 @@ namespace PuckUltimateFrisbeeMod
         }
 
         // Sprint Stamina Tuning:
-        // 1.0f = vanilla drain speed, 0.45f = 55% slower stamina drain (players can sprint >2x longer!)
-        public static float SprintStaminaDrainMultiplier = 0.45f;
+        public static float SprintStaminaDrainMultiplier = 0.25f;
 
         /// <summary>
         /// Computes a natural human arm reach from the hockey stick:
@@ -252,7 +251,7 @@ namespace PuckUltimateFrisbeeMod
             public float PeakAngularWhipSpeed = 0f;
             public float SmoothedSwingPowerBonus = 0f;
 
-            public const float FullChargeSeconds = 2.20f;
+            public const float FullChargeSeconds = 2.40f;
 
             public void OnCatchOrPickup(Player holder)
             {
@@ -348,9 +347,11 @@ namespace PuckUltimateFrisbeeMod
 
             public float GetCombinedThrowPower()
             {
-                float baseCharge = StaminaUsed * 0.65f;
-                float swingContribution = SmoothedSwingPowerBonus * 0.45f;
-                return Mathf.Clamp01(baseCharge + swingContribution);
+                // Holding Shift to drain the full stamina bar gives 85% base power,
+                // and a strong mouse whip adds up to +30% extra (up to 1.15f overdrive for monster hucks!)
+                float baseCharge = StaminaUsed * 0.85f;
+                float swingContribution = SmoothedSwingPowerBonus * 0.30f;
+                return Mathf.Clamp(baseCharge + swingContribution, 0f, 1.15f);
             }
 
             public void Reset(PlayerBody body = null)
@@ -498,9 +499,9 @@ namespace PuckUltimateFrisbeeMod
 
         public static void BroadcastAnnouncement(string message, string color = "#ffe97f")
         {
-            if (NetworkRoles.IsServer && NetworkBehaviourSingleton<ChatManager>.Instance != null)
+            if (NetworkRoles.IsServer)
             {
-                NetworkBehaviourSingleton<ChatManager>.Instance.Server_BroadcastChatMessage($"[ULTIMATE] {message}", color);
+                UltimateBroadcastPopupManager.ServerSendPopupAlert(message, color);
             }
         }
 
@@ -510,6 +511,18 @@ namespace PuckUltimateFrisbeeMod
             if (_scoreGoalMethod == null)
             {
                 _scoreGoalMethod = ActiveGameModeInstance.GetType().GetMethod("ScoreGoal", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+            }
+
+            // 1. Primary Assist must be a teammate of the receiver (and not the receiver themselves)
+            if (thrower == null || GetTeam(thrower) != scoringTeam || thrower == receiver)
+            {
+                thrower = null;
+                secondAssist = null; // Broken teammate chain: cannot have a secondary assist without a valid primary assist
+            }
+            // 2. Secondary Assist must also be on the scoring team and distinct from receiver & primary assist
+            else if (secondAssist == null || GetTeam(secondAssist) != scoringTeam || secondAssist == receiver || secondAssist == thrower)
+            {
+                secondAssist = null;
             }
 
             PullingTeam = scoringTeam;
@@ -1807,11 +1820,20 @@ namespace PuckUltimateFrisbeeMod
             disc.Server_Unfreeze();
 
             float swingBonus = Mathf.Clamp01(tracker.SmoothedSwingPowerBonus);
-            float combinedPower = tracker.GetCombinedThrowPower();
+            float combinedPower = tracker.GetCombinedThrowPower(); // 0.0 to 1.15
             tracker.Reset(thrower.PlayerBody);
 
-            float powerCurve = Mathf.Pow(combinedPower, 1.15f);
-            float launchSpeed = Mathf.Lerp(6.5f, 24.0f, powerCurve);
+            // Normalize 0..1.15f into a smooth curve that reaches 31.5 m/s on a full huck
+            float normalizedPower = Mathf.Clamp01(combinedPower / 1.15f);
+            float powerCurve = Mathf.Pow(normalizedPower, 1.08f);
+            float launchSpeed = Mathf.Lerp(7.0f, 31.5f, powerCurve);
+
+            // In real Ultimate, pullers get a running start! Give Pulls a 10% velocity boost
+            // so a full-power Pull can travel 65m-75m (Goal Line to Goal Line).
+            if (UltimateRulesManager.IsPullPlay)
+            {
+                launchSpeed *= 1.10f;
+            }
 
             float launchPitchDeg = Mathf.Clamp((22f - releaseStickAngle.x) * 0.55f, -6f, 32f);
             if (throwType == UltimateThrowType.Hammer)
@@ -1843,13 +1865,22 @@ namespace PuckUltimateFrisbeeMod
             disc.transform.SetPositionAndRotation(launchPos, launchRot);
             rb.position = launchPos;
             rb.rotation = launchRot;
-
             rb.linearVelocity = launchDir * launchSpeed;
             rb.angularVelocity = Vector3.zero;
 
             UltimateRulesManager.ActiveFlightThrowType = throwType;
             UltimateRulesManager.ActiveFlightSpinSign = spinSign;
-            UltimateRulesManager.SecondLastThrower = UltimateRulesManager.LastThrower;
+            // Only carry LastThrower into SecondLastThrower if it was a live pass from a teammate (never on a Pull or from an opponent)
+            if (!UltimateRulesManager.IsPullPlay &&
+                UltimateRulesManager.LastThrower != null &&
+                UltimateRulesManager.GetTeam(UltimateRulesManager.LastThrower) == UltimateRulesManager.GetTeam(thrower))
+            {
+                UltimateRulesManager.SecondLastThrower = UltimateRulesManager.LastThrower;
+            }
+            else
+            {
+                UltimateRulesManager.SecondLastThrower = null;
+            }
             UltimateRulesManager.LastThrower = thrower;
             UltimateRulesManager.Holder = null;
             UltimateRulesManager.IsHolderPivotLocked = false;
@@ -2167,6 +2198,23 @@ namespace PuckUltimateFrisbeeMod
                 }
             }
 
+            // If this was a ground pickup (after a turnover, pull, or drop) or the previous touch was an opponent,
+            // reset the passing chain so opponents never stay in LastThrower / SecondLastThrower!
+            if (!wasInFlight || (previousThrower != null && prevThrowerTeam != catcherTeam))
+            {
+                UltimateRulesManager.LastThrower = null;
+                UltimateRulesManager.SecondLastThrower = null;
+            }
+
+            UltimateRulesManager.IsPullPlay = false;
+            UltimateRulesManager.IsCurrentThrowPull = false;
+            UltimateRulesManager.OffensiveTeam = UltimateRulesManager.IsWarmup ? PlayerTeam.None : catcherTeam;
+
+            if (!UltimateRulesManager.IsWarmup && UltimateRulesManager.IsHolderPivotLocked)
+            {
+                WalkHolderToGoalLineIfInEndzone(catcher);
+            }
+
             UltimateRulesManager.IsPullPlay = false;
             UltimateRulesManager.IsCurrentThrowPull = false;
             UltimateRulesManager.OffensiveTeam = UltimateRulesManager.IsWarmup ? PlayerTeam.None : catcherTeam;
@@ -2233,26 +2281,26 @@ namespace PuckUltimateFrisbeeMod
             float clampedAoA = Mathf.Clamp(aoaDeg, -12f, 24f);
 
             float gravityMag = Mathf.Abs(Physics.gravity.y);
-            float baseGlideRatio = isInverted ? 0.56f : 0.78f;
-            float aoaLiftBonus = clampedAoA * 0.018f;
+            float baseGlideRatio = isInverted ? 0.62f : 0.84f; // Higher glide ratio so hucks float!
+            float aoaLiftBonus = clampedAoA * 0.019f;
 
             // Headwind increases horizAirSpeed -> more lift! Tailwind decreases horizAirSpeed -> less lift!
-            float speedLiftFactor = Mathf.Clamp01(horizAirSpeed / 8.5f);
+            float speedLiftFactor = Mathf.Clamp01(horizAirSpeed / 8.0f);
             float headwindPopupBonus = Mathf.Clamp((horizAirSpeed - horizGroundSpeed) * 0.035f, -0.12f, 0.18f);
 
             float verticalLiftAccel = gravityMag * Mathf.Clamp(
                 (baseGlideRatio + aoaLiftBonus + headwindPopupBonus) * speedLiftFactor,
                 0.10f,
-                1.14f);
+                1.16f);
 
             if (vel.y > 0.5f)
             {
-                verticalLiftAccel *= Mathf.Clamp01(1.0f - (vel.y / 10.0f));
+                verticalLiftAccel *= Mathf.Clamp01(1.0f - (vel.y / 13.5f)); // Allow higher release trajectories without killing lift
             }
             Vector3 liftForce = Vector3.up * verticalLiftAccel;
 
-            // Aerodynamic drag acts against relative air velocity (naturally carries the disc with tailwinds & crosswinds)
-            float linearDrag = 0.24f + Mathf.Max(0f, clampedAoA) * 0.012f;
+            // Lower aerodynamic drag (0.155 vs old 0.24) so a 31 m/s huck carries 65-80m across the field!
+            float linearDrag = 0.155f + Mathf.Max(0f, clampedAoA) * 0.009f;
             Vector3 dragForce = -airVel * linearDrag;
 
             // Crosswind exposure against the tilted belly/underside of the disc
