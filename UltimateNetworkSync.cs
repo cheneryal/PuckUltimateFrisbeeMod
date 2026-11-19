@@ -22,6 +22,7 @@ namespace PuckUltimateFrisbeeMod
         {
             public ulong HolderClientId;
             public sbyte ThrowStyle;
+            public float FlightWobble;
         }
 
         // Maps Puck.NetworkObjectId -> Holder & Spin state (supports unlimited Warmup discs!)
@@ -34,6 +35,7 @@ namespace PuckUltimateFrisbeeMod
         // Legacy fallback properties for single-disc checks
         public static ulong ClientSyncedHolderId = ulong.MaxValue;
         public static sbyte ClientSyncedThrowStyle = 0;
+        public static float ClientSyncedFlightWobble = 0f;
 
         public static void RecordPlayerDiscInteraction(Player player, Puck disc)
         {
@@ -188,7 +190,12 @@ namespace PuckUltimateFrisbeeMod
             }
         }
 
-        public static void ServerBroadcastHolderState(Player holder, sbyte throwStyle, Puck disc = null, Player focusPlayerOverride = null)
+        public static void ServerBroadcastHolderState(
+            Player holder,
+            sbyte throwStyle,
+            Puck disc = null,
+            Player focusPlayerOverride = null,
+            float flightWobble = 0f)
         {
             if (disc == null && holder == null)
             {
@@ -198,6 +205,8 @@ namespace PuckUltimateFrisbeeMod
 
             ulong discNetId = (disc != null && disc.NetworkObject != null) ? disc.NetworkObjectId : 0UL;
             ulong holderId = holder != null ? holder.OwnerClientId : ulong.MaxValue;
+            float clampedWobble = Mathf.Clamp01(flightWobble);
+            byte wobbleByte = (byte)Mathf.RoundToInt(clampedWobble * 255f);
 
             Player focusPlayer = focusPlayerOverride ?? holder;
             if (focusPlayer != null && disc != null)
@@ -208,19 +217,26 @@ namespace PuckUltimateFrisbeeMod
 
             ClientSyncedHolderId = holderId;
             ClientSyncedThrowStyle = throwStyle;
-            ClientDiscStates[discNetId] = new DiscSyncEntry { HolderClientId = holderId, ThrowStyle = throwStyle };
+            ClientSyncedFlightWobble = clampedWobble;
+            ClientDiscStates[discNetId] = new DiscSyncEntry
+            {
+                HolderClientId = holderId,
+                ThrowStyle = throwStyle,
+                FlightWobble = clampedWobble
+            };
 
             var nm = NetworkManager.Singleton;
             if (nm == null || !nm.IsServer || nm.CustomMessagingManager == null) return;
             if (nm.ConnectedClientsIds == null || nm.ConnectedClientsIds.Count == 0) return;
 
-            var writer = new FastBufferWriter(32, Allocator.Temp);
+            var writer = new FastBufferWriter(36, Allocator.Temp);
             try
             {
                 writer.WriteValueSafe(discNetId);
                 writer.WriteValueSafe(holderId);
                 writer.WriteValueSafe(throwStyle);
                 writer.WriteValueSafe(focusClientId);
+                writer.WriteValueSafe(wobbleByte);
                 nm.CustomMessagingManager.SendNamedMessageToAll(StateMessageName, writer, NetworkDelivery.Reliable);
             }
             finally
@@ -244,17 +260,31 @@ namespace PuckUltimateFrisbeeMod
                     reader.ReadValueSafe(out focusClientId);
                 }
 
+                float wobble = 0f;
+                if (reader.Position < reader.Length)
+                {
+                    reader.ReadValueSafe(out byte wobbleByte);
+                    wobble = wobbleByte / 255f;
+                }
+
                 if (discNetId == ulong.MaxValue)
                 {
                     ClientSyncedHolderId = ulong.MaxValue;
                     ClientSyncedThrowStyle = 0;
+                    ClientSyncedFlightWobble = 0f;
                     ClientDiscStates.Clear();
                     return;
                 }
 
                 ClientSyncedHolderId = holderId;
                 ClientSyncedThrowStyle = throwStyle;
-                ClientDiscStates[discNetId] = new DiscSyncEntry { HolderClientId = holderId, ThrowStyle = throwStyle };
+                ClientSyncedFlightWobble = wobble;
+                ClientDiscStates[discNetId] = new DiscSyncEntry
+                {
+                    HolderClientId = holderId,
+                    ThrowStyle = throwStyle,
+                    FlightWobble = wobble
+                };
 
                 if (holderId != ulong.MaxValue)
                 {

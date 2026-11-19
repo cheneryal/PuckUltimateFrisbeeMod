@@ -671,6 +671,7 @@ namespace PuckUltimateFrisbeeMod
         }
     }
 
+    [DefaultExecutionOrder(500)]
     // Handles HUD Wind Compass, Ambient Outdoor Wind Audio, and Dual-Layer Wind Particles
     public class UltimateWindClientController : MonoBehaviour
     {
@@ -689,6 +690,9 @@ namespace PuckUltimateFrisbeeMod
         private GUIStyle _hudActionStyle;
         private GUIStyle _hudKeyTextStyle;
         private GUIStyle _hudPillTextStyle;
+        private GUIStyle _throwBadgeStyle;
+        private GUIStyle _throwStatusStyle;
+        private GUIStyle _throwMicroStyle;
 
         private static readonly (string Action, string Key)[] _runningControls = new[]
         {
@@ -704,14 +708,13 @@ namespace PuckUltimateFrisbeeMod
 
         private static readonly (string Action, string Key)[] _holdingDiscControls = new[]
         {
-            ("Power + Whip",     "Hold + Release Shift"),
-            ("Pump Fake",        "RMB / Space / R"),
-            ("Back / Forehand",  "Mouse L / R"),
-            ("Hyzer / Blade",    "Scroll Wheel"),
-            ("Hammer / Scoober", "Aim High / Flip"),
-            ("Pivot Step",       "W / A / S / D"),
-            ("Track Disc",       "Hold LMB"),
-            ("Customize Gear", "F4")
+            ("Coil + Whip Throw", "Hold + Release LMB"),
+            ("Pump Fake / Cancel", "Free Mouse / RMB"),
+            ("Back / Forehand",   "Hand Left / Right"),
+            ("IO / OI / Flip",    "Scroll Wheel"),
+            ("Hammer / Scoober",  "Aim High / Flip"),
+            ("Pivot Lunge",       "WASD / Q / E"),
+            ("Customize Gear",    "F4")
         };
 
         private void Start()
@@ -1127,6 +1130,18 @@ namespace PuckUltimateFrisbeeMod
             }
         }
 
+        private void LateUpdate()
+        {
+            // Set to UltimateLocalThrowTelemetry.IsArmed if you only want it hidden while LMB is held down
+            bool shouldHideStamina = UltimateLocalThrowTelemetry.IsHoldingDisc;
+            UltimateStaminaBarHider.UpdateVisibility(shouldHideStamina);
+        }
+
+        private void OnDestroy()
+        {
+            UltimateStaminaBarHider.RestoreAll();
+        }
+
         private void OnGUI()
         {
             // Draw Broadcast Popups FIRST so they appear even if Camera.main is switching during goals/replays!
@@ -1207,8 +1222,7 @@ namespace PuckUltimateFrisbeeMod
             GUI.Label(new Rect(panelRect.x, dialCenter.y + dialRadius + 20f, boxW, 18f), relLabel, subStyle);
             // Draw the Bottom-Right Context-Aware Minimalist Controls HUD
             DrawMinimalistControlsHUD();
-            // Draw the Top-Center Broadcast UI Popups (Goals, Turnovers, Pulls, Stall Count, Blocks)
-            UltimateBroadcastPopupManager.DrawPopups(_whiteTex);
+            DrawThrowTelemetryHUD();
         }
 
         private void EnsureControlsHudStyles()
@@ -1252,6 +1266,187 @@ namespace PuckUltimateFrisbeeMod
                 fontStyle = FontStyle.Bold
             };
             _hudPillTextStyle.normal.textColor = new Color(0.90f, 0.94f, 0.98f, 0.90f);
+        }
+
+        private void DrawThrowTelemetryHUD()
+        {
+            if (_whiteTex == null) return;
+
+            bool isHolding = UltimateLocalThrowTelemetry.IsHoldingDisc;
+            float feedbackAge = Time.unscaledTime - UltimateLocalThrowTelemetry.LastFeedbackTime;
+            bool showPostRelease = !isHolding && feedbackAge < 1.25f && !string.IsNullOrEmpty(UltimateLocalThrowTelemetry.LastFeedbackText);
+
+            if (!isHolding && !showPostRelease) return;
+
+            if (_throwBadgeStyle == null)
+            {
+                _throwBadgeStyle = new GUIStyle(GUI.skin.label)
+                {
+                    alignment = TextAnchor.MiddleCenter,
+                    fontSize = 11,
+                    fontStyle = FontStyle.Bold
+                };
+                _throwStatusStyle = new GUIStyle(GUI.skin.label)
+                {
+                    alignment = TextAnchor.MiddleRight,
+                    fontSize = 10,
+                    fontStyle = FontStyle.Bold
+                };
+                _throwMicroStyle = new GUIStyle(GUI.skin.label)
+                {
+                    alignment = TextAnchor.MiddleLeft,
+                    fontSize = 10,
+                    fontStyle = FontStyle.Bold
+                };
+            }
+
+            float centerX = Screen.width * 0.5f;
+
+            // --- COMPACT POST-RELEASE FEEDBACK PILL (1.25s after throw/fake) ---
+            if (showPostRelease)
+            {
+                float alpha = Mathf.Clamp01((1.25f - feedbackAge) / 0.35f);
+                float pillW = 248f;
+                float pillH = 26f;
+                Rect r = new Rect(centerX - pillW * 0.5f, Screen.height - 62f, pillW, pillH);
+
+                Color c = UltimateLocalThrowTelemetry.LastFeedbackColor;
+                DrawSolidRect(r, new Color(0.05f, 0.08f, 0.12f, 0.78f * alpha));
+                DrawSolidRect(new Rect(r.x, r.y, 3.5f, r.height), new Color(c.r, c.g, c.b, alpha));
+                DrawSolidRect(new Rect(r.x, r.y, r.width, 1f), new Color(1f, 1f, 1f, 0.12f * alpha));
+                DrawSolidRect(new Rect(r.x, r.yMax - 1f, r.width, 1f), new Color(1f, 1f, 1f, 0.12f * alpha));
+
+                _throwBadgeStyle.normal.textColor = new Color(c.r, c.g, c.b, alpha);
+                GUI.Label(r, UltimateLocalThrowTelemetry.LastFeedbackText, _throwBadgeStyle);
+                return;
+            }
+
+            // --- LIVE HOLDING-DISC TELEMETRY & POWER METER (Bottom-Center) ---
+            float panelW = 304f;
+            float panelH = 82f;
+            Rect panel = new Rect(centerX - panelW * 0.5f, Screen.height - panelH - 22f, panelW, panelH);
+
+            bool armed = UltimateLocalThrowTelemetry.IsArmed;
+            float coil = UltimateLocalThrowTelemetry.Coil01;
+            float power = UltimateLocalThrowTelemetry.Power01;
+            float wobble = UltimateLocalThrowTelemetry.Wobble01;
+            float pivotExt = UltimateLocalThrowTelemetry.PivotExtension01;
+            float rollDeg = UltimateLocalThrowTelemetry.BladeRollDeg;
+            UltimateThrowType tType = UltimateLocalThrowTelemetry.ThrowType;
+
+            Color typeAccent;
+            switch (tType)
+            {
+                case UltimateThrowType.Backhand: typeAccent = new Color(0.28f, 0.72f, 1.00f); break;
+                case UltimateThrowType.Forehand: typeAccent = new Color(0.22f, 0.90f, 0.52f); break;
+                case UltimateThrowType.Hammer:   typeAccent = new Color(1.00f, 0.65f, 0.22f); break;
+                default:                         typeAccent = new Color(0.82f, 0.52f, 1.00f); break; // Scoober
+            };
+
+            Color barColor = wobble >= 0.42f
+                ? new Color(1.00f, 0.48f, 0.20f)
+                : (power >= 0.75f
+                    ? new Color(1.00f, 0.84f, 0.28f)
+                    : new Color(0.22f, 0.92f, 0.54f));
+
+            // Backdrop & crisp border
+            DrawSolidRect(panel, new Color(0.05f, 0.08f, 0.12f, 0.78f));
+            DrawSolidRect(new Rect(panel.x, panel.y, panel.width, 2f), armed ? barColor : typeAccent);
+            DrawSolidRect(new Rect(panel.x, panel.yMax - 1f, panel.width, 1f), new Color(1f, 1f, 1f, 0.12f));
+            DrawSolidRect(new Rect(panel.x, panel.y, 1f, panel.height), new Color(1f, 1f, 1f, 0.10f));
+            DrawSolidRect(new Rect(panel.xMax - 1f, panel.y, 1f, panel.height), new Color(1f, 1f, 1f, 0.10f));
+
+            // 1. TOP ROW: Throw Type Badge | Live Scroll-Wheel Tilt Graphic | Prompt/Status
+            Rect badgeRect = new Rect(panel.x + 10f, panel.y + 8f, 82f, 20f);
+            DrawSolidRect(badgeRect, new Color(typeAccent.r, typeAccent.g, typeAccent.b, 0.18f));
+            DrawSolidRect(new Rect(badgeRect.x, badgeRect.y, 3f, badgeRect.height), typeAccent);
+            _throwBadgeStyle.normal.textColor = typeAccent;
+            GUI.Label(badgeRect, tType.ToString().ToUpperInvariant(), _throwBadgeStyle);
+
+            // Live Disc Tilt Horizon Bar (mirrors Scroll Wheel BladeAngle)
+            Vector2 tiltCenter = new Vector2(panel.x + 144f, panel.y + 18f);
+            DrawSolidRect(new Rect(tiltCenter.x - 18f, tiltCenter.y - 0.5f, 36f, 1f), new Color(1f, 1f, 1f, 0.18f));
+            Matrix4x4 savedMat = GUI.matrix;
+            GUIUtility.RotateAroundPivot(-rollDeg, tiltCenter);
+            DrawSolidRect(new Rect(tiltCenter.x - 15f, tiltCenter.y - 1.5f, 30f, 3f),
+                Mathf.Abs(rollDeg) > 100f ? new Color(1f, 0.65f, 0.25f) : Color.white);
+            // Small top-dome notch so you can immediately see right-side-up vs inverted!
+            DrawSolidRect(new Rect(tiltCenter.x - 3f, tiltCenter.y - 4f, 6f, 2.5f), typeAccent);
+            GUI.matrix = savedMat;
+
+            string statusText;
+            Color statusCol;
+            if (UltimateLocalThrowTelemetry.WaitingForFreshLmb)
+            {
+                statusText = "RELEASE LMB";
+                statusCol = new Color(1f, 0.82f, 0.35f);
+            }
+            else if (armed)
+            {
+                statusText = wobble >= 0.42f ? "WOBBLY PLANE!" : "WHIP + RELEASE";
+                statusCol = wobble >= 0.42f ? new Color(1f, 0.52f, 0.22f) : barColor;
+            }
+            else
+            {
+                statusText = "HOLD LMB TO THROW";
+                statusCol = new Color(0.75f, 0.82f, 0.90f, 0.88f);
+            }
+            _throwStatusStyle.normal.textColor = statusCol;
+            GUI.Label(new Rect(panel.x + 170f, panel.y + 8f, 124f, 20f), statusText, _throwStatusStyle);
+
+            // 2. MIDDLE ROW: Power Bar (Coil segment + Whip Snap extension, fills Left -> Right)
+            Rect barBg = new Rect(panel.x + 10f, panel.y + 35f, panelW - 20f, 16f);
+            DrawSolidRect(barBg, new Color(1f, 1f, 1f, 0.09f));
+
+            if (armed)
+            {
+                // Show unlocked Coil ceiling as a translucent cyan zone + bright vertical tick
+                float maxUnlocked = (tType == UltimateThrowType.Forehand)
+                    ? (0.07f + (0.61f + 0.32f * coil))
+                    : (tType == UltimateThrowType.Backhand
+                        ? (0.07f + (0.48f + 0.45f * coil))
+                        : (0.08f + (0.50f + 0.42f * coil)));
+                maxUnlocked = Mathf.Clamp01(maxUnlocked);
+
+                DrawSolidRect(new Rect(barBg.x, barBg.y, barBg.width * maxUnlocked, barBg.height),
+                    new Color(0.28f, 0.72f, 1.0f, 0.16f));
+                DrawSolidRect(new Rect(barBg.x + barBg.width * maxUnlocked - 1f, barBg.y, 2f, barBg.height),
+                    new Color(0.45f, 0.85f, 1.0f, 0.75f));
+
+                // Live Whip/Release power fill surging inside the unlocked ceiling
+                float totalW = barBg.width * Mathf.Clamp01(power);
+                DrawSolidRect(new Rect(barBg.x, barBg.y, totalW, barBg.height), barColor);
+            }
+
+            // Quarter tick marks
+            for (int t = 1; t <= 3; t++)
+            {
+                float tx = barBg.x + barBg.width * (t * 0.25f);
+                DrawSolidRect(new Rect(tx, barBg.y, 1f, barBg.height), new Color(0f, 0f, 0f, 0.45f));
+            }
+
+            // Percentage readout centered inside the power bar
+            _throwBadgeStyle.normal.textColor = Color.white;
+            string barLabel = armed
+                ? $"{Mathf.RoundToInt(power * 100f)}%  (COIL {Mathf.RoundToInt(coil * 100f)}%)"
+                : $"TILT {Mathf.RoundToInt(rollDeg)}°  ·  FREE FAKE MODE";
+            GUI.Label(barBg, barLabel, _throwBadgeStyle);
+
+            // 3. BOTTOM MICRO-ROW: Pivot Lunge Stability Bar + Cancel Hint
+            _throwMicroStyle.normal.textColor = pivotExt > 0.65f
+                ? new Color(1f, 0.78f, 0.30f)
+                : new Color(0.68f, 0.75f, 0.82f, 0.85f);
+            GUI.Label(new Rect(panel.x + 10f, panel.y + 57f, 68f, 18f), "PIVOT", _throwMicroStyle);
+
+            Rect pivotTrack = new Rect(panel.x + 54f, panel.y + 62f, 92f, 7f);
+            DrawSolidRect(pivotTrack, new Color(1f, 1f, 1f, 0.10f));
+            Color pivotFillCol = pivotExt > 0.65f ? new Color(1f, 0.75f, 0.25f) : new Color(0.32f, 0.76f, 1f);
+            DrawSolidRect(new Rect(pivotTrack.x, pivotTrack.y, pivotTrack.width * pivotExt, pivotTrack.height), pivotFillCol);
+
+            _throwStatusStyle.normal.textColor = new Color(0.65f, 0.72f, 0.80f, 0.80f);
+            GUI.Label(new Rect(panel.x + 154f, panel.y + 57f, 140f, 18f),
+                armed ? "RMB / SPACE: CANCEL" : "WASD / Q-E: PIVOT LUNGE",
+                _throwStatusStyle);
         }
 
         private void DrawSolidRect(Rect rect, Color color)
@@ -1379,6 +1574,258 @@ namespace PuckUltimateFrisbeeMod
             if (absAngle < 35f) return "Tailwind";
             if (absAngle > 145f) return "Headwind";
             return relAngleDeg > 0f ? "Cross (L -> R)" : "Cross (R -> L)";
+        }
+    }
+    // =========================================================================
+    // HIDE VANILLA STAMINA BAR WHILE HOLDING / THROWING DISC (C# 7.3)
+    // =========================================================================
+    public static class UltimateStaminaBarHider
+    {
+        private static readonly List<object> _staminaVisualElements = new List<object>();
+        private static readonly List<GameObject> _staminaGameObjects = new List<GameObject>();
+
+        private static PropertyInfo _veNameProp;
+        private static PropertyInfo _veVisibleProp;
+        private static PropertyInfo _veChildCountProp;
+        private static MethodInfo _veElementAtMethod;
+
+        private static bool _isCurrentlyHidden = false;
+        private static float _lastScanTime = -999f;
+        private static bool _loggedDiscovery = false;
+
+        public static void UpdateVisibility(bool hide)
+        {
+            if (UltimateFrisbeePlugin.IsHeadlessServer) return;
+
+            if (hide)
+            {
+                if (_staminaVisualElements.Count == 0 && _staminaGameObjects.Count == 0 &&
+                    Time.unscaledTime - _lastScanTime > 1.5f)
+                {
+                    ScanForStaminaBar();
+                }
+
+                ApplyHiddenState(true);
+                _isCurrentlyHidden = true;
+            }
+            else if (_isCurrentlyHidden)
+            {
+                ApplyHiddenState(false);
+                _isCurrentlyHidden = false;
+            }
+        }
+
+        public static void RestoreAll()
+        {
+            if (_isCurrentlyHidden)
+            {
+                ApplyHiddenState(false);
+                _isCurrentlyHidden = false;
+            }
+            _staminaVisualElements.Clear();
+            _staminaGameObjects.Clear();
+            _loggedDiscovery = false;
+        }
+
+        private static void ApplyHiddenState(bool hide)
+        {
+            bool visible = !hide;
+
+            // 1. UI Toolkit VisualElements
+            if (_veVisibleProp != null)
+            {
+                for (int i = _staminaVisualElements.Count - 1; i >= 0; i--)
+                {
+                    object ve = _staminaVisualElements[i];
+                    if (ve == null)
+                    {
+                        _staminaVisualElements.RemoveAt(i);
+                        continue;
+                    }
+                    try
+                    {
+                        _veVisibleProp.SetValue(ve, visible);
+                    }
+                    catch
+                    {
+                        _staminaVisualElements.RemoveAt(i);
+                    }
+                }
+            }
+
+            // 2. Fallback uGUI GameObjects (if any)
+            for (int i = _staminaGameObjects.Count - 1; i >= 0; i--)
+            {
+                GameObject go = _staminaGameObjects[i];
+                if (go == null)
+                {
+                    _staminaGameObjects.RemoveAt(i);
+                    continue;
+                }
+                if (go.activeSelf != visible)
+                {
+                    go.SetActive(visible);
+                }
+            }
+        }
+
+        private static void ScanForStaminaBar()
+        {
+            _lastScanTime = Time.unscaledTime;
+            _staminaVisualElements.Clear();
+            _staminaGameObjects.Clear();
+
+            var seenVE = new HashSet<object>();
+            var seenGO = new HashSet<GameObject>();
+
+            // A. Scan all Unity UI Toolkit UIDocuments (standard in Puck)
+            Type uiDocType = AccessTools.TypeByName("UnityEngine.UIElements.UIDocument");
+            Type veType = AccessTools.TypeByName("UnityEngine.UIElements.VisualElement");
+
+            if (veType != null && _veVisibleProp == null)
+            {
+                _veNameProp = veType.GetProperty("name", BindingFlags.Instance | BindingFlags.Public);
+                _veVisibleProp = veType.GetProperty("visible", BindingFlags.Instance | BindingFlags.Public);
+                _veChildCountProp = veType.GetProperty("childCount", BindingFlags.Instance | BindingFlags.Public);
+                _veElementAtMethod = veType.GetMethod("ElementAt", BindingFlags.Instance | BindingFlags.Public, null, new Type[] { typeof(int) }, null);
+            }
+
+            if (uiDocType != null && veType != null)
+            {
+                PropertyInfo rootProp = uiDocType.GetProperty("rootVisualElement", BindingFlags.Instance | BindingFlags.Public);
+                if (rootProp != null)
+                {
+                    UnityEngine.Object[] docs = UnityEngine.Object.FindObjectsByType(uiDocType, FindObjectsInactive.Include, FindObjectsSortMode.None);
+                    for (int i = 0; i < docs.Length; i++)
+                    {
+                        if (docs[i] == null) continue;
+                        try
+                        {
+                            object rootVE = rootProp.GetValue(docs[i]);
+                            if (rootVE != null)
+                            {
+                                CollectStaminaVisualElements(rootVE, seenVE);
+                            }
+                        }
+                        catch { }
+                    }
+                }
+            }
+
+            // B. Scan UIManager & its child MonoBehaviours for stamina-named VisualElement fields/properties
+            UIManager uiMgr = MonoBehaviourSingleton<UIManager>.Instance;
+            if (uiMgr != null)
+            {
+                foreach (MonoBehaviour mb in uiMgr.GetComponentsInChildren<MonoBehaviour>(true))
+                {
+                    if (mb == null) continue;
+                    ScanComponentForStaminaMembers(mb, veType, seenVE, seenGO);
+                }
+            }
+
+            // C. Fallback scan for uGUI Canvas children named "*stamina*"
+            foreach (Canvas canvas in UnityEngine.Object.FindObjectsByType<Canvas>(FindObjectsInactive.Include, FindObjectsSortMode.None))
+            {
+                if (canvas == null) continue;
+                CollectStaminaTransforms(canvas.transform, seenGO);
+            }
+
+            if (!_loggedDiscovery && (_staminaVisualElements.Count > 0 || _staminaGameObjects.Count > 0))
+            {
+                _loggedDiscovery = true;
+                UltimateFrisbeePlugin.ModLogger.Info(
+                    $"[StaminaBarHider] Hooked {_staminaVisualElements.Count} UI Toolkit element(s) and {_staminaGameObjects.Count} uGUI object(s).");
+            }
+        }
+
+        private static void CollectStaminaVisualElements(object ve, HashSet<object> seen)
+        {
+            if (ve == null || _veNameProp == null || _veChildCountProp == null || _veElementAtMethod == null) return;
+
+            string veName = _veNameProp.GetValue(ve) as string;
+            if (!string.IsNullOrEmpty(veName) && veName.IndexOf("stamina", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                // Grab the outermost stamina container so background, border, and fill all hide together
+                if (seen.Add(ve))
+                {
+                    _staminaVisualElements.Add(ve);
+                }
+                return;
+            }
+
+            int count = (int)_veChildCountProp.GetValue(ve);
+            for (int i = 0; i < count; i++)
+            {
+                object child = _veElementAtMethod.Invoke(ve, new object[] { i });
+                if (child != null)
+                {
+                    CollectStaminaVisualElements(child, seen);
+                }
+            }
+        }
+
+        private static void ScanComponentForStaminaMembers(
+            MonoBehaviour mb,
+            Type veType,
+            HashSet<object> seenVE,
+            HashSet<GameObject> seenGO)
+        {
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+            Type t = mb.GetType();
+
+            foreach (FieldInfo f in t.GetFields(flags))
+            {
+                if (f.Name.IndexOf("stamina", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                TryCaptureStaminaObject(f.GetValue(mb), veType, seenVE, seenGO);
+            }
+
+            foreach (PropertyInfo p in t.GetProperties(flags))
+            {
+                if (!p.CanRead || p.GetIndexParameters().Length > 0) continue;
+                if (p.Name.IndexOf("stamina", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                try { TryCaptureStaminaObject(p.GetValue(mb), veType, seenVE, seenGO); } catch { }
+            }
+        }
+
+        private static void TryCaptureStaminaObject(
+            object val,
+            Type veType,
+            HashSet<object> seenVE,
+            HashSet<GameObject> seenGO)
+        {
+            if (val == null) return;
+            if (veType != null && veType.IsInstanceOfType(val))
+            {
+                if (seenVE.Add(val)) _staminaVisualElements.Add(val);
+            }
+            else if (val is GameObject go)
+            {
+                if (seenGO.Add(go)) _staminaGameObjects.Add(go);
+            }
+            else if (val is Component comp && comp != null)
+            {
+                // Avoid hiding an entire shared HUD root unless the component itself is named Stamina
+                if (comp.gameObject.name.IndexOf("stamina", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    if (seenGO.Add(comp.gameObject)) _staminaGameObjects.Add(comp.gameObject);
+                }
+            }
+        }
+
+        private static void CollectStaminaTransforms(Transform parent, HashSet<GameObject> seenGO)
+        {
+            if (parent == null) return;
+            for (int i = 0; i < parent.childCount; i++)
+            {
+                Transform child = parent.GetChild(i);
+                if (child == null) continue;
+                if (child.name.IndexOf("stamina", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    if (seenGO.Add(child.gameObject)) _staminaGameObjects.Add(child.gameObject);
+                    continue;
+                }
+                CollectStaminaTransforms(child, seenGO);
+            }
         }
     }
 }

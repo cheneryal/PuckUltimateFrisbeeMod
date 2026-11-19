@@ -203,35 +203,369 @@ namespace PuckUltimateFrisbeeMod
     }
 
     // =========================================================================
-    // ULTIMATE FRISBEE LAYOUT / DIVING MECHANIC
+    // SAFE LMB DISC-TRACK SUPPRESSOR (ONLY WHILE HOLDING A DISC!)
+    // Preserves default LMB disc tracking 100% whenever NOT holding a disc.
+    // =========================================================================
+    public static class UltimateDiscTrackSuppressor
+    {
+        private static bool _scanned = false;
+        private static readonly List<MemberInfo> _inputBoolWrapperMembers = new List<MemberInfo>();
+        private static readonly List<MemberInfo> _cameraBoolMembers = new List<MemberInfo>();
+        private static readonly List<MemberInfo> _inputActionMembers = new List<MemberInfo>();
+        private static readonly HashSet<UnityEngine.InputSystem.InputAction> _disabledActions =
+            new HashSet<UnityEngine.InputSystem.InputAction>();
+
+        public static bool ShouldSuppressTrackForLocalPlayer()
+        {
+            var nm = NetworkManager.Singleton;
+            if (nm == null || !nm.IsClient) return false;
+            return UltimateNetworkSync.IsPlayerHoldingAnyDisc(nm.LocalClientId);
+        }
+
+        private static void EnsureScanned()
+        {
+            if (_scanned) return;
+            _scanned = true;
+
+            ScanTypeForTrackMembers(typeof(PlayerInput), _inputBoolWrapperMembers, _inputActionMembers);
+            ScanTypeForTrackMembers(typeof(PlayerCamera), _cameraBoolMembers, _inputActionMembers);
+        }
+
+        private static void ScanTypeForTrackMembers(Type type, List<MemberInfo> boolTargets, List<MemberInfo> actionTargets)
+        {
+            if (type == null) return;
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+
+            foreach (FieldInfo f in type.GetFields(flags))
+            {
+                ClassifyMember(f, f.Name, f.FieldType, boolTargets, actionTargets);
+            }
+            foreach (PropertyInfo p in type.GetProperties(flags))
+            {
+                if (!p.CanRead) continue;
+                ClassifyMember(p, p.Name, p.PropertyType, boolTargets, actionTargets);
+            }
+        }
+
+        private static void ClassifyMember(
+            MemberInfo member,
+            string name,
+            Type memberType,
+            List<MemberInfo> boolTargets,
+            List<MemberInfo> actionTargets)
+        {
+            string lower = name.ToLowerInvariant();
+            bool nameMatches = lower.Contains("track") || lower.Contains("lookatpuck") ||
+                               lower.Contains("puckcam") || lower.Contains("puckfocus") ||
+                               (lower.Contains("focus") && !lower.Contains("chat") && !lower.Contains("ui"));
+            if (!nameMatches) return;
+
+            if (memberType == typeof(UnityEngine.InputSystem.InputAction))
+            {
+                actionTargets.Add(member);
+                return;
+            }
+
+            if (memberType == typeof(bool))
+            {
+                boolTargets.Add(member);
+                return;
+            }
+
+            // Puck synced input wrapper pattern (e.g. TrackInput.ClientValue / ServerValue)
+            PropertyInfo clientVal = memberType.GetProperty("ClientValue", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            FieldInfo clientValField = memberType.GetField("ClientValue", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if ((clientVal != null && clientVal.PropertyType == typeof(bool)) ||
+                (clientValField != null && clientValField.FieldType == typeof(bool)))
+            {
+                boolTargets.Add(member);
+            }
+        }
+
+        public static void ApplySuppressionState(Player localPlayer, bool suppress)
+        {
+            EnsureScanned();
+
+            if (!suppress)
+            {
+                RestoreDisabledActions();
+                return;
+            }
+
+            if (localPlayer == null) return;
+
+            if (localPlayer.PlayerInput != null)
+            {
+                ZeroOutMembers(localPlayer.PlayerInput, _inputBoolWrapperMembers);
+                DisableActionsOn(localPlayer.PlayerInput);
+            }
+
+            var cam = localPlayer.PlayerCamera;
+            if (cam != null)
+            {
+                ZeroOutMembers(cam, _cameraBoolMembers);
+                DisableActionsOn(cam);
+            }
+        }
+
+        public static void SuppressPlayerCameraDirect(PlayerCamera cam)
+        {
+            if (cam == null) return;
+            EnsureScanned();
+            ZeroOutMembers(cam, _cameraBoolMembers);
+
+            Player p = cam.GetComponentInParent<Player>();
+            if (p != null && p.PlayerInput != null)
+            {
+                ZeroOutMembers(p.PlayerInput, _inputBoolWrapperMembers);
+            }
+        }
+
+        public static void RestoreDisabledActions()
+        {
+            if (_disabledActions.Count == 0) return;
+            foreach (var action in _disabledActions)
+            {
+                try
+                {
+                    if (action != null && !action.enabled) action.Enable();
+                }
+                catch { }
+            }
+            _disabledActions.Clear();
+        }
+
+        private static void DisableActionsOn(object instance)
+        {
+            if (instance == null) return;
+            Type instType = instance.GetType();
+            for (int i = 0; i < _inputActionMembers.Count; i++)
+            {
+                MemberInfo m = _inputActionMembers[i];
+                if (m.DeclaringType == null || !m.DeclaringType.IsAssignableFrom(instType)) continue;
+                try
+                {
+                    var action = (m is FieldInfo fi ? fi.GetValue(instance) : ((PropertyInfo)m).GetValue(instance))
+                        as UnityEngine.InputSystem.InputAction;
+                    if (action != null && action.enabled)
+                    {
+                        action.Disable();
+                        _disabledActions.Add(action);
+                    }
+                }
+                catch { }
+            }
+        }
+
+        private static void ZeroOutMembers(object instance, List<MemberInfo> members)
+        {
+            if (instance == null) return;
+            Type instType = instance.GetType();
+
+            for (int i = 0; i < members.Count; i++)
+            {
+                MemberInfo m = members[i];
+                if (m.DeclaringType == null || !m.DeclaringType.IsAssignableFrom(instType)) continue;
+                try
+                {
+                    if (m is FieldInfo fi)
+                    {
+                        if (fi.FieldType == typeof(bool))
+                        {
+                            fi.SetValue(instance, false);
+                        }
+                        else
+                        {
+                            ZeroOutBoolWrapper(fi.GetValue(instance));
+                        }
+                    }
+                    else if (m is PropertyInfo pi)
+                    {
+                        if (pi.PropertyType == typeof(bool) && pi.CanWrite)
+                        {
+                            pi.SetValue(instance, false);
+                        }
+                        else
+                        {
+                            ZeroOutBoolWrapper(pi.GetValue(instance));
+                        }
+                    }
+                }
+                catch { }
+            }
+        }
+
+        private static void ZeroOutBoolWrapper(object wrapper)
+        {
+            if (wrapper == null) return;
+            Type wt = wrapper.GetType();
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+
+            var cp = wt.GetProperty("ClientValue", flags);
+            if (cp != null && cp.CanWrite && cp.PropertyType == typeof(bool)) cp.SetValue(wrapper, false);
+            var cf = wt.GetField("ClientValue", flags);
+            if (cf != null && cf.FieldType == typeof(bool)) cf.SetValue(wrapper, false);
+
+            var sp = wt.GetProperty("ServerValue", flags);
+            if (sp != null && sp.CanWrite && sp.PropertyType == typeof(bool)) sp.SetValue(wrapper, false);
+            var sf = wt.GetField("ServerValue", flags);
+            if (sf != null && sf.FieldType == typeof(bool)) sf.SetValue(wrapper, false);
+        }
+    }
+
+    // Intercepts PlayerCamera/PlayerController track start/performed handlers ONLY while holding a disc
+    [HarmonyPatch]
+    public static class DiscTrack_SuppressWhileHolding_Patch
+    {
+        private static readonly List<MethodBase> _targets = new List<MethodBase>();
+
+        [HarmonyPrepare]
+        public static bool Prepare()
+        {
+            _targets.Clear();
+            Type[] candidateTypes = { typeof(PlayerCamera), typeof(PlayerController), typeof(PlayerInput) };
+
+            foreach (Type t in candidateTypes)
+            {
+                if (t == null) continue;
+                foreach (MethodInfo m in AccessTools.GetDeclaredMethods(t))
+                {
+                    if (m == null || m.IsAbstract || m.ContainsGenericParameters) continue;
+                    string lower = m.Name.ToLowerInvariant();
+
+                    // Never block Canceled/Stop so releasing LMB always clears any active track!
+                    if (lower.Contains("cancel") || lower.Contains("stop") || lower.Contains("end")) continue;
+
+                    bool isTrackMethod =
+                        lower.Contains("trackpuck") ||
+                        lower.Contains("lookatpuck") ||
+                        lower.Contains("puckcamera") ||
+                        lower.Contains("ontrack") ||
+                        (lower.Contains("track") && (lower.Contains("action") || lower.Contains("input") || lower.Contains("started") || lower.Contains("performed")));
+
+                    if (isTrackMethod)
+                    {
+                        _targets.Add(m);
+                    }
+                }
+            }
+            return _targets.Count > 0;
+        }
+
+        [HarmonyTargetMethods]
+        public static IEnumerable<MethodBase> TargetMethods() => _targets;
+
+        [HarmonyPrefix]
+        public static bool Prefix()
+        {
+            return !UltimateDiscTrackSuppressor.ShouldSuppressTrackForLocalPlayer();
+        }
+    }
+
+    // Also zero out PlayerCamera's track state immediately before its Update/LateUpdate while holding a disc
+    [HarmonyPatch]
+    public static class PlayerCamera_SuppressTrackTick_Patch
+    {
+        private static readonly List<MethodBase> _targets = new List<MethodBase>();
+
+        [HarmonyPrepare]
+        public static bool Prepare()
+        {
+            _targets.Clear();
+            var u = AccessTools.Method(typeof(PlayerCamera), "Update");
+            var lu = AccessTools.Method(typeof(PlayerCamera), "LateUpdate");
+            if (u != null) _targets.Add(u);
+            if (lu != null) _targets.Add(lu);
+            return _targets.Count > 0;
+        }
+
+        [HarmonyTargetMethods]
+        public static IEnumerable<MethodBase> TargetMethods() => _targets;
+
+        [HarmonyPrefix]
+        public static void Prefix(PlayerCamera __instance)
+        {
+            if (UltimateDiscTrackSuppressor.ShouldSuppressTrackForLocalPlayer())
+            {
+                UltimateDiscTrackSuppressor.SuppressPlayerCameraDirect(__instance);
+            }
+        }
+    }
+
+    // =========================================================================
+    // CLIENT-SIDE LOCAL THROW TELEMETRY (0-Latency HUD Feed)
+    // =========================================================================
+    public static class UltimateLocalThrowTelemetry
+    {
+        public static bool IsHoldingDisc;
+        public static bool IsArmed;
+        public static bool WaitingForFreshLmb;
+        public static UltimateThrowType ThrowType = UltimateThrowType.Backhand;
+        public static float BladeRollDeg;
+        public static float Coil01;
+        public static float Whip01;
+        public static float Power01;
+        public static float Wobble01;
+        public static float PivotExtension01;
+
+        public static float LastFeedbackTime = -999f;
+        public static string LastFeedbackText = "";
+        public static Color LastFeedbackColor = Color.white;
+
+        public static readonly UltimateRulesManager.ThrowMotionTracker LocalTracker =
+            new UltimateRulesManager.ThrowMotionTracker();
+
+        public static void RecordFeedback(string text, Color color)
+        {
+            LastFeedbackTime = Time.unscaledTime;
+            LastFeedbackText = text;
+            LastFeedbackColor = color;
+        }
+
+        public static void ResetHoldingState()
+        {
+            IsHoldingDisc = false;
+            IsArmed = false;
+            WaitingForFreshLmb = false;
+            Coil01 = 0f;
+            Whip01 = 0f;
+            Power01 = 0f;
+            Wobble01 = 0f;
+            PivotExtension01 = 0f;
+            LocalTracker.Reset();
+        }
+    }
+
+    // =========================================================================
+    // ULTIMATE FRISBEE LAYOUT / DIVING, STRAFE, SKY JUMP & THROW CLUTCH NETWORKING
     // =========================================================================
     public static class UltimateDiveMod
     {
         public const string DiveMessageName = "ULTIMATE/Dive";
 
-        // Tunable physics values matching DashFall's DiveMod
         public static float MinStaminaForDive = 0.25f;
         public static float MinAxis = 0.1f;
-        public static float DiveVelocity = 7.5f;                 // Forward layout burst speed (m/s)
-        public static float DiveTorque = 13.5f;                  // Forward pitch torque that tips the player horizontal
+        public static float DiveVelocity = 7.5f;
+        public static float DiveTorque = 13.5f;
         public static float DiveAutoClearIfNoFallSeconds = 0.45f;
         public static bool EnableDiveFallenDrag = true;
-        public static float DiveFallenDragAmount = 2.8f;         // Turf chest-slide drag while fallen
+        public static float DiveFallenDragAmount = 2.8f;
 
         internal static readonly Dictionary<ulong, float> DiveStartedAt = new Dictionary<ulong, float>();
         internal static readonly HashSet<ulong> DiveToggled = new HashSet<ulong>();
 
-        // --- Q/E STRAFING & CROUCH SKY-JUMP SETTINGS ---
+        // --- Q/E STRAFING, SKY-JUMP & LMB THROW CLUTCH STATES ---
         internal static readonly Dictionary<ulong, sbyte> ClientStrafeState = new Dictionary<ulong, sbyte>();
+        internal static readonly Dictionary<ulong, bool> ClientThrowClutchHeld = new Dictionary<ulong, bool>();
         internal static readonly Dictionary<ulong, float> LastCrouchTime = new Dictionary<ulong, float>();
         internal static readonly Dictionary<ulong, float> LastSkyJumpTime = new Dictionary<ulong, float>();
         internal static readonly Dictionary<ulong, bool> WasJumpingLastTick = new Dictionary<ulong, bool>();
 
-        public static float StrafeRunSpeed = 5.8f;          // Normal sideways run speed (m/s)
-        public static float StrafeSprintSpeed = 7.6f;       // Sprint sideways speed (m/s)
-        public static float StrafeResponsiveness = 18.0f;   // How quickly you reach strafe speed
-        public static float SkyJumpVerticalVelocity = 5.1f; // High vertical spring for sky battles!
-        public static float SkyJumpStaminaCost = 0.12f;     // Stamina used by a crouch-spring jump
+        public static float StrafeRunSpeed = 5.8f;
+        public static float StrafeSprintSpeed = 7.6f;
+        public static float StrafeResponsiveness = 18.0f;
+        public static float SkyJumpVerticalVelocity = 5.1f;
+        public static float SkyJumpStaminaCost = 0.12f;
 
         private static CustomMessagingManager _registeredCmm = null;
 
@@ -256,9 +590,12 @@ namespace PuckUltimateFrisbeeMod
             DiveStartedAt.Clear();
             DiveToggled.Clear();
             ClientStrafeState.Clear();
+            ClientThrowClutchHeld.Clear();
             LastCrouchTime.Clear();
             LastSkyJumpTime.Clear();
             WasJumpingLastTick.Clear();
+            UltimateDiscTrackSuppressor.RestoreDisabledActions();
+            UltimateLocalThrowTelemetry.ResetHoldingState();
         }
 
         public static void ClientSendDiveAction()
@@ -271,9 +608,7 @@ namespace PuckUltimateFrisbeeMod
             {
                 Player localPlayer = MonoBehaviourSingleton<PlayerManager>.Instance?.GetPlayerByClientId(nm.LocalClientId);
                 if (localPlayer != null && localPlayer.PlayerInput != null)
-                {
                     TryStartDiveNow(localPlayer.PlayerInput);
-                }
                 return;
             }
 
@@ -293,16 +628,13 @@ namespace PuckUltimateFrisbeeMod
             if (NetworkRoles.IsServer)
             {
                 Player localPlayer = MonoBehaviourSingleton<PlayerManager>.Instance?.GetPlayerByClientId(nm.LocalClientId);
-                if (localPlayer != null)
-                {
-                    ServerCancelPlayerThrow(localPlayer);
-                }
+                if (localPlayer != null) ServerCancelPlayerThrow(localPlayer);
                 return;
             }
 
             using (var writer = new FastBufferWriter(4, Allocator.Temp))
             {
-                writer.WriteValueSafe((byte)2); // 2 = Cancel Throw / Pump Fake
+                writer.WriteValueSafe((byte)2);
                 nm.CustomMessagingManager.SendNamedMessage(DiveMessageName, NetworkManager.ServerClientId, writer, NetworkDelivery.Reliable);
             }
         }
@@ -321,7 +653,7 @@ namespace PuckUltimateFrisbeeMod
 
             using (var writer = new FastBufferWriter(4, Allocator.Temp))
             {
-                writer.WriteValueSafe((byte)3); // 3 = Q/E Strafe State
+                writer.WriteValueSafe((byte)3);
                 writer.WriteValueSafe(strafeDir);
                 nm.CustomMessagingManager.SendNamedMessage(DiveMessageName, NetworkManager.ServerClientId, writer, NetworkDelivery.Reliable);
             }
@@ -342,7 +674,27 @@ namespace PuckUltimateFrisbeeMod
 
             using (var writer = new FastBufferWriter(4, Allocator.Temp))
             {
-                writer.WriteValueSafe((byte)4); // 4 = Crouch-Spring Sky Jump
+                writer.WriteValueSafe((byte)4);
+                nm.CustomMessagingManager.SendNamedMessage(DiveMessageName, NetworkManager.ServerClientId, writer, NetworkDelivery.Reliable);
+            }
+        }
+
+        public static void ClientSendThrowClutchState(bool isPressed)
+        {
+            EnsureNetworkRegistered();
+            var nm = NetworkManager.Singleton;
+            if (nm == null || !nm.IsConnectedClient || nm.CustomMessagingManager == null) return;
+
+            if (NetworkRoles.IsServer)
+            {
+                ClientThrowClutchHeld[nm.LocalClientId] = isPressed;
+                return;
+            }
+
+            using (var writer = new FastBufferWriter(4, Allocator.Temp))
+            {
+                writer.WriteValueSafe((byte)5); // 5 = LMB Throw Clutch State
+                writer.WriteValueSafe((byte)(isPressed ? 1 : 0));
                 nm.CustomMessagingManager.SendNamedMessage(DiveMessageName, NetworkManager.ServerClientId, writer, NetworkDelivery.Reliable);
             }
         }
@@ -350,9 +702,10 @@ namespace PuckUltimateFrisbeeMod
         public static void ServerCancelPlayerThrow(Player player)
         {
             if (player == null) return;
+            ClientThrowClutchHeld[player.OwnerClientId] = false;
             if (UltimateRulesManager.WindupTrackers.TryGetValue(player.OwnerClientId, out var tracker))
             {
-                tracker.CancelCharge(player.PlayerBody);
+                tracker.CancelArm();
             }
         }
 
@@ -366,10 +719,8 @@ namespace PuckUltimateFrisbeeMod
             if (IsFaceOff() || !body.IsGrounded || (body.HasFallen != null && body.HasFallen.Value)) return;
             if (UltimateRulesManager.Holder == player || UltimateNetworkSync.IsPlayerHoldingAnyDisc(player.OwnerClientId)) return;
 
-            // Cooldown check (0.65s between sky jumps)
             if (LastSkyJumpTime.TryGetValue(id, out float lastJump) && (Time.time - lastJump) < 0.65f) return;
 
-            // Must currently be crouching (Ctrl) OR have released Ctrl within the last 0.30s
             bool isCrouched = body.IsSliding != null && body.IsSliding.Value;
             bool recentlyCrouched = LastCrouchTime.TryGetValue(id, out float crouchT) && (Time.time - crouchT) <= 0.30f;
             if (!isCrouched && !recentlyCrouched) return;
@@ -382,10 +733,8 @@ namespace PuckUltimateFrisbeeMod
                 body.Stamina.Value = Mathf.Max(0f, body.Stamina.Value - SkyJumpStaminaCost);
             }
 
-            // Un-crouch the player so they spring upright into the air
             if (body.IsSliding != null) body.IsSliding.Value = false;
 
-            // Apply high vertical launch velocity while preserving horizontal run/strafe momentum!
             Vector3 vel = rb.linearVelocity;
             vel.y = SkyJumpVerticalVelocity;
             rb.linearVelocity = vel;
@@ -407,6 +756,17 @@ namespace PuckUltimateFrisbeeMod
                 {
                     reader.ReadValueSafe(out sbyte strafeDir);
                     ClientStrafeState[senderClientId] = strafeDir;
+                }
+                catch { }
+                return;
+            }
+
+            if (actionType == 5)
+            {
+                try
+                {
+                    reader.ReadValueSafe(out byte pressedByte);
+                    ClientThrowClutchHeld[senderClientId] = (pressedByte != 0);
                 }
                 catch { }
                 return;
@@ -440,7 +800,6 @@ namespace PuckUltimateFrisbeeMod
             var body = player.PlayerBody;
             if (body == null || body.Rigidbody == null) return;
 
-            // Cannot layout while airborne, already fallen, during FaceOff lineup, or while holding the disc!
             if (!body.IsGrounded || body.HasFallen.Value || IsFaceOff()) return;
             if (UltimateRulesManager.Holder == player || UltimateNetworkSync.IsPlayerHoldingAnyDisc(player.OwnerClientId)) return;
 
@@ -469,7 +828,6 @@ namespace PuckUltimateFrisbeeMod
             body.Rigidbody.AddForce(dir * DiveVelocity, ForceMode.VelocityChange);
             body.Rigidbody.AddTorque(Vector3.Cross(Vector3.up, dir).normalized * DiveTorque, ForceMode.VelocityChange);
 
-            // Play a subtle turf/air whoosh sound on layout launch
             UltimateAudioManager.ServerBroadcastSound(UltimateSoundType.Throw, body.transform.position, 0.55f, 0.78f);
         }
 
@@ -488,7 +846,7 @@ namespace PuckUltimateFrisbeeMod
         }
     }
 
-    // Client-side hotkey listener (Default: F key or Mouse4/Forward Button, matching DashFall)
+    // Client-side input listener: Q/E Strafe, LMB Throw Clutch (with Track Suppression), RMB Fake, Ctrl+Space SkyJump, F Dive
     public class UltimateDiveClientInput : MonoBehaviour
     {
         public PlayerBody Body;
@@ -496,6 +854,13 @@ namespace PuckUltimateFrisbeeMod
         private const float ClientDiveCooldown = 0.5f;
         private sbyte _lastSentStrafe = 0;
         private float _lastLocalCrouchTime = -999f;
+
+        private bool _wasHoldingDisc = false;
+        private bool _isLmbClutchSent = false;
+        private bool _requireFreshLmbPress = false;
+        private Vector3 _localPivotAnchor = Vector3.zero;
+        private bool _hasLocalPivotAnchor = false;
+        private float _localCatchStartTime = 0f;
 
         private static bool IsTypingOrPaused()
         {
@@ -512,12 +877,63 @@ namespace PuckUltimateFrisbeeMod
             return false;
         }
 
+        private void OnDisable()
+        {
+            if (_wasHoldingDisc)
+            {
+                UltimateDiscTrackSuppressor.ApplySuppressionState(Body?.Player, false);
+                UltimateLocalThrowTelemetry.ResetHoldingState();
+                _wasHoldingDisc = false;
+            }
+        }
+
         private void Update()
         {
             if (Body == null || Body.Player == null || !Body.Player.IsLocalPlayer) return;
 
             var kb = UnityEngine.InputSystem.Keyboard.current;
             var mouse = UnityEngine.InputSystem.Mouse.current;
+            Player player = Body.Player;
+
+            bool isHolding = UltimateNetworkSync.IsPlayerHoldingAnyDisc(player.OwnerClientId);
+
+            // Toggle LMB disc tracking suppression cleanly on state transitions
+            if (isHolding != _wasHoldingDisc)
+            {
+                if (isHolding)
+                {
+                    // Just caught/picked up disc: suppress LMB disc track immediately!
+                    UltimateDiscTrackSuppressor.ApplySuppressionState(player, true);
+
+                    // Guard against accidental throw if player was holding LMB to track the incoming disc!
+                    bool lmbHeldOnCatch = mouse != null && mouse.leftButton.isPressed;
+                    _requireFreshLmbPress = lmbHeldOnCatch;
+                    _isLmbClutchSent = false;
+                    _localCatchStartTime = Time.time;
+                    _hasLocalPivotAnchor = false;
+                    UltimateLocalThrowTelemetry.LocalTracker.Reset();
+                    UltimateDiveMod.ClientSendThrowClutchState(false);
+                }
+                else
+                {
+                    // No longer holding disc: restore LMB disc tracking immediately!
+                    if (_isLmbClutchSent)
+                    {
+                        _isLmbClutchSent = false;
+                        UltimateDiveMod.ClientSendThrowClutchState(false);
+                    }
+                    _requireFreshLmbPress = false;
+                    _hasLocalPivotAnchor = false;
+                    UltimateDiscTrackSuppressor.ApplySuppressionState(player, false);
+                    UltimateLocalThrowTelemetry.ResetHoldingState();
+                }
+                _wasHoldingDisc = isHolding;
+            }
+
+            if (isHolding)
+            {
+                UltimateDiscTrackSuppressor.ApplySuppressionState(player, true);
+            }
 
             if (IsTypingOrPaused())
             {
@@ -526,10 +942,17 @@ namespace PuckUltimateFrisbeeMod
                     _lastSentStrafe = 0;
                     UltimateDiveMod.ClientSendStrafeState(0);
                 }
+                if (_isLmbClutchSent)
+                {
+                    _isLmbClutchSent = false;
+                    UltimateDiveMod.ClientSendThrowClutchState(false);
+                    UltimateLocalThrowTelemetry.IsArmed = false;
+                    UltimateLocalThrowTelemetry.LocalTracker.Reset();
+                }
                 return;
             }
 
-            // --- 1. Q / E LATERAL STRAFE INPUT ---
+            // --- 1. Q / E LATERAL STRAFE (works for BOTH Running & Pivot Lunge!) ---
             sbyte currentStrafe = 0;
             if (kb != null)
             {
@@ -542,15 +965,10 @@ namespace PuckUltimateFrisbeeMod
                 UltimateDiveMod.ClientSendStrafeState(currentStrafe);
             }
 
-            // --- 2. IF HOLDING DISC: PUMP FAKE (Right-Click / R / Space) ---
-            if (UltimateNetworkSync.IsPlayerHoldingAnyDisc(Body.Player.OwnerClientId))
+            // --- 2. HOLDING DISC: LMB CLUTCH + COIL/WHIP + PUMP FAKE + LIVE HUD TELEMETRY ---
+            if (isHolding)
             {
-                bool cancelPressed = (kb != null && (kb.rKey.wasPressedThisFrame || kb.spaceKey.wasPressedThisFrame)) ||
-                                     (mouse != null && mouse.rightButton.wasPressedThisFrame);
-                if (cancelPressed)
-                {
-                    UltimateDiveMod.ClientSendCancelThrowAction();
-                }
+                UpdateHoldingDiscControls(player, kb, mouse);
                 return;
             }
 
@@ -575,9 +993,138 @@ namespace PuckUltimateFrisbeeMod
                 UltimateDiveMod.ClientSendDiveAction();
             }
         }
+
+        private void UpdateHoldingDiscControls(
+            Player player,
+            UnityEngine.InputSystem.Keyboard kb,
+            UnityEngine.InputSystem.Mouse mouse)
+        {
+            if (player.Stick == null || player.PlayerInput == null) return;
+
+            bool isLeft = player.Handedness != null && player.Handedness.Value == PlayerHandedness.Left;
+            Vector2 stickAngle = player.PlayerInput.StickRaycastOriginAngleInput.ClientValue;
+            float bladeAngle = player.Stick.BladeAngle;
+
+            // Approximate local pivot anchor once momentum stop settles (or read exact anchor if listen server)
+            if (UltimateRulesManager.TryGetPivotAnchor(player.OwnerClientId, out Vector3 exactAnchor))
+            {
+                _localPivotAnchor = exactAnchor;
+                _hasLocalPivotAnchor = true;
+            }
+            else if (!_hasLocalPivotAnchor && (Time.time - _localCatchStartTime) >= 0.45f)
+            {
+                _localPivotAnchor = Body.transform.position;
+                _hasLocalPivotAnchor = true;
+            }
+
+            float pivotExt01 = 0f;
+            if (_hasLocalPivotAnchor)
+            {
+                Vector3 delta = Body.transform.position - _localPivotAnchor;
+                delta.y = 0f;
+                pivotExt01 = Mathf.Clamp01(delta.magnitude / UltimateRulesManager.PivotMaxRadius);
+            }
+
+            UltimateThrowType liveType = UltimateRulesManager.DetermineThrowType(
+                Body, player.Stick, stickAngle, isLeft, out _);
+
+            UltimateLocalThrowTelemetry.IsHoldingDisc = true;
+            UltimateLocalThrowTelemetry.ThrowType = liveType;
+            UltimateLocalThrowTelemetry.BladeRollDeg = bladeAngle * UltimateVisualTuning.WristRollMultiplier;
+            UltimateLocalThrowTelemetry.PivotExtension01 = pivotExt01;
+            UltimateLocalThrowTelemetry.WaitingForFreshLmb = _requireFreshLmbPress;
+
+            bool lmbPressed = mouse != null && mouse.leftButton.isPressed;
+            bool cancelPressed = (kb != null && (kb.rKey.wasPressedThisFrame || kb.spaceKey.wasPressedThisFrame)) ||
+                                 (mouse != null && mouse.rightButton.wasPressedThisFrame);
+
+            // Pump Fake / Cancel while armed
+            if (cancelPressed && _isLmbClutchSent)
+            {
+                _isLmbClutchSent = false;
+                _requireFreshLmbPress = lmbPressed;
+                UltimateDiveMod.ClientSendCancelThrowAction();
+                UltimateLocalThrowTelemetry.IsArmed = false;
+                UltimateLocalThrowTelemetry.Coil01 = 0f;
+                UltimateLocalThrowTelemetry.Whip01 = 0f;
+                UltimateLocalThrowTelemetry.Power01 = 0f;
+                UltimateLocalThrowTelemetry.Wobble01 = 0f;
+                UltimateLocalThrowTelemetry.LocalTracker.Reset();
+                UltimateLocalThrowTelemetry.RecordFeedback("PUMP FAKE", new Color(0.55f, 0.78f, 1.0f));
+                return;
+            }
+
+            if (_requireFreshLmbPress)
+            {
+                if (!lmbPressed)
+                {
+                    _requireFreshLmbPress = false;
+                }
+                UltimateLocalThrowTelemetry.IsArmed = false;
+                return;
+            }
+
+            // LMB Pressed -> Arm Throw!
+            if (lmbPressed && !_isLmbClutchSent)
+            {
+                _isLmbClutchSent = true;
+                UltimateDiveMod.ClientSendThrowClutchState(true);
+                UltimateLocalThrowTelemetry.LocalTracker.BeginArm(Body, player.Stick, stickAngle, bladeAngle, liveType);
+            }
+            // LMB Held -> Update Live Coil, Whip & Wobble Telemetry!
+            else if (lmbPressed && _isLmbClutchSent)
+            {
+                UltimateLocalThrowTelemetry.LocalTracker.UpdateArm(
+                    Body, player.Stick, stickAngle, bladeAngle, isLeft, liveType, pivotExt01, Time.deltaTime);
+            }
+            // LMB Released -> Fire Throw!
+            else if (!lmbPressed && _isLmbClutchSent)
+            {
+                var tr = UltimateLocalThrowTelemetry.LocalTracker;
+                float pct = Mathf.RoundToInt(tr.GetCombinedThrowPower(liveType, pivotExt01) * 100f);
+                float wob = tr.EstimatedWobble;
+                float snap = tr.PeakWhip;
+
+                string tag;
+                Color col;
+                if (wob >= 0.42f)
+                {
+                    tag = $"{liveType.ToString().ToUpperInvariant()} · {pct}% · WOBBLY";
+                    col = new Color(1.0f, 0.58f, 0.22f);
+                }
+                else if (pct >= 75f)
+                {
+                    tag = $"{liveType.ToString().ToUpperInvariant()} · {pct}% · FULL POWER";
+                    col = new Color(1.0f, 0.85f, 0.30f);
+                }
+                else if (snap >= 0.55f)
+                {
+                    tag = $"{liveType.ToString().ToUpperInvariant()} · {pct}% · CLEAN SNAP";
+                    col = new Color(0.24f, 0.92f, 0.54f);
+                }
+                else
+                {
+                    tag = $"{liveType.ToString().ToUpperInvariant()} · {pct}% · TOUCH";
+                    col = new Color(0.60f, 0.85f, 1.0f);
+                }
+
+                UltimateLocalThrowTelemetry.RecordFeedback(tag, col);
+
+                _isLmbClutchSent = false;
+                UltimateDiveMod.ClientSendThrowClutchState(false);
+                tr.Reset();
+            }
+
+            var localTr = UltimateLocalThrowTelemetry.LocalTracker;
+            UltimateLocalThrowTelemetry.IsArmed = _isLmbClutchSent;
+            UltimateLocalThrowTelemetry.Coil01 = _isLmbClutchSent ? localTr.PeakCoil : 0f;
+            UltimateLocalThrowTelemetry.Whip01 = _isLmbClutchSent ? localTr.PeakWhip : 0f;
+            UltimateLocalThrowTelemetry.Power01 = _isLmbClutchSent ? localTr.GetCombinedThrowPower(liveType, pivotExt01) : 0f;
+            UltimateLocalThrowTelemetry.Wobble01 = _isLmbClutchSent ? localTr.EstimatedWobble : 0f;
+        }
     }
 
-    // Slow down sprint stamina drain, auto-clear dive state, and apply turf slide drag when fallen
+    // Active Pivot Lunge, Q/E Strafe, Sprint Stamina & Dive Recovery
     [HarmonyPatch(typeof(PlayerBody), "FixedUpdate")]
     public static class PlayerBody_DiveAutoClearAndDrag_Patch
     {
@@ -646,6 +1193,60 @@ namespace PuckUltimateFrisbeeMod
                              NetworkBehaviourSingleton<GameManager>.Instance.Phase == GamePhase.FaceOff;
 
             // -----------------------------------------------------------------
+            // 0B. ACTIVE PIVOT STEPPING / LUNGE AROUND PLANTED PIVOT FOOT
+            // -----------------------------------------------------------------
+            if (isHoldingDisc && !isFaceOff && rb != null &&
+                UltimateRulesManager.TryGetPivotAnchor(player.OwnerClientId, out Vector3 pivotAnchor))
+            {
+                SetPlayerSkateTraction(id, __instance, 0f);
+                if (__instance.IsSprinting != null) __instance.IsSprinting.Value = false;
+
+                Vector2 move = player.PlayerInput != null ? player.PlayerInput.MoveInput.ServerValue : Vector2.zero;
+                sbyte qeStrafe = UltimateDiveMod.ClientStrafeState.TryGetValue(player.OwnerClientId, out sbyte sdPivot) ? sdPivot : (sbyte)0;
+
+                float fwdInput = Mathf.Clamp(move.y, -1f, 1f);
+                float latInput = qeStrafe != 0 ? qeStrafe : Mathf.Clamp(move.x, -1f, 1f);
+
+                Vector3 fwdDir = Vector3.ProjectOnPlane(__instance.transform.forward, Vector3.up).normalized;
+                Vector3 rightDir = Vector3.ProjectOnPlane(__instance.transform.right, Vector3.up).normalized;
+
+                Vector3 lungeDir = (fwdDir * fwdInput) + (rightDir * latInput);
+                if (lungeDir.magnitude > 1f) lungeDir.Normalize();
+
+                Vector3 targetWorldPos = pivotAnchor + lungeDir * UltimateRulesManager.PivotMaxRadius;
+
+                // Keep pivot lunge strictly in-bounds (and behind the goal line if caught in central zone)
+                if (!UltimateRulesManager.IsWarmup && !UltimateRulesManager.IsPullPlay)
+                {
+                    float maxX = UltimateRulesManager.FieldHalfWidth - 0.18f;
+                    float maxZ = UltimateRulesManager.EndzoneZThreshold;
+                    targetWorldPos.x = Mathf.Clamp(targetWorldPos.x, -maxX, maxX);
+                    targetWorldPos.z = Mathf.Clamp(targetWorldPos.z, -maxZ, maxZ);
+                }
+
+                Vector3 currentPos = rb.position;
+                Vector3 toTarget = targetWorldPos - currentPos;
+                toTarget.y = 0f;
+
+                Vector3 desiredHorizVel = Vector3.ClampMagnitude(toTarget * 11.5f, UltimateRulesManager.PivotLungeSpeed);
+                rb.linearVelocity = new Vector3(desiredHorizVel.x, rb.linearVelocity.y, desiredHorizVel.z);
+
+                // Hard radius tether so markers/physics can never shove the thrower off their planted foot
+                Vector3 fromAnchor = currentPos - pivotAnchor;
+                fromAnchor.y = 0f;
+                float distFromAnchor = fromAnchor.magnitude;
+                float maxAllowedDist = UltimateRulesManager.PivotMaxRadius + 0.04f;
+                if (distFromAnchor > maxAllowedDist)
+                {
+                    Vector3 clampedPos = pivotAnchor + (fromAnchor / distFromAnchor) * maxAllowedDist;
+                    clampedPos.y = currentPos.y;
+                    rb.position = clampedPos;
+                    __instance.transform.position = clampedPos;
+                }
+                return;
+            }
+
+            // -----------------------------------------------------------------
             // 1. TRACK CROUCH (SLIDING) & VANILLA JUMP TRANSITION FOR SKY JUMPS
             // -----------------------------------------------------------------
             if (__instance.IsSliding != null && __instance.IsSliding.Value)
@@ -657,7 +1258,6 @@ namespace PuckUltimateFrisbeeMod
             bool wasJumping = UltimateDiveMod.WasJumpingLastTick.TryGetValue(id, out bool wj) && wj;
             UltimateDiveMod.WasJumpingLastTick[id] = isJumpingNow;
 
-            // If vanilla jump just fired within 0.30s of crouching, upgrade it to a Sky Jump!
             if (isJumpingNow && !wasJumping &&
                 UltimateDiveMod.LastCrouchTime.TryGetValue(id, out float lastCrouchT) &&
                 (Time.time - lastCrouchT) <= 0.30f)
@@ -676,7 +1276,6 @@ namespace PuckUltimateFrisbeeMod
 
             if (rb != null && strafeDir != 0 && !isFaceOff && !isHoldingDisc && !hasFallen && !isDiving && __instance.IsGrounded)
             {
-                // Disable Skate lateral traction while holding Q/E so Skate doesn't brake our sideways velocity
                 SetPlayerSkateTraction(id, __instance, 0f);
 
                 Vector3 rightDir = Vector3.ProjectOnPlane(__instance.transform.right, Vector3.up).normalized;
@@ -686,14 +1285,11 @@ namespace PuckUltimateFrisbeeMod
                 float forwardSpeed = Vector3.Dot(vel, forwardDir);
                 float currentRightSpeed = Vector3.Dot(vel, rightDir);
 
-                // Only grant Sprint strafe speed if the player actually has stamina and is actively sprinting
                 bool hasSprintStamina = __instance.Stamina == null || __instance.Stamina.Value > 0.01f;
                 float maxAllowedHorizSpeed = (isSprinting && hasSprintStamina)
                     ? UltimateDiveMod.StrafeSprintSpeed
                     : UltimateDiveMod.StrafeRunSpeed;
 
-                // If the player is also moving forward/backward (W/S), scale down target lateral speed
-                // so the diagonal vector magnitude never exceeds maxAllowedHorizSpeed!
                 float forwardRatio = Mathf.Clamp01(Mathf.Abs(forwardSpeed) / maxAllowedHorizSpeed);
                 float diagScale = Mathf.Sqrt(Mathf.Max(0.5f, 1f - (forwardRatio * forwardRatio * 0.5f)));
 
@@ -704,7 +1300,6 @@ namespace PuckUltimateFrisbeeMod
                     UltimateDiveMod.StrafeResponsiveness * Time.fixedDeltaTime
                 );
 
-                // Reconstruct horizontal velocity and strictly clamp total horizontal speed
                 Vector3 newHorizVel = (forwardDir * forwardSpeed) + (rightDir * newRightSpeed);
                 if (newHorizVel.magnitude > maxAllowedHorizSpeed)
                 {
@@ -715,7 +1310,6 @@ namespace PuckUltimateFrisbeeMod
             }
             else
             {
-                // Restore normal turf traction when not actively strafing
                 SetPlayerSkateTraction(id, __instance, 2.5f);
             }
 
@@ -758,13 +1352,9 @@ namespace PuckUltimateFrisbeeMod
             if (UltimateDiveMod.EnableDiveFallenDrag && hasFallen && __instance.Movement != null)
             {
                 if (_ambientDragProp != null && _ambientDragProp.CanWrite)
-                {
                     _ambientDragProp.SetValue(__instance.Movement, UltimateDiveMod.DiveFallenDragAmount);
-                }
                 else if (_ambientDragField != null)
-                {
                     _ambientDragField.SetValue(__instance.Movement, UltimateDiveMod.DiveFallenDragAmount);
-                }
             }
 
             if (elapsed < UltimateDiveMod.DiveAutoClearIfNoFallSeconds) return;
@@ -779,15 +1369,8 @@ namespace PuckUltimateFrisbeeMod
                     try { _recoverMethod.Invoke(__instance, null); } catch { }
                 }
 
-                if (__instance.HasFallen != null)
-                {
-                    __instance.HasFallen.Value = false;
-                }
-
-                if (rb != null)
-                {
-                    rb.angularVelocity = Vector3.zero;
-                }
+                if (__instance.HasFallen != null) __instance.HasFallen.Value = false;
+                if (rb != null) rb.angularVelocity = Vector3.zero;
 
                 PostDiveStabilizeUntil[id] = Time.time + 0.40f;
                 UltimateDiveMod.ClearDiveState(player);
@@ -801,7 +1384,6 @@ namespace PuckUltimateFrisbeeMod
         }
     }
 
-    // Clean up per-player dive dictionaries when a player body despawns
     [HarmonyPatch(typeof(PlayerBody), "OnNetworkDespawn")]
     public static class PlayerBody_OnNetworkDespawn_DivePatch
     {
@@ -817,13 +1399,15 @@ namespace PuckUltimateFrisbeeMod
             PlayerBody_DiveAutoClearAndDrag_Patch.PrevStamina.Remove(id);
             PlayerBody_DiveAutoClearAndDrag_Patch.PostDiveStabilizeUntil.Remove(id);
             UltimateDiveMod.ClientStrafeState.Remove(player.OwnerClientId);
+            UltimateDiveMod.ClientThrowClutchHeld.Remove(player.OwnerClientId);
+            UltimateRulesManager.ClearPivotAnchor(player.OwnerClientId);
             UltimateDiveMod.LastCrouchTime.Remove(id);
             UltimateDiveMod.LastSkyJumpTime.Remove(id);
             UltimateDiveMod.WasJumpingLastTick.Remove(id);
             PlayerBody_DiveAutoClearAndDrag_Patch.CachedSkates.Remove(id);
         }
     }
-    
+
     [HarmonyPatch(typeof(PlayerCamera), "OnNetworkPostSpawn")]
     public static class PlayerCamera_ExtendFarClip_Patch
     {

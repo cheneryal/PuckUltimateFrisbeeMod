@@ -271,6 +271,8 @@ namespace PuckUltimateFrisbeeMod
         private float _visualSpinAngle = 0f;
         private Vector3 _lastFrameWorldPos = Vector3.zero;
         private float _smoothedWorldSpeed = 0f;
+        private float _visualWobble = 0f;
+        private bool _wasHeldLastFrame = false;
         public static float GetMinimumCenterHeightForRotation(Quaternion rot)
         {
             Vector3 discNormal = rot * Vector3.up;
@@ -320,7 +322,14 @@ namespace PuckUltimateFrisbeeMod
 
                 Disc.transform.localScale = Vector3.one;
                 CustomDiscVisual.localPosition = Vector3.zero;
-                CustomDiscVisual.localRotation = Quaternion.Euler(0f, _visualSpinAngle, 0f) * Quaternion.Euler(UltimateVisualTuning.DiscMeshRotationOffset);
+                 Quaternion wobbleRot = Quaternion.identity;
+                if (_visualWobble > 0.02f)
+                {
+                    float t = Time.time * 42f;
+                    float amp = _visualWobble * 15f;
+                    wobbleRot = Quaternion.Euler(Mathf.Sin(t) * amp, 0f, Mathf.Cos(t * 1.13f) * amp);
+                }
+                CustomDiscVisual.localRotation = wobbleRot * Quaternion.Euler(0f, _visualSpinAngle, 0f) * Quaternion.Euler(UltimateVisualTuning.DiscMeshRotationOffset);
                 CustomDiscVisual.localScale = Vector3.one * UltimateVisualTuning.DiscMeshScale;
             }
             else
@@ -465,16 +474,19 @@ namespace PuckUltimateFrisbeeMod
             ulong discNetId = (Disc.NetworkObject != null) ? Disc.NetworkObjectId : 0UL;
             ulong holderId = ulong.MaxValue;
             sbyte syncedStyle = UltimateNetworkSync.ClientSyncedThrowStyle;
-
+            float syncedWobble = UltimateNetworkSync.ClientSyncedFlightWobble;
             if (UltimateNetworkSync.ClientDiscStates.TryGetValue(discNetId, out var syncEntry))
             {
                 holderId = syncEntry.HolderClientId;
                 syncedStyle = syncEntry.ThrowStyle;
+                syncedWobble = syncEntry.FlightWobble;
             }
             else if (!UltimateRulesManager.IsWarmup)
             {
                 holderId = UltimateNetworkSync.ClientSyncedHolderId;
             }
+
+            
 
             bool isHeld = (holderId != ulong.MaxValue && MonoBehaviourSingleton<PlayerManager>.Instance != null);
 
@@ -488,6 +500,28 @@ namespace PuckUltimateFrisbeeMod
 
             if (!isHeld && (isAirborne || _smoothedWorldSpeed > 0.25f))
             {
+                if (isHeld)
+                {
+                    _visualSpinAngle = 0f;
+                    _smoothedWorldSpeed = 0f;
+                    _visualWobble = 0f;
+                }
+                else
+                {
+                    if (_wasHeldLastFrame)
+                    {
+                        _visualWobble = syncedWobble;
+                    }
+                    else if (isAirborne)
+                    {
+                        _visualWobble = Mathf.MoveTowards(_visualWobble, 0f, dt * 0.28f);
+                    }
+                    else
+                    {
+                        _visualWobble = 0f;
+                    }
+                }
+                _wasHeldLastFrame = isHeld;
                 sbyte spinSign = syncedStyle == 0 ? (sbyte)1 : syncedStyle;
                 float speedFactor = isAirborne
                     ? Mathf.Clamp01(Mathf.Max(0.45f, _smoothedWorldSpeed / 15f))
