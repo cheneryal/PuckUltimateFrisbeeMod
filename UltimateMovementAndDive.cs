@@ -537,6 +537,561 @@ namespace PuckUltimateFrisbeeMod
     }
 
     // =========================================================================
+    // KEYBIND-AGNOSTIC JUMP & CROUCH/SLIDE READER (CLIENT & SERVER)
+    // Never falls back to hardcoded Space/Ctrl. Reads live InputActions,
+    // InputManager, PlayerInput wrappers, and Harmony-hooked native Jump calls.
+    // =========================================================================
+    public static class UltimateKeybindReader
+    {
+        private struct InputMemberBinding
+        {
+            public Type DeclaringType;
+            public MemberInfo OuterMember;
+            public MemberInfo ClientInner;
+            public MemberInfo ServerInner;
+            public MemberInfo ValueInner;
+            public bool IsDirectBool;
+            public bool IsCounter;
+        }
+
+        private static bool _membersScanned = false;
+        private static bool _loggedDiagnostics = false;
+        private static readonly List<InputMemberBinding> _jumpMembers = new List<InputMemberBinding>();
+        private static readonly List<InputMemberBinding> _crouchMembers = new List<InputMemberBinding>();
+        private static readonly List<MemberInfo> _actionContainerMembers = new List<MemberInfo>();
+
+        private static readonly List<UnityEngine.InputSystem.InputAction> _jumpActions =
+            new List<UnityEngine.InputSystem.InputAction>();
+        private static readonly List<UnityEngine.InputSystem.InputAction> _crouchActions =
+            new List<UnityEngine.InputSystem.InputAction>();
+
+        // Tracks counter-based jump inputs (e.g. int/uint/byte press counters)
+        private static readonly Dictionary<ulong, long> _lastJumpCounterClient = new Dictionary<ulong, long>();
+        private static readonly Dictionary<ulong, long> _lastJumpCounterServer = new Dictionary<ulong, long>();
+
+        private static float _lastActionScanTime = -999f;
+        private const float ActionRescanInterval = 1.5f;
+
+        private static Type _inputManagerType;
+
+        public static void ResetCache()
+        {
+            _jumpActions.Clear();
+            _crouchActions.Clear();
+            _lastJumpCounterClient.Clear();
+            _lastJumpCounterServer.Clear();
+            _lastActionScanTime = -999f;
+            _loggedDiagnostics = false;
+        }
+
+        private static void EnsureMembersScanned()
+        {
+            if (_membersScanned) return;
+            _membersScanned = true;
+
+            _inputManagerType = AccessTools.TypeByName("InputManager");
+
+            ScanType(typeof(PlayerInput));
+            ScanType(typeof(PlayerController));
+            if (_inputManagerType != null) ScanType(_inputManagerType);
+        }
+
+        private static void ScanType(Type type)
+        {
+            if (type == null) return;
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+
+            foreach (FieldInfo f in type.GetFields(flags))
+            {
+                ClassifyMember(f, f.Name, f.FieldType);
+            }
+            foreach (PropertyInfo p in type.GetProperties(flags))
+            {
+                if (!p.CanRead || p.GetIndexParameters().Length > 0) continue;
+                ClassifyMember(p, p.Name, p.PropertyType);
+            }
+        }
+
+        private static void ClassifyMember(MemberInfo member, string name, Type memberType)
+        {
+            if (memberType == null) return;
+
+            if (memberType == typeof(UnityEngine.InputSystem.InputAction) ||
+                memberType == typeof(UnityEngine.InputSystem.InputActionReference) ||
+                memberType == typeof(UnityEngine.InputSystem.InputActionMap) ||
+                memberType == typeof(UnityEngine.InputSystem.InputActionAsset) ||
+                typeof(UnityEngine.InputSystem.IInputActionCollection2).IsAssignableFrom(memberType))
+            {
+                _actionContainerMembers.Add(member);
+                return;
+            }
+
+            bool isJump = IsStrictInputMemberName(name, isJump: true);
+            bool isCrouch = !isJump && IsStrictInputMemberName(name, isJump: false);
+            if (!isJump && !isCrouch) return;
+
+            var targetList = isJump ? _jumpMembers : _crouchMembers;
+
+            if (memberType == typeof(bool))
+            {
+                targetList.Add(new InputMemberBinding
+                {
+                    DeclaringType = member.DeclaringType,
+                    OuterMember = member,
+                    IsDirectBool = true
+                });
+                return;
+            }
+
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+            MemberInfo clientInner = FindInnerValueMember(memberType, "ClientValue", flags, out bool cCounter);
+            MemberInfo serverInner = FindInnerValueMember(memberType, "ServerValue", flags, out bool sCounter);
+            MemberInfo valueInner = FindInnerValueMember(memberType, "Value", flags, out bool vCounter);
+
+            if (clientInner != null || serverInner != null || valueInner != null)
+            {
+                bool isCounter = cCounter || sCounter || vCounter;
+                // Only allow integer counters for jump (not crouch)
+                if (isCounter && !isJump) return;
+
+                targetList.Add(new InputMemberBinding
+                {
+                    DeclaringType = member.DeclaringType,
+                    OuterMember = member,
+                    ClientInner = clientInner,
+                    ServerInner = serverInner,
+                    ValueInner = valueInner,
+                    IsDirectBool = false,
+                    IsCounter = isCounter
+                });
+            }
+        }
+
+        private static MemberInfo FindInnerValueMember(Type t, string memberName, BindingFlags flags, out bool isCounter)
+        {
+            isCounter = false;
+            Type valType = null;
+            MemberInfo found = null;
+
+            PropertyInfo p = t.GetProperty(memberName, flags);
+            if (p != null && p.CanRead && p.GetIndexParameters().Length == 0)
+            {
+                valType = p.PropertyType;
+                found = p;
+            }
+            else
+            {
+                FieldInfo f = t.GetField(memberName, flags);
+                if (f != null)
+                {
+                    valType = f.FieldType;
+                    found = f;
+                }
+            }
+
+            if (found == null || valType == null) return null;
+
+            if (valType == typeof(bool) || valType == typeof(float))
+                return found;
+
+            if (valType == typeof(int) || valType == typeof(uint) || valType == typeof(byte) || valType == typeof(ulong))
+            {
+                isCounter = true;
+                return found;
+            }
+
+            return null;
+        }
+
+        private static bool IsStrictInputMemberName(string name, bool isJump)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            string lower = name.ToLowerInvariant().TrimStart('_');
+            if (lower.Contains("sky") || lower.Contains("slider") || lower.Contains("time") ||
+                lower.Contains("cooldown") || lower.Contains("force") || lower.Contains("vel") ||
+                lower.Contains("speed") || lower.Contains("height") || lower.Contains("stamina") ||
+                lower.Contains("audio") || lower.Contains("sound") || lower.Contains("can") ||
+                lower.Contains("allow") || lower.Contains("has") || lower.Contains("was") ||
+                lower.Contains("last") || lower.Contains("prev"))
+                return false;
+
+            if (isJump)
+            {
+                return lower == "jump" || lower == "jumpinput" || lower == "isjumping" ||
+                       (lower.Contains("jump") && (lower.Contains("input") || lower.Contains("action") || lower.Contains("press")));
+            }
+            else
+            {
+                return lower == "slide" || lower == "slideinput" || lower == "issliding" ||
+                       lower == "crouch" || lower == "crouchinput" || lower == "iscrouching" ||
+                       ((lower.Contains("slide") || lower.Contains("crouch")) &&
+                        (lower.Contains("input") || lower.Contains("action") || lower.Contains("press")));
+            }
+        }
+
+        private static bool IsJumpActionName(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            string lower = name.ToLowerInvariant();
+            return lower.Contains("jump") && !lower.Contains("sky");
+        }
+
+        private static bool IsCrouchActionName(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return false;
+            string lower = name.ToLowerInvariant();
+            if (lower.Contains("slider")) return false;
+            return lower.Contains("slide") || lower.Contains("crouch") || lower.Contains("duck");
+        }
+
+        private static bool IsExcludedActionMap(UnityEngine.InputSystem.InputAction action)
+        {
+            string mapName = action?.actionMap?.name;
+            if (string.IsNullOrEmpty(mapName)) return false;
+            string lower = mapName.ToLowerInvariant();
+            return lower.Contains("ui") || lower.Contains("menu") || lower.Contains("chat") || lower.Contains("debug");
+        }
+
+        private static bool HasEnabledAction(List<UnityEngine.InputSystem.InputAction> actions)
+        {
+            for (int i = 0; i < actions.Count; i++)
+            {
+                if (actions[i] != null && actions[i].enabled) return true;
+            }
+            return false;
+        }
+
+        private static void TryRegisterAction(UnityEngine.InputSystem.InputAction action, string hintName = null)
+        {
+            if (action == null || IsExcludedActionMap(action)) return;
+
+            bool isJump = IsJumpActionName(action.name) || IsJumpActionName(hintName);
+            bool isCrouch = !isJump && (IsCrouchActionName(action.name) || IsCrouchActionName(hintName));
+
+            if (isJump && !_jumpActions.Contains(action))
+                _jumpActions.Add(action);
+            else if (isCrouch && !_crouchActions.Contains(action))
+                _crouchActions.Add(action);
+        }
+
+        private static object GetInputManagerInstance()
+        {
+            if (_inputManagerType == null) return null;
+            try
+            {
+                var prop = AccessTools.Property(_inputManagerType, "Instance");
+                if (prop != null) return prop.GetValue(null);
+                var field = AccessTools.Field(_inputManagerType, "Instance");
+                if (field != null) return field.GetValue(null);
+            }
+            catch { }
+            return null;
+        }
+
+        private static void CollectActionsFromInstance(object instance)
+        {
+            if (instance == null) return;
+            Type instType = instance.GetType();
+
+            for (int i = 0; i < _actionContainerMembers.Count; i++)
+            {
+                MemberInfo m = _actionContainerMembers[i];
+                if (m.DeclaringType == null || !m.DeclaringType.IsAssignableFrom(instType)) continue;
+
+                try
+                {
+                    object val = ReadMember(m, instance);
+                    if (val == null) continue;
+
+                    if (val is UnityEngine.InputSystem.InputAction directAction)
+                    {
+                        TryRegisterAction(directAction, m.Name);
+                    }
+                    else if (val is UnityEngine.InputSystem.InputActionReference actionRef)
+                    {
+                        TryRegisterAction(actionRef.action, m.Name);
+                    }
+                    else if (val is UnityEngine.InputSystem.InputActionMap map)
+                    {
+                        var actions = map.actions;
+                        for (int a = 0; a < actions.Count; a++) TryRegisterAction(actions[a]);
+                    }
+                    else if (val is UnityEngine.InputSystem.InputActionAsset asset)
+                    {
+                        var maps = asset.actionMaps;
+                        for (int mi = 0; mi < maps.Count; mi++)
+                        {
+                            var actions = maps[mi].actions;
+                            for (int a = 0; a < actions.Count; a++) TryRegisterAction(actions[a]);
+                        }
+                    }
+                    else if (val is UnityEngine.InputSystem.IInputActionCollection2 collection)
+                    {
+                        foreach (var a in collection) TryRegisterAction(a);
+                    }
+                }
+                catch { }
+            }
+        }
+
+        private static void RefreshClientActions(Player localPlayer)
+        {
+            bool needsScan = _lastActionScanTime < 0f ||
+                             ((Time.unscaledTime - _lastActionScanTime) >= ActionRescanInterval &&
+                              (!HasEnabledAction(_jumpActions) || !HasEnabledAction(_crouchActions)));
+            if (!needsScan) return;
+
+            _lastActionScanTime = Time.unscaledTime;
+            _jumpActions.Clear();
+            _crouchActions.Clear();
+
+            CollectActionsFromInstance(GetInputManagerInstance());
+            if (localPlayer != null)
+            {
+                CollectActionsFromInstance(localPlayer.PlayerInput);
+                CollectActionsFromInstance(localPlayer.GetComponent(typeof(PlayerController)));
+            }
+
+            if (!HasEnabledAction(_jumpActions) || !HasEnabledAction(_crouchActions))
+            {
+                try
+                {
+                    var enabledActions = UnityEngine.InputSystem.InputSystem.ListEnabledActions();
+                    for (int i = 0; i < enabledActions.Count; i++)
+                    {
+                        TryRegisterAction(enabledActions[i]);
+                    }
+                }
+                catch { }
+            }
+
+            if (!_loggedDiagnostics)
+            {
+                _loggedDiagnostics = true;
+                LogDiagnostics();
+            }
+        }
+
+        private static void LogDiagnostics()
+        {
+            try
+            {
+                string FormatActions(List<UnityEngine.InputSystem.InputAction> list)
+                {
+                    if (list.Count == 0) return "NONE";
+                    return string.Join(", ", list.Select(a =>
+                    {
+                        var paths = new List<string>();
+                        for (int i = 0; i < a.bindings.Count; i++) paths.Add(a.bindings[i].effectivePath);
+                        return $"{a.actionMap?.name}/{a.name}[{string.Join("|", paths)}](enabled={a.enabled})";
+                    }));
+                }
+
+                string jumpMem = _jumpMembers.Count == 0 ? "NONE" : string.Join(", ", _jumpMembers.Select(m => $"{m.DeclaringType.Name}.{m.OuterMember.Name}(counter={m.IsCounter})"));
+                string crouchMem = _crouchMembers.Count == 0 ? "NONE" : string.Join(", ", _crouchMembers.Select(m => $"{m.DeclaringType.Name}.{m.OuterMember.Name}"));
+
+                Debug.Log($"[UltimateKeybindReader] JumpActions={FormatActions(_jumpActions)} | CrouchActions={FormatActions(_crouchActions)} | JumpMembers={jumpMem} | CrouchMembers={crouchMem} | HookedJumpMethods={JumpInput_SkyJumpHook_Patch.HookedMethodSummary}");
+            }
+            catch { }
+        }
+
+        private static object ReadMember(MemberInfo m, object instance)
+        {
+            if (m is FieldInfo fi) return fi.GetValue(instance);
+            if (m is PropertyInfo pi) return pi.GetValue(instance);
+            return null;
+        }
+
+        private static bool EvaluateMembers(
+            ulong playerKey,
+            object instance,
+            List<InputMemberBinding> members,
+            bool isServer,
+            out bool counterIncremented)
+        {
+            counterIncremented = false;
+            if (instance == null) return false;
+            Type instType = instance.GetType();
+            bool anyHeld = false;
+
+            for (int i = 0; i < members.Count; i++)
+            {
+                var b = members[i];
+                if (b.DeclaringType == null || !b.DeclaringType.IsAssignableFrom(instType)) continue;
+
+                try
+                {
+                    object outerVal = ReadMember(b.OuterMember, instance);
+                    if (b.IsDirectBool)
+                    {
+                        if (outerVal is bool bv && bv) anyHeld = true;
+                        continue;
+                    }
+
+                    if (outerVal == null) continue;
+                    MemberInfo inner = isServer ? (b.ServerInner ?? b.ValueInner) : (b.ClientInner ?? b.ValueInner);
+                    if (inner == null) continue;
+
+                    object innerVal = ReadMember(inner, outerVal);
+                    if (b.IsCounter)
+                    {
+                        long current = Convert.ToInt64(innerVal);
+                        var cache = isServer ? _lastJumpCounterServer : _lastJumpCounterClient;
+                        ulong key = (playerKey * 31UL) + (ulong)i;
+                        if (cache.TryGetValue(key, out long prev) && current != prev)
+                        {
+                            counterIncremented = true;
+                        }
+                        cache[key] = current;
+                    }
+                    else
+                    {
+                        if (innerVal is bool ib && ib) anyHeld = true;
+                        else if (innerVal is float f && f > 0.5f) anyHeld = true;
+                    }
+                }
+                catch { }
+            }
+
+            return anyHeld;
+        }
+
+        public static bool IsCrouchHeldClient(Player localPlayer)
+        {
+            EnsureMembersScanned();
+            RefreshClientActions(localPlayer);
+
+            for (int i = 0; i < _crouchActions.Count; i++)
+            {
+                var action = _crouchActions[i];
+                if (action != null && action.enabled && action.IsPressed()) return true;
+            }
+
+            if (localPlayer != null && localPlayer.PlayerInput != null)
+            {
+                if (EvaluateMembers(localPlayer.NetworkObjectId, localPlayer.PlayerInput, _crouchMembers, isServer: false, out _))
+                    return true;
+            }
+
+            return false;
+        }
+
+        public static void CheckJumpClient(Player localPlayer, out bool pressedThisFrame, out bool isHeld)
+        {
+            EnsureMembersScanned();
+            RefreshClientActions(localPlayer);
+
+            pressedThisFrame = false;
+            isHeld = false;
+
+            for (int i = 0; i < _jumpActions.Count; i++)
+            {
+                var action = _jumpActions[i];
+                if (action == null || !action.enabled) continue;
+                if (action.WasPressedThisFrame()) pressedThisFrame = true;
+                if (action.IsPressed()) isHeld = true;
+            }
+
+            if (localPlayer != null && localPlayer.PlayerInput != null)
+            {
+                bool held = EvaluateMembers(localPlayer.NetworkObjectId, localPlayer.PlayerInput, _jumpMembers, isServer: false, out bool counterFired);
+                if (counterFired) pressedThisFrame = true;
+                if (held) isHeld = true;
+            }
+        }
+
+        public static bool IsCrouchHeldServer(Player player)
+        {
+            if (player == null || player.PlayerInput == null) return false;
+            EnsureMembersScanned();
+            return EvaluateMembers(player.NetworkObjectId, player.PlayerInput, _crouchMembers, isServer: true, out _);
+        }
+
+        public static bool CheckJumpServer(Player player, out bool counterFired)
+        {
+            counterFired = false;
+            if (player == null || player.PlayerInput == null) return false;
+            EnsureMembersScanned();
+            return EvaluateMembers(player.NetworkObjectId, player.PlayerInput, _jumpMembers, isServer: true, out counterFired);
+        }
+    }
+
+    // Intercepts Puck's native Jump callbacks/RPCs on PlayerInput, PlayerController & PlayerBody
+    // so ANY rebound Jump key triggers Sky Jump immediately when crouched/recently crouched.
+    [HarmonyPatch]
+    public static class JumpInput_SkyJumpHook_Patch
+    {
+        private static readonly List<MethodBase> _targets = new List<MethodBase>();
+        public static string HookedMethodSummary { get; private set; } = "NONE";
+
+        [HarmonyPrepare]
+        public static bool Prepare()
+        {
+            _targets.Clear();
+            Type[] candidateTypes = { typeof(PlayerInput), typeof(PlayerController), typeof(PlayerBody) };
+
+            foreach (Type t in candidateTypes)
+            {
+                if (t == null) continue;
+                foreach (MethodInfo m in AccessTools.GetDeclaredMethods(t))
+                {
+                    if (m == null || m.IsAbstract || m.IsStatic || m.IsSpecialName || m.ContainsGenericParameters)
+                        continue;
+
+                    string lower = m.Name.ToLowerInvariant();
+                    if (!lower.Contains("jump")) continue;
+
+                    if (lower.Contains("sky") || lower.Contains("cancel") || lower.Contains("stop") ||
+                        lower.Contains("end") || lower.Contains("release") || lower.Contains("reset") ||
+                        lower.Contains("clear") || lower.Contains("audio") || lower.Contains("sound") ||
+                        lower.Contains("anim") || lower.Contains("can"))
+                        continue;
+
+                    _targets.Add(m);
+                }
+            }
+
+            HookedMethodSummary = _targets.Count == 0
+                ? "NONE"
+                : string.Join(", ", _targets.Select(m => $"{m.DeclaringType?.Name}.{m.Name}"));
+
+            return _targets.Count > 0;
+        }
+
+        [HarmonyTargetMethods]
+        public static IEnumerable<MethodBase> TargetMethods() => _targets;
+
+        [HarmonyPrefix]
+        public static void Prefix(object __instance, object[] __args)
+        {
+            if (__instance == null) return;
+
+            // If this is a Unity InputAction callback, ignore Canceled (key release)
+            if (__args != null && __args.Length == 1 &&
+                __args[0] is UnityEngine.InputSystem.InputAction.CallbackContext ctx)
+            {
+                if (ctx.canceled) return;
+            }
+
+            Player player = null;
+            if (__instance is PlayerInput pi) player = pi.Player;
+            else if (__instance is PlayerBody pb) player = pb.Player;
+            else if (__instance is Component comp) player = comp.GetComponentInParent<Player>() ?? comp.GetComponent<Player>();
+
+            if (player == null) return;
+
+            if (NetworkRoles.IsServer)
+            {
+                UltimateDiveMod.ServerTrySkyJump(player);
+            }
+            if (player.IsLocalPlayer)
+            {
+                UltimateDiveClientInput.OnNativeJumpDetected(player);
+            }
+        }
+    }
+
+    // =========================================================================
     // ULTIMATE FRISBEE LAYOUT / DIVING, STRAFE, SKY JUMP & THROW CLUTCH NETWORKING
     // =========================================================================
     public static class UltimateDiveMod
@@ -560,6 +1115,7 @@ namespace PuckUltimateFrisbeeMod
         internal static readonly Dictionary<ulong, float> LastCrouchTime = new Dictionary<ulong, float>();
         internal static readonly Dictionary<ulong, float> LastSkyJumpTime = new Dictionary<ulong, float>();
         internal static readonly Dictionary<ulong, bool> WasJumpingLastTick = new Dictionary<ulong, bool>();
+        internal static readonly Dictionary<ulong, float> LastGroundedTime = new Dictionary<ulong, float>();
 
         public static float StrafeRunSpeed = 5.8f;
         public static float StrafeSprintSpeed = 7.6f;
@@ -594,6 +1150,7 @@ namespace PuckUltimateFrisbeeMod
             LastCrouchTime.Clear();
             LastSkyJumpTime.Clear();
             WasJumpingLastTick.Clear();
+            UltimateKeybindReader.ResetCache();
             UltimateDiscTrackSuppressor.RestoreDisabledActions();
             UltimateLocalThrowTelemetry.ResetHoldingState();
         }
@@ -716,13 +1273,19 @@ namespace PuckUltimateFrisbeeMod
             var rb = body.Rigidbody;
             ulong id = player.NetworkObjectId;
 
-            if (IsFaceOff() || !body.IsGrounded || (body.HasFallen != null && body.HasFallen.Value)) return;
+            bool recentlyGrounded = body.IsGrounded ||
+                (LastGroundedTime.TryGetValue(id, out float lastGroundT) &&
+                 (Time.time - lastGroundT) <= 0.12f &&
+                 rb.linearVelocity.y >= -0.5f);
+
+            if (IsFaceOff() || !recentlyGrounded || (body.HasFallen != null && body.HasFallen.Value)) return;
             if (UltimateRulesManager.Holder == player || UltimateNetworkSync.IsPlayerHoldingAnyDisc(player.OwnerClientId)) return;
 
             if (LastSkyJumpTime.TryGetValue(id, out float lastJump) && (Time.time - lastJump) < 0.65f) return;
 
-            bool isCrouched = body.IsSliding != null && body.IsSliding.Value;
-            bool recentlyCrouched = LastCrouchTime.TryGetValue(id, out float crouchT) && (Time.time - crouchT) <= 0.30f;
+            bool isCrouched = (body.IsSliding != null && body.IsSliding.Value) ||
+                              UltimateKeybindReader.IsCrouchHeldServer(player);
+            bool recentlyCrouched = LastCrouchTime.TryGetValue(id, out float crouchT) && (Time.time - crouchT) <= 0.35f;
             if (!isCrouched && !recentlyCrouched) return;
 
             if (body.Stamina != null && body.Stamina.Value < SkyJumpStaminaCost) return;
@@ -854,42 +1417,65 @@ namespace PuckUltimateFrisbeeMod
         private const float ClientDiveCooldown = 0.5f;
         private sbyte _lastSentStrafe = 0;
         private float _lastLocalCrouchTime = -999f;
-
+        private bool _wasJumpHeldLastFrame = false;
         private bool _wasHoldingDisc = false;
         private bool _isLmbClutchSent = false;
         private bool _requireFreshLmbPress = false;
         private Vector3 _localPivotAnchor = Vector3.zero;
         private bool _hasLocalPivotAnchor = false;
         private float _localCatchStartTime = 0f;
+        private static UltimateDiveClientInput _localInstance;
+        private int _lastSkyJumpSentFrame = -1;
+
+        public static void OnNativeJumpDetected(Player player)
+        {
+            var inst = _localInstance;
+            if (inst == null || inst.Body == null || inst.Body.Player != player) return;
+            if (IsTypingOrPaused()) return;
+            if (UltimateNetworkSync.IsPlayerHoldingAnyDisc(player.OwnerClientId)) return;
+
+            bool isCrouchedNow = (inst.Body.IsSliding != null && inst.Body.IsSliding.Value) ||
+                                 UltimateKeybindReader.IsCrouchHeldClient(player);
+            if (isCrouchedNow) inst._lastLocalCrouchTime = Time.unscaledTime;
+
+            if ((Time.unscaledTime - inst._lastLocalCrouchTime) <= 0.35f &&
+                inst._lastSkyJumpSentFrame != Time.frameCount)
+            {
+                inst._lastSkyJumpSentFrame = Time.frameCount;
+                UltimateDiveMod.ClientSendSkyJumpAction();
+            }
+        }
 
         private static bool IsTypingOrPaused()
         {
             if (Time.timeScale <= 0f) return true;
             if (Cursor.visible && Cursor.lockState != CursorLockMode.Locked) return true;
-
+            
             try
             {
                 var chat = MonoBehaviourSingleton<UIManager>.Instance?.Chat;
                 if (chat != null && chat.IsFocused) return true;
             }
             catch { }
-
             return false;
         }
 
         private void OnDisable()
         {
+            _wasJumpHeldLastFrame = false;
             if (_wasHoldingDisc)
             {
                 UltimateDiscTrackSuppressor.ApplySuppressionState(Body?.Player, false);
                 UltimateLocalThrowTelemetry.ResetHoldingState();
                 _wasHoldingDisc = false;
             }
+            if (_localInstance == this) _localInstance = null;
         }
 
         private void Update()
         {
             if (Body == null || Body.Player == null || !Body.Player.IsLocalPlayer) return;
+            _localInstance = this;
 
             var kb = UnityEngine.InputSystem.Keyboard.current;
             var mouse = UnityEngine.InputSystem.Mouse.current;
@@ -937,6 +1523,7 @@ namespace PuckUltimateFrisbeeMod
 
             if (IsTypingOrPaused())
             {
+                _wasJumpHeldLastFrame = false;
                 if (_lastSentStrafe != 0)
                 {
                     _lastSentStrafe = 0;
@@ -968,20 +1555,28 @@ namespace PuckUltimateFrisbeeMod
             // --- 2. HOLDING DISC: LMB CLUTCH + COIL/WHIP + PUMP FAKE + LIVE HUD TELEMETRY ---
             if (isHolding)
             {
+                UltimateKeybindReader.CheckJumpClient(player, out _, out _wasJumpHeldLastFrame);
                 UpdateHoldingDiscControls(player, kb, mouse);
                 return;
             }
 
-            // --- 3. CROUCH + JUMP (CTRL + SPACE) SKY JUMP ---
-            bool isCrouchHeld = (kb != null && (kb.leftCtrlKey.isPressed || kb.rightCtrlKey.isPressed)) ||
+            // --- 3. CROUCH + JUMP (RESPECTS CUSTOM BASE-GAME KEYBINDS) SKY JUMP ---
+            bool isCrouchHeld = UltimateKeybindReader.IsCrouchHeldClient(player) ||
                                 (Body.IsSliding != null && Body.IsSliding.Value);
             if (isCrouchHeld)
             {
                 _lastLocalCrouchTime = Time.unscaledTime;
             }
 
-            if (kb != null && kb.spaceKey.wasPressedThisFrame && (Time.unscaledTime - _lastLocalCrouchTime) <= 0.30f)
+            UltimateKeybindReader.CheckJumpClient(player, out bool jumpPressedThisFrame, out bool isJumpHeld);
+            bool jumpTriggered = jumpPressedThisFrame || (isJumpHeld && !_wasJumpHeldLastFrame);
+            _wasJumpHeldLastFrame = isJumpHeld;
+
+            if (jumpTriggered &&
+                (Time.unscaledTime - _lastLocalCrouchTime) <= 0.35f &&
+                _lastSkyJumpSentFrame != Time.frameCount)
             {
+                _lastSkyJumpSentFrame = Time.frameCount;
                 UltimateDiveMod.ClientSendSkyJumpAction();
             }
 
@@ -1247,20 +1842,27 @@ namespace PuckUltimateFrisbeeMod
             }
 
             // -----------------------------------------------------------------
-            // 1. TRACK CROUCH (SLIDING) & VANILLA JUMP TRANSITION FOR SKY JUMPS
+            // 1. TRACK GROUNDED, CROUCH (SLIDING) & JUMP INPUT FOR SKY JUMPS
             // -----------------------------------------------------------------
-            if (__instance.IsSliding != null && __instance.IsSliding.Value)
+            if (__instance.IsGrounded)
+            {
+                UltimateDiveMod.LastGroundedTime[id] = Time.time;
+            }
+
+            if ((__instance.IsSliding != null && __instance.IsSliding.Value) ||
+                UltimateKeybindReader.IsCrouchHeldServer(player))
             {
                 UltimateDiveMod.LastCrouchTime[id] = Time.time;
             }
 
-            bool isJumpingNow = __instance.IsJumping;
+            bool serverJumpHeld = UltimateKeybindReader.CheckJumpServer(player, out bool serverJumpCounter);
+            bool isJumpingNow = __instance.IsJumping || serverJumpHeld;
             bool wasJumping = UltimateDiveMod.WasJumpingLastTick.TryGetValue(id, out bool wj) && wj;
             UltimateDiveMod.WasJumpingLastTick[id] = isJumpingNow;
 
-            if (isJumpingNow && !wasJumping &&
+            if ((serverJumpCounter || (isJumpingNow && !wasJumping)) &&
                 UltimateDiveMod.LastCrouchTime.TryGetValue(id, out float lastCrouchT) &&
-                (Time.time - lastCrouchT) <= 0.30f)
+                (Time.time - lastCrouchT) <= 0.35f)
             {
                 UltimateDiveMod.ServerTrySkyJump(player);
             }
@@ -1403,6 +2005,7 @@ namespace PuckUltimateFrisbeeMod
             UltimateRulesManager.ClearPivotAnchor(player.OwnerClientId);
             UltimateDiveMod.LastCrouchTime.Remove(id);
             UltimateDiveMod.LastSkyJumpTime.Remove(id);
+            UltimateDiveMod.LastGroundedTime.Remove(id);
             UltimateDiveMod.WasJumpingLastTick.Remove(id);
             PlayerBody_DiveAutoClearAndDrag_Patch.CachedSkates.Remove(id);
         }
