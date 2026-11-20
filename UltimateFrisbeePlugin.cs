@@ -132,7 +132,7 @@ namespace PuckUltimateFrisbeeMod
         public static float WristRollMultiplier = 3.25f;
 
         // Hard-coded from your in-game F8 fine-tuning:
-        public static Vector3 HeldDiscHandOffset = new Vector3(-0.068f, 0.125f, 0.128f);
-        public static Vector3 HeldDiscPitchOffset = new Vector3(-12.9f, 0f, 2.6f);
+        public static Vector3 HeldDiscHandOffset = new Vector3(-0.068f, 0.125f, 0.061f);
+        public static Vector3 HeldDiscPitchOffset = new Vector3(-13.4f, 0f, 2.6f);
     }
 }
