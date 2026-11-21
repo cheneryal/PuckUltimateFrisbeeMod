@@ -23,6 +23,7 @@ namespace PuckUltimateFrisbeeMod
     [HarmonyPatch(typeof(Level), "OnNetworkPostSpawn")]
     public static class Level_GrassStadiumSetup_Patch
     {
+        public static float VisualGroundSurfaceY = 0f;
         private static int _cachedBarrierLayer = -1;
         private static PhysicsMaterial _cachedBarrierMaterial = null;
         private static PhysicsMaterial _cachedIceMaterial = null;
@@ -532,6 +533,7 @@ namespace PuckUltimateFrisbeeMod
                 SetupFenceColliders(customField.transform, fieldRoot.transform, barrierLayer, iceLayer, wallMat);
             }
 
+            VisualGroundSurfaceY = visualGrassTopY;
             // Create our unified 350m x 350m Ground Collider on the ICE LAYER so players can walk smoothly
             // everywhere (including behind the endzones up to the fences) and NEVER fall through the map!
             GameObject turfObj = GameObject.CreatePrimitive(PrimitiveType.Cube);

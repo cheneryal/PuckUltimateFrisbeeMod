@@ -587,8 +587,18 @@ namespace PuckUltimateFrisbeeMod
         }
 
         public static bool IsWarmup =>
-            NetworkBehaviourSingleton<GameManager>.Instance == null ||
-            NetworkBehaviourSingleton<GameManager>.Instance.Phase != GamePhase.Play;
+        NetworkBehaviourSingleton<GameManager>.Instance == null ||
+        NetworkBehaviourSingleton<GameManager>.Instance.Phase == GamePhase.Warmup;
+
+        public static bool IsLiveDiscPhase
+        {
+            get
+            {
+                if (NetworkBehaviourSingleton<GameManager>.Instance == null) return true;
+                GamePhase phase = NetworkBehaviourSingleton<GameManager>.Instance.Phase;
+                return phase == GamePhase.Play || phase == GamePhase.Warmup;
+            }
+        }
 
         public static void Initialize()
         {
@@ -964,6 +974,11 @@ namespace PuckUltimateFrisbeeMod
                         EnforceGoalLineLineup(__instance);
                         return;
                     }
+
+                    if (!UltimateRulesManager.IsLiveDiscPhase)
+                    {
+                        return;
+                    }
                 }
 
                 if (!isWarmup && UltimateRulesManager.IsPullPlay)
@@ -1200,9 +1215,37 @@ namespace PuckUltimateFrisbeeMod
                     float discFlatness = Mathf.Clamp01(Mathf.Abs(discUp.y));
                     float bladeFactor = 1f - discFlatness;
 
+                    // Tuning knobs for 50/50 arbitration & post-block separation:
+                    const float SimultaneousOffenseTieWindow = 0.08f;   // 8 cm window where a true 50/50 goes to Offense (set 0f for pure closest-hand)
+                    const float PostDefensiveBlockCatchLockout = 0.10f; // Brief lockout so a hand-blocked disc isn't instantly caught 1 tick later
+
+                    bool inDefensiveBlockLockout = !isWarmup &&
+                                                   UltimateRulesManager.WasDefensiveBlock &&
+                                                   (Time.time - UltimateRulesManager.LastDeflectionTime < PostDefensiveBlockCatchLockout);
+
+                    // Order-independent ground pickup candidate
+                    Player bestGroundPicker = null;
+                    float bestGroundDist = float.MaxValue;
+
+                    // Order-independent airborne catch candidates
+                    Player bestAnyCatcher = null;
+                    float bestAnyCatchDist = float.MaxValue;
+                    float bestAnyCatchT = float.MaxValue;
+
+                    Player bestOffenseCatcher = null;
+                    float bestOffenseCatchDist = float.MaxValue;
+                    float bestOffenseCatchT = float.MaxValue;
+
+                    // Order-independent airborne deflection fallback (only used if NO player cleanly catches this tick)
+                    Player bestDeflector = null;
+                    Vector3 bestDeflectCenter = Vector3.zero;
+                    bool bestDeflectIsHand = false;
+                    float bestDeflectDist = float.MaxValue;
+                    float bestDeflectT = float.MaxValue;
+
                     foreach (Player player in allPlayers)
                     {
-                        if (!player.IsCharacterSpawned || player.Stick == null || player.PlayerBody == null)
+                        if (player == null || !player.IsCharacterSpawned || player.Stick == null || player.PlayerBody == null)
                             continue;
 
                         if (isWarmup && UltimateNetworkSync.IsPlayerHoldingAnyDisc(player.OwnerClientId))
@@ -1222,17 +1265,18 @@ namespace PuckUltimateFrisbeeMod
                         Vector3 bodyBasePos = player.PlayerBody.transform.position;
                         bool isDiving = UltimateDiveMod.IsPlayerDiving(player);
 
-                        Vector3 closestDiscPt = ClosestPointOnSegment(sweptStartPos, discPos, handPos);
+                        Vector3 closestDiscPt = ClosestPointOnSegment(sweptStartPos, discPos, handPos, out float sweepT);
                         float sweptHandDist = Vector3.Distance(closestDiscPt, handPos);
 
                         Vector3 chestCatchPt = bodyBasePos + Vector3.up * 1.05f + player.PlayerBody.transform.forward * 0.25f;
                         float chestDist = Vector3.Distance(closestDiscPt, chestCatchPt);
 
-                        // 1. GROUND PICKUP
+                        // 1. GROUND PICKUP (pick closest eligible player)
                         if (!isAirborne)
                         {
                             if (player == UltimateRulesManager.LastThrower && timeSinceRelease < 0.35f)
                                 continue;
+
                             float horizFootDist = Vector2.Distance(
                                 new Vector2(discPos.x, discPos.z),
                                 new Vector2(bodyBasePos.x, bodyBasePos.z));
@@ -1265,14 +1309,18 @@ namespace PuckUltimateFrisbeeMod
 
                                 if (canPickup)
                                 {
-                                    HandlePlayerCatch(__instance, player);
-                                    return;
+                                    float groundMetric = Mathf.Min(sweptHandDist, Mathf.Min(horizHandDist, horizFootDist));
+                                    if (groundMetric < bestGroundDist)
+                                    {
+                                        bestGroundDist = groundMetric;
+                                        bestGroundPicker = player;
+                                    }
                                 }
                             }
                             continue;
                         }
 
-                        // 2. AIRBORNE INTERACTIONS
+                        // 2. AIRBORNE INTERACTIONS (collect all candidates first, resolve after loop)
                         if (!isWarmup && UltimateRulesManager.IsCurrentThrowPull && !UltimateRulesManager.WasTippedInFlight && playerTeam == UltimateRulesManager.PullingTeam)
                             continue;
 
@@ -1311,13 +1359,38 @@ namespace PuckUltimateFrisbeeMod
                             cleanCatchRadius = Mathf.Max(cleanCatchRadius, 0.64f);
                         }
 
-                        bool caughtByHand = !isPointBlankMarkBlock && (sweptHandDist <= cleanCatchRadius);
-                        bool caughtInBreadbasket = !isPointBlankMarkBlock && (discFlatness > 0.72f && chestDist <= 0.42f && sweptHandDist <= 0.80f);
+                        bool caughtByHand = !inDefensiveBlockLockout && !isPointBlankMarkBlock && (sweptHandDist <= cleanCatchRadius);
+                        bool caughtInBreadbasket = !inDefensiveBlockLockout && !isPointBlankMarkBlock && (discFlatness > 0.72f && chestDist <= 0.42f && sweptHandDist <= 0.80f);
 
                         if (caughtByHand || caughtInBreadbasket)
                         {
-                            HandlePlayerCatch(__instance, player);
-                            return;
+                            float catchMetric = caughtByHand ? sweptHandDist : Mathf.Min(sweptHandDist, chestDist + 0.15f);
+
+                            if (bestAnyCatcher == null ||
+                                catchMetric < bestAnyCatchDist - 0.015f ||
+                                (Mathf.Abs(catchMetric - bestAnyCatchDist) <= 0.015f && sweepT < bestAnyCatchT))
+                            {
+                                bestAnyCatcher = player;
+                                bestAnyCatchDist = catchMetric;
+                                bestAnyCatchT = sweepT;
+                            }
+
+                            if (!isWarmup &&
+                                UltimateRulesManager.OffensiveTeam != PlayerTeam.None &&
+                                playerTeam == UltimateRulesManager.OffensiveTeam)
+                            {
+                                if (bestOffenseCatcher == null ||
+                                    catchMetric < bestOffenseCatchDist - 0.015f ||
+                                    (Mathf.Abs(catchMetric - bestOffenseCatchDist) <= 0.015f && sweepT < bestOffenseCatchT))
+                                {
+                                    bestOffenseCatcher = player;
+                                    bestOffenseCatchDist = catchMetric;
+                                    bestOffenseCatchT = sweepT;
+                                }
+                            }
+
+                            // Clean catch candidates should not also be evaluated as tips
+                            continue;
                         }
 
                         if (player == UltimateRulesManager.LastDeflector && (Time.time - UltimateRulesManager.LastDeflectionTime < 0.45f))
@@ -1326,8 +1399,19 @@ namespace PuckUltimateFrisbeeMod
                         float outerTipRadius = Mathf.Lerp(0.64f, 0.72f, bladeFactor) + (isDiving ? 0.25f : 0f);
                         if (sweptHandDist <= outerTipRadius)
                         {
-                            ApplyAirborneDeflection(__instance, rb, player, handPos, isHandTip: true, bladeFactor: bladeFactor);
-                            break;
+                            bool betterHandTip = !bestDeflectIsHand ||
+                                                 sweptHandDist < bestDeflectDist - 0.015f ||
+                                                 (Mathf.Abs(sweptHandDist - bestDeflectDist) <= 0.015f && sweepT < bestDeflectT);
+
+                            if (betterHandTip)
+                            {
+                                bestDeflector = player;
+                                bestDeflectCenter = handPos;
+                                bestDeflectIsHand = true;
+                                bestDeflectDist = sweptHandDist;
+                                bestDeflectT = sweepT;
+                            }
+                            continue;
                         }
 
                         float horizBodyDist = Vector2.Distance(
@@ -1335,11 +1419,51 @@ namespace PuckUltimateFrisbeeMod
                             new Vector2(bodyBasePos.x, bodyBasePos.z));
                         float relativeHeight = discPos.y - bodyBasePos.y;
 
-                        if (horizBodyDist <= 0.45f && relativeHeight >= 0.05f && relativeHeight <= 1.70f)
+                        if (!bestDeflectIsHand && horizBodyDist <= 0.45f && relativeHeight >= 0.05f && relativeHeight <= 1.70f)
                         {
-                            Vector3 bodyCenter = bodyBasePos + Vector3.up * Mathf.Clamp(relativeHeight, 0.3f, 1.3f);
-                            ApplyAirborneDeflection(__instance, rb, player, bodyCenter, isHandTip: false, bladeFactor: bladeFactor);
-                            break;
+                            if (horizBodyDist < bestDeflectDist)
+                            {
+                                bestDeflector = player;
+                                bestDeflectCenter = bodyBasePos + Vector3.up * Mathf.Clamp(relativeHeight, 0.3f, 1.3f);
+                                bestDeflectIsHand = false;
+                                bestDeflectDist = horizBodyDist;
+                                bestDeflectT = sweepT;
+                            }
+                        }
+                    }
+
+                    // --- RESOLVE WINNER AFTER EVALUATING ALL PLAYERS ---
+                    if (!isAirborne)
+                    {
+                        if (bestGroundPicker != null)
+                        {
+                            HandlePlayerCatch(__instance, bestGroundPicker);
+                            return;
+                        }
+                    }
+                    else
+                    {
+                        if (bestAnyCatcher != null)
+                        {
+                            Player winningCatcher = bestAnyCatcher;
+
+                            // Official Ultimate rule: true simultaneous 50/50 catch goes to Offense
+                            if (!isWarmup &&
+                                SimultaneousOffenseTieWindow > 0f &&
+                                bestOffenseCatcher != null &&
+                                bestOffenseCatcher != bestAnyCatcher &&
+                                (bestOffenseCatchDist - bestAnyCatchDist) <= SimultaneousOffenseTieWindow)
+                            {
+                                winningCatcher = bestOffenseCatcher;
+                            }
+
+                            HandlePlayerCatch(__instance, winningCatcher);
+                            return;
+                        }
+
+                        if (bestDeflector != null)
+                        {
+                            ApplyAirborneDeflection(__instance, rb, bestDeflector, bestDeflectCenter, isHandTip: bestDeflectIsHand, bladeFactor: bladeFactor);
                         }
                     }
                 }
@@ -1487,10 +1611,19 @@ namespace PuckUltimateFrisbeeMod
 
         private static Vector3 ClosestPointOnSegment(Vector3 a, Vector3 b, Vector3 point)
         {
+            return ClosestPointOnSegment(a, b, point, out _);
+        }
+
+        private static Vector3 ClosestPointOnSegment(Vector3 a, Vector3 b, Vector3 point, out float t)
+        {
             Vector3 ab = b - a;
             float sqrLen = ab.sqrMagnitude;
-            if (sqrLen < 0.00001f) return a;
-            float t = Mathf.Clamp01(Vector3.Dot(point - a, ab) / sqrLen);
+            if (sqrLen < 0.00001f)
+            {
+                t = 0f;
+                return a;
+            }
+            t = Mathf.Clamp01(Vector3.Dot(point - a, ab) / sqrLen);
             return a + ab * t;
         }
 
@@ -1769,6 +1902,7 @@ namespace PuckUltimateFrisbeeMod
             var players = MonoBehaviourSingleton<PlayerManager>.Instance.GetPlayers(false);
             int blueIdx = 0, redIdx = 0;
 
+
             foreach (var player in players)
             {
                 if (!player.IsCharacterSpawned || player.PlayerBody == null) continue;
@@ -1780,12 +1914,14 @@ namespace PuckUltimateFrisbeeMod
 
                 Vector3 lineupPos = new Vector3(xOffset, 0.25f, teamZ);
                 Quaternion lookCenter = Quaternion.LookRotation(new Vector3(0f, 0f, -Mathf.Sign(teamZ)), Vector3.up);
-
                 if (Mathf.Abs(player.PlayerBody.transform.position.z - teamZ) > 1.5f)
                 {
                     player.PlayerBody.Server_Teleport(lineupPos, lookCenter);
                 }
-                player.PlayerBody.Server_Freeze((RigidbodyConstraints)10);
+                if (player.PlayerBody.Rigidbody == null || player.PlayerBody.Rigidbody.constraints != (RigidbodyConstraints)10)
+                {
+                    player.PlayerBody.Server_Freeze((RigidbodyConstraints)10);
+                }
             }
 
             float pullDiscZ = (UltimateRulesManager.PullingTeam == PlayerTeam.Blue)
@@ -2008,14 +2144,24 @@ namespace PuckUltimateFrisbeeMod
         private static void FlattenAndFreezeDiscOnGround(Puck disc, Rigidbody rb, Vector3 groundSpot)
         {
             groundSpot.y = Mathf.Max(groundSpot.y, UltimateVisualTuning.DiscHalfThickness + 0.01f);
-            Quaternion flatRot = Quaternion.Euler(0f, disc.transform.eulerAngles.y, 0f);
-            rb.isKinematic = false;
-            rb.linearVelocity = Vector3.zero;
-            rb.angularVelocity = Vector3.zero;
-            rb.position = groundSpot;
-            rb.rotation = flatRot;
-            disc.transform.SetPositionAndRotation(groundSpot, flatRot);
-            disc.Server_Freeze(RigidbodyConstraints.FreezeAll);
+
+            bool alreadyFrozenAtSpot =
+                !rb.isKinematic &&
+                rb.constraints == RigidbodyConstraints.FreezeAll &&
+                (disc.transform.position - groundSpot).sqrMagnitude < 0.0004f &&
+                Vector3.Dot(disc.transform.up, Vector3.up) > 0.999f;
+
+            if (!alreadyFrozenAtSpot)
+            {
+                Quaternion flatRot = Quaternion.Euler(0f, disc.transform.eulerAngles.y, 0f);
+                rb.isKinematic = false;
+                rb.linearVelocity = Vector3.zero;
+                rb.angularVelocity = Vector3.zero;
+                rb.position = groundSpot;
+                rb.rotation = flatRot;
+                disc.transform.SetPositionAndRotation(groundSpot, flatRot);
+                disc.Server_Freeze(RigidbodyConstraints.FreezeAll);
+            }
 
             if (UltimateRulesManager.DiscStationaryStartTime <= 0f)
             {

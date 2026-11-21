@@ -337,7 +337,19 @@ namespace PuckUltimateFrisbeeMod
                 // Fallback if no custom prefab: flatten vanilla puck into a disc shape
                 Disc.transform.localScale = new Vector3(2.2f, 0.35f, 2.2f);
             }
-            
+            foreach (var r in Disc.GetComponentsInChildren<MeshRenderer>(true))
+            {
+                if (CustomDiscVisual != null && (r.transform == CustomDiscVisual || r.transform.IsChildOf(CustomDiscVisual)))
+                {
+                    r.enabled = true;
+                    r.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off; // <--- ADD THIS
+                    continue;
+                }
+                if (r.GetComponentInParent<PuckElevationIndicator>() != null)
+                    continue;
+
+                if (r.enabled) r.enabled = false;
+            }
         }
 
         public static void ComputeHandGripTransform(Player holder, sbyte throwStyle, out Vector3 discPos, out Quaternion discRot)
@@ -546,12 +558,16 @@ namespace PuckUltimateFrisbeeMod
                     p.y = minY;
                     Disc.transform.position = p;
                 }
+                UpdateGroundShadow(false); 
                 return;
             }
 
             Player holder = MonoBehaviourSingleton<PlayerManager>.Instance.GetPlayerByClientId(holderId);
             if (holder == null || !holder.IsCharacterSpawned || holder.Stick == null || holder.PlayerBody == null)
+            {
+                UpdateGroundShadow(false);
                 return;
+            }
 
             if (ElevationIndicator != null && ElevationIndicator.IsVisible)
             {
@@ -566,6 +582,133 @@ namespace PuckUltimateFrisbeeMod
                 Disc.Rigidbody.position = gripPos;
                 Disc.Rigidbody.rotation = discRot;
             }
+            UpdateGroundShadow(true);
+        }
+        // --- STRAIGHT-DOWN TRACKING SHADOW ---
+        private static Texture2D _sharedShadowTex;
+        private GameObject _groundShadowObj;
+        private MeshRenderer _groundShadowRenderer;
+        private Material _groundShadowMat;
+
+        private static Texture2D GetOrCreateShadowTexture()
+        {
+            if (_sharedShadowTex != null) return _sharedShadowTex;
+
+            const int size = 128;
+            _sharedShadowTex = new Texture2D(size, size, TextureFormat.ARGB32, false);
+            _sharedShadowTex.wrapMode = TextureWrapMode.Clamp;
+
+            float half = (size - 1) * 0.5f;
+            for (int y = 0; y < size; y++)
+            {
+                for (int x = 0; x < size; x++)
+                {
+                    float dx = (x - half) / half;
+                    float dy = (y - half) / half;
+                    float dist = Mathf.Sqrt(dx * dx + dy * dy);
+
+                    // Dark core matching the frisbee silhouette with a soft penumbra edge
+                    float alpha = 1f - Mathf.SmoothStep(0.55f, 1.0f, dist);
+                    _sharedShadowTex.SetPixel(x, y, new Color(0f, 0f, 0f, alpha));
+                }
+            }
+            _sharedShadowTex.Apply();
+            return _sharedShadowTex;
+        }
+
+        private void EnsureGroundShadow()
+        {
+            if (UltimateFrisbeePlugin.IsHeadlessServer || _groundShadowObj != null) return;
+
+            _groundShadowObj = GameObject.CreatePrimitive(PrimitiveType.Quad);
+            _groundShadowObj.name = "UltimateDiscGroundShadow";
+            UnityEngine.Object.Destroy(_groundShadowObj.GetComponent<Collider>());
+
+            _groundShadowRenderer = _groundShadowObj.GetComponent<MeshRenderer>();
+            _groundShadowRenderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+            _groundShadowRenderer.receiveShadows = false;
+
+            // Sprites/Default is guaranteed alpha-blended & unlit on URP/DX11/DX12/Metal/Vulkan
+            Shader shadowShader = Shader.Find("Sprites/Default")
+                            ?? Shader.Find("Universal Render Pipeline/Particles/Unlit")
+                            ?? Shader.Find("Particles/Standard Unlit");
+
+            if (shadowShader != null)
+            {
+                _groundShadowMat = new Material(shadowShader);
+                _groundShadowMat.mainTexture = GetOrCreateShadowTexture();
+                _groundShadowMat.color = new Color(0f, 0f, 0f, 0.65f);
+
+                // Safety setup in case URP Particles/Unlit fallback was used
+                if (_groundShadowMat.HasProperty("_Surface")) _groundShadowMat.SetFloat("_Surface", 1f);
+                if (_groundShadowMat.HasProperty("_Blend")) _groundShadowMat.SetFloat("_Blend", 0f);
+                if (_groundShadowMat.HasProperty("_SrcBlend")) _groundShadowMat.SetFloat("_SrcBlend", (float)UnityEngine.Rendering.BlendMode.SrcAlpha);
+                if (_groundShadowMat.HasProperty("_DstBlend")) _groundShadowMat.SetFloat("_DstBlend", (float)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
+                if (_groundShadowMat.HasProperty("_ZWrite")) _groundShadowMat.SetFloat("_ZWrite", 0f);
+                _groundShadowMat.renderQueue = 3000;
+
+                _groundShadowRenderer.material = _groundShadowMat;
+            }
+        }
+
+        private void UpdateGroundShadow(bool isHeld)
+        {
+            if (UltimateFrisbeePlugin.IsHeadlessServer || Disc == null) return;
+            EnsureGroundShadow();
+            if (_groundShadowObj == null) return;
+
+            bool shouldShow = Disc.gameObject.activeInHierarchy;
+            if (_groundShadowObj.activeSelf != shouldShow)
+            {
+                _groundShadowObj.SetActive(shouldShow);
+            }
+            if (!shouldShow) return;
+
+            float groundY = Level_GrassStadiumSetup_Patch.VisualGroundSurfaceY;
+            Vector3 discPos = Disc.transform.position;
+            float height = Mathf.Max(0f, discPos.y - groundY);
+
+            // Place 1.6cm above the grass (above the +1.2cm painted lines so it never z-fights)
+            // while staying cleanly underneath resting discs
+            float shadowY = groundY + 0.016f;
+            _groundShadowObj.transform.position = new Vector3(discPos.x, shadowY, discPos.z);
+
+            // Slight elliptical foreshortening when the disc is tilted/bladed, clamped so it's always readable
+            Vector3 discUp = Disc.transform.up;
+            float flatness = Mathf.Clamp01(Mathf.Abs(discUp.y));
+            Vector3 horizTilt = new Vector3(discUp.x, 0f, discUp.z);
+            float yaw = (horizTilt.sqrMagnitude > 0.0001f)
+                ? Mathf.Atan2(horizTilt.x, horizTilt.z) * Mathf.Rad2Deg
+                : Disc.transform.eulerAngles.y;
+
+            // Rotate Quad +90 deg on X so its front face (-Z) points straight up (+Y)
+            _groundShadowObj.transform.rotation = Quaternion.Euler(90f, yaw, 0f);
+
+            // Scale widens gently as the disc gets higher; opacity keeps a readable floor (0.30) on high hucks
+            float heightT = Mathf.Clamp01(height / 16f);
+            float majorDiameter = Mathf.Lerp(0.62f, 1.35f, heightT);
+            float minorDiameter = majorDiameter * Mathf.Lerp(0.55f, 1.0f, flatness);
+            _groundShadowObj.transform.localScale = new Vector3(majorDiameter, minorDiameter, 1f);
+
+            if (_groundShadowMat != null)
+            {
+                float alpha = Mathf.Lerp(0.68f, 0.30f, heightT);
+                if (isHeld) alpha *= 0.65f; // Slightly softer while held in hand
+                Color col = new Color(0f, 0f, 0f, alpha);
+                _groundShadowMat.color = col;
+                if (_groundShadowMat.HasProperty("_BaseColor")) _groundShadowMat.SetColor("_BaseColor", col);
+            }
+        }
+
+        private void OnDisable()
+        {
+            if (_groundShadowObj != null) _groundShadowObj.SetActive(false);
+        }
+
+        private void OnDestroy()
+        {
+            if (_groundShadowObj != null) UnityEngine.Object.Destroy(_groundShadowObj);
+            if (_groundShadowMat != null) UnityEngine.Object.Destroy(_groundShadowMat);
         }
     }
 
