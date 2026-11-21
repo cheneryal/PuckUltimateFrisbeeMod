@@ -585,7 +585,7 @@ namespace PuckUltimateFrisbeeMod
 
             float now = Time.unscaledTime;
             float centerX = Screen.width * 0.5f;
-            float currentY = 72f; // Placed cleanly below the top-center scoreboard!
+            float currentY = Mathf.Max(118f, Screen.height * 0.115f); // Scales cleanly below scoreboard + PERIOD text
 
             for (int i = _majorPopups.Count - 1; i >= 0; i--)
             {
