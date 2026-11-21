@@ -44,6 +44,7 @@ namespace PuckUltimateFrisbeeMod
                 _harmony.PatchAll(Assembly.GetExecutingAssembly());
 
                 UltimateRulesManager.Initialize();
+                UltimateMatchReporter.Initialize();
                 UltimateWindManager.Initialize();
                 UltimateDiveMod.EnsureNetworkRegistered();
                 UltimateAppearanceManager.Initialize(PluginDirectory);
@@ -79,6 +80,7 @@ namespace PuckUltimateFrisbeeMod
                 if (!_isAlreadyEnabled) return true;
                 _isAlreadyEnabled = false;
                 UltimateRulesManager.Dispose();
+                UltimateMatchReporter.Dispose();
                 UltimateWindManager.Dispose();
                 UltimateDiveMod.Dispose();
                 UltimateAppearanceManager.Dispose();
