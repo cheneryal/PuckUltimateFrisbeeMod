@@ -1271,20 +1271,26 @@ namespace PuckUltimateFrisbeeMod
                         Vector3 chestCatchPt = bodyBasePos + Vector3.up * 1.05f + player.PlayerBody.transform.forward * 0.25f;
                         float chestDist = Vector3.Distance(closestDiscPt, chestCatchPt);
 
-                        // 1. GROUND PICKUP (pick closest eligible player)
+                        // 1. GROUND PICKUP (requires intentionally placing your hand on the disc)
                         if (!isAirborne)
                         {
                             if (player == UltimateRulesManager.LastThrower && timeSinceRelease < 0.35f)
                                 continue;
 
-                            float horizFootDist = Vector2.Distance(
-                                new Vector2(discPos.x, discPos.z),
-                                new Vector2(bodyBasePos.x, bodyBasePos.z));
+                            const float GroundPickupHorizRadius = 0.42f; // Disc radius (0.24m) + hand palm (~0.18m)
+                            const float GroundPickupMaxHeight   = 0.38f; // Hand must actually be lowered down to the disc
+
                             float horizHandDist = Vector2.Distance(
-                                new Vector2(discPos.x, discPos.z),
+                                new Vector2(closestDiscPt.x, closestDiscPt.z),
                                 new Vector2(handPos.x, handPos.z));
 
-                            if (sweptHandDist <= 1.45f || horizHandDist <= 1.35f || horizFootDist <= 1.45f)
+                            // Note: handPos.y can dip slightly below ground due to ArmVerticalMultiplier when reaching down
+                            float handHeightOffset = handPos.y - closestDiscPt.y;
+                            bool handAtDisc = (horizHandDist <= GroundPickupHorizRadius) &&
+                                              (handHeightOffset <= GroundPickupMaxHeight) &&
+                                              (handHeightOffset >= -0.45f);
+
+                            if (handAtDisc)
                             {
                                 bool canPickup = false;
                                 if (isWarmup)
@@ -1309,7 +1315,7 @@ namespace PuckUltimateFrisbeeMod
 
                                 if (canPickup)
                                 {
-                                    float groundMetric = Mathf.Min(sweptHandDist, Mathf.Min(horizHandDist, horizFootDist));
+                                    float groundMetric = sweptHandDist;
                                     if (groundMetric < bestGroundDist)
                                     {
                                         bestGroundDist = groundMetric;

@@ -313,8 +313,17 @@ namespace PuckUltimateFrisbeeMod
             {
                 if (r == null) continue;
                 string objName = r.gameObject.name;
+
+                // Never paint the 1st-person frisbee glove or wristband with skin color!
+                if (objName.IndexOf("Hand_Glove", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                    objName.IndexOf("Band", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    continue;
+                }
+
                 bool isSkinObj = objName.Contains("Custom_Head") || objName.Contains("Arm") ||
-                                 objName.Contains("Glove") || objName.Contains("Leg");
+                                 objName.Contains("Glove") || objName.Contains("Leg") ||
+                                 objName.Equals("Stylized_Hand", StringComparison.OrdinalIgnoreCase);
                 bool isHairObj = objName.Contains("Hair") || objName.Contains("Beard");
 
                 Material[] mats = r.materials;
@@ -323,6 +332,13 @@ namespace PuckUltimateFrisbeeMod
                 {
                     if (mats[i] == null) continue;
                     string matName = mats[i].name;
+
+                    // Extra guard: never tint materials explicitly named Glove or Band
+                    if (matName.IndexOf("Glove", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        matName.IndexOf("Band", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        continue;
+                    }
 
                     if (isSkinObj || matName.IndexOf("Skin", StringComparison.OrdinalIgnoreCase) >= 0)
                     {

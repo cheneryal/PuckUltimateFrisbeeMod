@@ -228,6 +228,11 @@ namespace PuckUltimateFrisbeeMod
 
                         controller.CustomArmInstance = customArm.transform;
                         controller.CalibrateCustomArmBounds();
+                        if (__instance.Player != null && __instance.Player.PlayerBody != null)
+                        {
+                            var skinSync = __instance.Player.PlayerBody.GetComponentInChildren<UltimateSkinAndTeamSync>(true);
+                            if (skinSync != null) skinSync.ApplyCustomization(force: true);
+                        }
                     }
                     else
                     {
@@ -336,19 +341,6 @@ namespace PuckUltimateFrisbeeMod
             {
                 // Fallback if no custom prefab: flatten vanilla puck into a disc shape
                 Disc.transform.localScale = new Vector3(2.2f, 0.35f, 2.2f);
-            }
-            foreach (var r in Disc.GetComponentsInChildren<MeshRenderer>(true))
-            {
-                if (CustomDiscVisual != null && (r.transform == CustomDiscVisual || r.transform.IsChildOf(CustomDiscVisual)))
-                {
-                    r.enabled = true;
-                    r.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off; // <--- ADD THIS
-                    continue;
-                }
-                if (r.GetComponentInParent<PuckElevationIndicator>() != null)
-                    continue;
-
-                if (r.enabled) r.enabled = false;
             }
         }
 
