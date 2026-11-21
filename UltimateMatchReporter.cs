@@ -1,8 +1,10 @@
 using System;
-using System.Collections.Generic;
+using System.Collections;
+using System.Reflection;
+using System.Net.Security;
 using System.IO;
 using System.Linq;
-using System.Net;
+using System.Diagnostics;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
@@ -19,6 +21,8 @@ namespace PuckUltimateFrisbeeMod
         private static string _callbackUrl;
         private static string _webhookSecret;
         private static bool _hasReported = false;
+        private static PlayerTeam _forfeitingTeam = PlayerTeam.None;
+        private static float _forfeitDetectedTime = -999f;
 
         // Empty-server watchdog state
         private static float _serverStartTime = 0f;
@@ -35,6 +39,7 @@ namespace PuckUltimateFrisbeeMod
             IsMatchServer = false;
             _hasReported = false;
             _anyPlayerEverJoined = false;
+            _forfeitingTeam = PlayerTeam.None;
             _emptySinceTime = -1f;
             _serverStartTime = Time.realtimeSinceStartup;
             _nextWatchdogCheckTime = _serverStartTime + 10f;
@@ -74,6 +79,70 @@ namespace PuckUltimateFrisbeeMod
             _hasReported = false;
         }
 
+        public static void RecordForfeitVote(Vote vote)
+        {
+            if (!IsMatchServer || !NetworkRoles.IsServer || vote == null)
+                return;
+
+            if (!vote.Passed || !string.Equals(vote.Name, "forfeit", StringComparison.OrdinalIgnoreCase))
+                return;
+
+            PlayerTeam detected = ExtractTeamFromVote(vote);
+            if (detected == PlayerTeam.Red || detected == PlayerTeam.Blue)
+            {
+                _forfeitingTeam = detected;
+                _forfeitDetectedTime = Time.realtimeSinceStartup;
+                UltimateFrisbeePlugin.ModLogger.Info(
+                    $"UltimateMatchReporter: Detected passed forfeit vote by {detected}.");
+            }
+        }
+
+        private static PlayerTeam ExtractTeamFromVote(Vote vote)
+        {
+            const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+            Type t = vote.GetType();
+
+            // 1. Check any PlayerTeam or collection of PlayerTeam (e.g. Teams / AllowedTeams)
+            foreach (var prop in t.GetProperties(flags))
+            {
+                if (prop.GetIndexParameters().Length > 0) continue;
+                object val = null;
+                try { val = prop.GetValue(vote); } catch { continue; }
+                PlayerTeam found = UnwrapTeamValue(val);
+                if (found != PlayerTeam.None) return found;
+            }
+            foreach (var field in t.GetFields(flags))
+            {
+                object val = null;
+                try { val = field.GetValue(vote); } catch { continue; }
+                PlayerTeam found = UnwrapTeamValue(val);
+                if (found != PlayerTeam.None) return found;
+            }
+            return PlayerTeam.None;
+        }
+
+        private static PlayerTeam UnwrapTeamValue(object val)
+        {
+            if (val is PlayerTeam pt && (pt == PlayerTeam.Red || pt == PlayerTeam.Blue))
+                return pt;
+
+            if (val is IEnumerable seq && !(val is string))
+            {
+                PlayerTeam found = PlayerTeam.None;
+                int count = 0;
+                foreach (var item in seq)
+                {
+                    if (item is PlayerTeam teamItem && (teamItem == PlayerTeam.Red || teamItem == PlayerTeam.Blue))
+                    {
+                        found = teamItem;
+                        count++;
+                    }
+                }
+                if (count == 1) return found;
+            }
+            return PlayerTeam.None;
+        }
+
         public static void OnGameOver(int redScore, int blueScore, int period)
         {
             if (!IsMatchServer || !NetworkRoles.IsServer || _hasReported)
@@ -81,28 +150,45 @@ namespace PuckUltimateFrisbeeMod
 
             _hasReported = true;
 
+            bool isForfeit = false;
             int? winnerTeam = null;
-            if (redScore > blueScore) winnerTeam = 1;       // Red
-            else if (blueScore > redScore) winnerTeam = 2;  // Blue
+
+            if ((_forfeitingTeam == PlayerTeam.Red || _forfeitingTeam == PlayerTeam.Blue) &&
+                (Time.realtimeSinceStartup - _forfeitDetectedTime) < 10f)
+            {
+                isForfeit = true;
+                winnerTeam = (_forfeitingTeam == PlayerTeam.Blue) ? 1 : 2; // Opposing team wins
+            }
+            else if (redScore > blueScore)
+            {
+                winnerTeam = 1; // Red
+            }
+            else if (blueScore > redScore)
+            {
+                winnerTeam = 2; // Blue
+            }
 
             var playerStatsJson = CollectPlayerStatsJson();
             string winnerJson = winnerTeam.HasValue ? winnerTeam.Value.ToString() : "null";
+            string forfeitJson = isForfeit ? "true" : "false";
 
             string payload =
                 "{" +
                 $"\"match_id\":\"{EscapeJson(_matchId)}\"," +
                 $"\"winner_team\":{winnerJson}," +
+                $"\"forfeit\":{forfeitJson}," +
                 $"\"red_score\":{redScore}," +
                 $"\"blue_score\":{blueScore}," +
                 $"\"period\":{period}," +
                 $"\"players\":{playerStatsJson}" +
                 "}";
 
+            string tag = isForfeit ? $" (Forfeit by {_forfeitingTeam})" : "";
             UltimateFrisbeePlugin.ModLogger.Info(
-                $"UltimateMatchReporter: GameOver detected for Match #{_matchId} (Red {redScore} - Blue {blueScore}). Reporting in {POST_GAME_GRACE_SECONDS:F0}s...");
+                $"UltimateMatchReporter: GameOver detected for Match #{_matchId} (Red {redScore} - Blue {blueScore}){tag}. Reporting in {POST_GAME_GRACE_SECONDS:F0}s...");
 
             UltimateRulesManager.BroadcastAnnouncement(
-                $"FINAL: RED {redScore} - {blueScore} BLUE! Reporting to Discord & closing server in {POST_GAME_GRACE_SECONDS:F0}s...",
+                $"FINAL: RED {redScore} - {blueScore} BLUE{tag}! Reporting to Discord & closing server in {POST_GAME_GRACE_SECONDS:F0}s...",
                 "#2ecc71");
 
             Task.Run(async () =>
@@ -211,37 +297,54 @@ namespace PuckUltimateFrisbeeMod
             {
                 try
                 {
-                    var req = (HttpWebRequest)WebRequest.Create(_callbackUrl);
-                    req.Method = "POST";
-                    req.ContentType = "application/json; charset=utf-8";
-                    req.Timeout = 10000;
-                    if (!string.IsNullOrEmpty(_webhookSecret))
+                    var psi = new ProcessStartInfo
                     {
-                        req.Headers["X-Match-Secret"] = _webhookSecret;
-                    }
+                        FileName = "/usr/bin/curl",
+                        Arguments =
+                            $"-sS -f -m 10 -X POST " +
+                            $"-H \"Content-Type: application/json\" " +
+                            $"-H \"X-Match-Secret: {_webhookSecret}\" " +
+                            $"--data-binary @- \"{_callbackUrl}\"",
+                        RedirectStandardInput = true,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        UseShellExecute = false,
+                        CreateNoWindow = true
+                    };
 
-                    byte[] bytes = Encoding.UTF8.GetBytes(jsonPayload);
-                    req.ContentLength = bytes.Length;
-                    using (Stream reqStream = req.GetRequestStream())
+                    using (var proc = Process.Start(psi))
                     {
-                        reqStream.Write(bytes, 0, bytes.Length);
-                    }
+                        using (var writer = new StreamWriter(proc.StandardInput.BaseStream, new UTF8Encoding(false)))
+                        {
+                            writer.Write(jsonPayload);
+                        }
 
-                    using (var resp = (HttpWebResponse)req.GetResponse())
-                    {
-                        UltimateFrisbeePlugin.ModLogger.Info(
-                            $"UltimateMatchReporter: Posted Match #{_matchId} result (HTTP {(int)resp.StatusCode}).");
-                        return;
+                        string stdout = proc.StandardOutput.ReadToEnd();
+                        string stderr = proc.StandardError.ReadToEnd();
+                        proc.WaitForExit(15000);
+
+                        if (proc.ExitCode == 0)
+                        {
+                            UltimateFrisbeePlugin.ModLogger.Info(
+                                $"UltimateMatchReporter: Posted Match #{_matchId} result successfully ({stdout.Trim()}).");
+                            return;
+                        }
+
+                        UltimateFrisbeePlugin.ModLogger.Error(
+                            $"UltimateMatchReporter: Attempt {attempt} curl exited {proc.ExitCode}: {stderr.Trim()}");
                     }
                 }
                 catch (Exception ex)
                 {
                     UltimateFrisbeePlugin.ModLogger.Error(
                         $"UltimateMatchReporter: Attempt {attempt} failed posting Match #{_matchId}: {ex.Message}");
-                    System.Threading.Thread.Sleep(2000);
                 }
+
+                System.Threading.Thread.Sleep(2000);
             }
         }
+
+
 
         private static string ExtractJsonString(string json, string key)
         {
@@ -286,6 +389,18 @@ namespace PuckUltimateFrisbeeMod
             if (UltimateMatchReporter.IsMatchServer)
             {
                 UltimateMatchReporter.TickEmptyServerWatchdog();
+            }
+        }
+    }
+    [HarmonyPatch(typeof(BaseGameMode<BaseGameModeConfig>), "OnVoteRemoved")]
+    public static class BaseGameMode_TrackForfeit_Patch
+    {
+        [HarmonyPrefix]
+        public static void Prefix(Vote vote)
+        {
+            if (UltimateMatchReporter.IsMatchServer)
+            {
+                UltimateMatchReporter.RecordForfeitVote(vote);
             }
         }
     }
