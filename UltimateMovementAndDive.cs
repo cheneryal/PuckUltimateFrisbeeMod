@@ -102,9 +102,8 @@ namespace PuckUltimateFrisbeeMod
             _smoothedSpeed = Mathf.Lerp(_smoothedSpeed, instantSpeed, Mathf.Clamp01(dt * 12f));
 
             bool isGrounded = currentPos.y < 0.65f;
-            bool isFrozenHolder = (UltimateNetworkSync.ClientSyncedHolderId != ulong.MaxValue &&
-                                   Body.Player != null &&
-                                   Body.Player.OwnerClientId == UltimateNetworkSync.ClientSyncedHolderId);
+            bool isFrozenHolder = Body.Player != null &&
+                                  UltimateNetworkSync.IsPlayerHoldingAnyDisc(Body.Player.OwnerClientId);
 
             if (isGrounded && !isFrozenHolder && _smoothedSpeed > 0.65f)
             {
@@ -153,10 +152,10 @@ namespace PuckUltimateFrisbeeMod
 
             if (NetworkRoles.IsServer)
             {
-                UltimateNetworkSync.ServerBroadcastHolderState(UltimateRulesManager.Holder, UltimateNetworkSync.ClientSyncedThrowStyle);
+                ulong spawnClientId = __instance.Player != null ? __instance.Player.OwnerClientId : __instance.OwnerClientId;
+                UltimateNetworkSync.ServerSyncActiveHoldersToClient(spawnClientId);
                 UltimateAppearanceManager.ServerBroadcastAllAppearances();
             }
-
 
             if (!UltimateFrisbeePlugin.IsHeadlessServer)
             {
@@ -1279,7 +1278,7 @@ namespace PuckUltimateFrisbeeMod
                  rb.linearVelocity.y >= -0.5f);
 
             if (IsFaceOff() || !recentlyGrounded || (body.HasFallen != null && body.HasFallen.Value)) return;
-            if (UltimateRulesManager.Holder == player || UltimateNetworkSync.IsPlayerHoldingAnyDisc(player.OwnerClientId)) return;
+            if (UltimateNetworkSync.IsPlayerHoldingAnyDisc(player.OwnerClientId)) return;
 
             if (LastSkyJumpTime.TryGetValue(id, out float lastJump) && (Time.time - lastJump) < 0.65f) return;
 
@@ -1364,7 +1363,7 @@ namespace PuckUltimateFrisbeeMod
             if (body == null || body.Rigidbody == null) return;
 
             if (!body.IsGrounded || body.HasFallen.Value || IsFaceOff()) return;
-            if (UltimateRulesManager.Holder == player || UltimateNetworkSync.IsPlayerHoldingAnyDisc(player.OwnerClientId)) return;
+            if (UltimateNetworkSync.IsPlayerHoldingAnyDisc(player.OwnerClientId)) return;
 
             var id = player.NetworkObjectId;
             if (DiveToggled.Contains(id)) return;
@@ -1779,8 +1778,7 @@ namespace PuckUltimateFrisbeeMod
                 }
             }
 
-            bool isHoldingDisc = (UltimateRulesManager.Holder == player) ||
-                                 UltimateNetworkSync.IsPlayerHoldingAnyDisc(player.OwnerClientId);
+            bool isHoldingDisc = UltimateNetworkSync.IsPlayerHoldingAnyDisc(player.OwnerClientId);
             bool isDiving = UltimateDiveMod.DiveToggled.Contains(id);
             bool isSprinting = __instance.IsSprinting != null && __instance.IsSprinting.Value;
             bool hasFallen = __instance.HasFallen != null && __instance.HasFallen.Value;
@@ -1839,6 +1837,20 @@ namespace PuckUltimateFrisbeeMod
                     __instance.transform.position = clampedPos;
                 }
                 return;
+            }
+
+            // Self-heal: if not holding a disc and not in FaceOff, clear any stale pivot anchor or FaceOff freeze
+            if (!isHoldingDisc && !isFaceOff)
+            {
+                if (UltimateRulesManager.TryGetPivotAnchor(player.OwnerClientId, out _))
+                {
+                    UltimateRulesManager.ClearPivotAnchor(player.OwnerClientId);
+                }
+
+                if (rb != null && (rb.constraints & (RigidbodyConstraints.FreezePositionX | RigidbodyConstraints.FreezePositionZ)) != 0)
+                {
+                    __instance.Server_Unfreeze();
+                }
             }
 
             // -----------------------------------------------------------------

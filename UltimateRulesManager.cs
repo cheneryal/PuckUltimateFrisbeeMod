@@ -46,6 +46,8 @@ namespace PuckUltimateFrisbeeMod
 
         // Possession & Disc State
         public static Player Holder = null;
+        public static Player GoalCelebrationHolder = null;
+        public static Puck GoalCelebrationDisc = null;
         public static Player LastThrower = null;
         public static Player SecondLastThrower = null;
         public static PlayerTeam OffensiveTeam = PlayerTeam.None;
@@ -619,6 +621,8 @@ namespace PuckUltimateFrisbeeMod
                 Holder.PlayerBody.Server_Unfreeze();
             }
             Holder = null;
+            GoalCelebrationHolder = null;
+            GoalCelebrationDisc = null;
             IsHolderPivotLocked = false;
             PlayerPivotAnchors.Clear();
             LastThrower = null;
@@ -777,6 +781,18 @@ namespace PuckUltimateFrisbeeMod
 
             PullingTeam = scoringTeam;
             ResetPlayState();
+
+            if (receiver != null && disc != null)
+            {
+                GoalCelebrationHolder = receiver;
+                GoalCelebrationDisc = disc;
+                if (disc.Rigidbody != null)
+                {
+                    disc.Rigidbody.isKinematic = true;
+                    disc.Server_Freeze(RigidbodyConstraints.FreezeAll);
+                }
+                UltimateNetworkSync.ServerBroadcastHolderState(receiver, 1, disc);
+            }
             _scoreGoalMethod?.Invoke(ActiveGameModeInstance, new object[] { scoringTeam, receiver, thrower, secondAssist, disc });
         }
     }
@@ -977,6 +993,25 @@ namespace PuckUltimateFrisbeeMod
 
                     if (!UltimateRulesManager.IsLiveDiscPhase)
                     {
+                        if (__instance == UltimateRulesManager.GoalCelebrationDisc &&
+                            UltimateRulesManager.GoalCelebrationHolder != null)
+                        {
+                            Player celebHolder = UltimateRulesManager.GoalCelebrationHolder;
+                            if (celebHolder.IsCharacterSpawned && celebHolder.Stick != null && celebHolder.PlayerBody != null)
+                            {
+                                rb.isKinematic = true;
+                                ClientDiscFollower.ComputeHandGripTransform(celebHolder, 1, out Vector3 gripPos, out Quaternion discRot);
+                                rb.position = gripPos;
+                                rb.rotation = discRot;
+                                __instance.transform.SetPositionAndRotation(gripPos, discRot);
+                            }
+                            else
+                            {
+                                UltimateRulesManager.GoalCelebrationHolder = null;
+                                UltimateRulesManager.GoalCelebrationDisc = null;
+                                UltimateNetworkSync.ServerBroadcastHolderState(null, 0, __instance);
+                            }
+                        }
                         return;
                     }
                 }
@@ -1612,6 +1647,10 @@ namespace PuckUltimateFrisbeeMod
             finally
             {
                 SaveDiscState(ds);
+                if (isWarmup)
+                {
+                    UltimateRulesManager.Holder = null;
+                }
             }
         }
 
@@ -1896,8 +1935,13 @@ namespace PuckUltimateFrisbeeMod
                             p.PlayerBody.Server_Unfreeze();
                     }
                 }
-
                 UltimateRulesManager.BroadcastAnnouncement($"PULL! {UltimateRulesManager.PullingTeam}: Pick up the disc behind your line and Pull!", "#2ecc71");
+            }
+            else
+            {
+                // Non-live phases (Goal celebration, Replay, PeriodOver, GameOver):
+                // ensure no player stays stuck holding/pivot-locked
+                UltimateRulesManager.ResetPlayState();
             }
         }
 
@@ -2105,6 +2149,8 @@ namespace PuckUltimateFrisbeeMod
             UltimateRulesManager.IsDiscTumblingOnGround = false;
             UltimateRulesManager.ActiveFlightWobble = 0f;
             UltimateRulesManager.WentOutOfBoundsInFlight = false;
+            UltimateRulesManager.PlayerPivotAnchors.Clear();
+            UltimateNetworkSync.ServerBroadcastClearAllHolders();
             UltimateNetworkSync.ServerBroadcastHolderState(null, 1, disc);
 
             float pullDiscZ = (UltimateRulesManager.PullingTeam == PlayerTeam.Blue)

@@ -112,9 +112,26 @@ namespace PuckUltimateFrisbeeMod
             return pucks[0];
         }
 
+        public static void OnDiscDespawned(ulong discNetId)
+        {
+            if (ClientDiscStates.TryGetValue(discNetId, out var removed))
+            {
+                if (ClientSyncedHolderId == removed.HolderClientId)
+                {
+                    ClientSyncedHolderId = ulong.MaxValue;
+                }
+                ClientDiscStates.Remove(discNetId);
+            }
+            else if (!UltimateRulesManager.IsWarmup)
+            {
+                ClientSyncedHolderId = ulong.MaxValue;
+            }
+        }
+
         public static bool IsPlayerHoldingAnyDisc(ulong clientId)
         {
             if (clientId == ulong.MaxValue) return false;
+            if (!UltimateRulesManager.IsLiveDiscPhase) return false;
 
             // Server-authoritative check against live spawned Pucks first
             if (NetworkRoles.IsServer)
@@ -134,11 +151,28 @@ namespace PuckUltimateFrisbeeMod
                 return false;
             }
 
-            foreach (var kvp in ClientDiscStates)
+            // Client-side: ONLY trust entries matching a live, currently spawned non-replay Puck
+            if (MonoBehaviourSingleton<PuckManager>.Instance == null) return false;
+            var livePucks = MonoBehaviourSingleton<PuckManager>.Instance.GetPucks(false);
+            if (livePucks == null || livePucks.Count == 0) return false;
+
+            bool isWarmup = UltimateRulesManager.IsWarmup;
+            for (int i = 0; i < livePucks.Count; i++)
             {
-                if (kvp.Value.HolderClientId == clientId) return true;
+                Puck p = livePucks[i];
+                if (p == null || !p.IsSpawned || p.NetworkObject == null) continue;
+                if (p.IsReplay != null && p.IsReplay.Value) continue;
+
+                if (ClientDiscStates.TryGetValue(p.NetworkObjectId, out var entry))
+                {
+                    if (entry.HolderClientId == clientId) return true;
+                }
+                else if (!isWarmup && ClientSyncedHolderId == clientId)
+                {
+                    return true;
+                }
             }
-            return !UltimateRulesManager.IsWarmup && ClientSyncedHolderId == clientId;
+            return false;
         }
 
         public static void EnsureRegistered()
@@ -203,7 +237,19 @@ namespace PuckUltimateFrisbeeMod
                 return;
             }
 
-            ulong discNetId = (disc != null && disc.NetworkObject != null) ? disc.NetworkObjectId : 0UL;
+            // NEVER insert or broadcast a holder with discNetId == 0UL (causes permanent ghost-held lock!)
+            if (disc == null || disc.NetworkObject == null)
+            {
+                return;
+            }
+
+            // Never store or broadcast a holder against a non-existent or unspawned disc (prevents 0UL phantom entries)
+            if (disc == null || !disc.IsSpawned || disc.NetworkObject == null)
+            {
+                return;
+            }
+
+            ulong discNetId = disc.NetworkObjectId;
             ulong holderId = holder != null ? holder.OwnerClientId : ulong.MaxValue;
             float clampedWobble = Mathf.Clamp01(flightWobble);
             byte wobbleByte = (byte)Mathf.RoundToInt(clampedWobble * 255f);
@@ -214,7 +260,7 @@ namespace PuckUltimateFrisbeeMod
                 RecordPlayerDiscInteraction(focusPlayer, disc);
             }
             ulong focusClientId = focusPlayer != null ? focusPlayer.OwnerClientId : ulong.MaxValue;
-
+            
             ClientSyncedHolderId = holderId;
             ClientSyncedThrowStyle = throwStyle;
             ClientSyncedFlightWobble = clampedWobble;
@@ -223,7 +269,7 @@ namespace PuckUltimateFrisbeeMod
                 HolderClientId = holderId,
                 ThrowStyle = throwStyle,
                 FlightWobble = clampedWobble
-            };
+            };   
 
             var nm = NetworkManager.Singleton;
             if (nm == null || !nm.IsServer || nm.CustomMessagingManager == null) return;
@@ -242,6 +288,49 @@ namespace PuckUltimateFrisbeeMod
             finally
             {
                 writer.Dispose();
+            }
+        }
+
+        public static void ServerSyncActiveHoldersToClient(ulong targetClientId)
+        {
+            var nm = NetworkManager.Singleton;
+            if (nm == null || !nm.IsServer || nm.CustomMessagingManager == null) return;
+            if (targetClientId == NetworkManager.ServerClientId) return; // Listen server host already has state
+            if (MonoBehaviourSingleton<PuckManager>.Instance == null) return;
+
+            var pucks = MonoBehaviourSingleton<PuckManager>.Instance.GetPucks(false);
+            if (pucks == null) return;
+
+            for (int i = 0; i < pucks.Count; i++)
+            {
+                Puck p = pucks[i];
+                if (p == null || !p.IsSpawned || p.NetworkObject == null) continue;
+                if (p.IsReplay != null && p.IsReplay.Value) continue;
+
+                Player holder = null;
+                sbyte throwStyle = 1;
+                if (!UltimateRulesManager.IsWarmup)
+                {
+                    holder = UltimateRulesManager.Holder;
+                    throwStyle = ClientSyncedThrowStyle;
+                }
+                else if (UltimateRulesManager.DiscStates.TryGetValue(p, out var ds) && ds.Holder != null)
+                {
+                    holder = ds.Holder;
+                    throwStyle = (sbyte)(ds.ActiveFlightSpinSign >= 0f ? 1 : -1);
+                }
+
+                if (holder == null) continue;
+
+                using (var writer = new FastBufferWriter(36, Allocator.Temp))
+                {
+                    writer.WriteValueSafe(p.NetworkObjectId);
+                    writer.WriteValueSafe(holder.OwnerClientId);
+                    writer.WriteValueSafe(throwStyle);
+                    writer.WriteValueSafe(holder.OwnerClientId);
+                    writer.WriteValueSafe((byte)0);
+                    nm.CustomMessagingManager.SendNamedMessage(StateMessageName, targetClientId, writer, NetworkDelivery.Reliable);
+                }
             }
         }
 

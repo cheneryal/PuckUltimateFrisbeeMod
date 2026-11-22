@@ -475,19 +475,25 @@ namespace PuckUltimateFrisbeeMod
         {
             if (Disc == null) return;
 
+            bool isReplayDisc = Disc.IsReplay != null && Disc.IsReplay.Value;
+
             ulong discNetId = (Disc.NetworkObject != null) ? Disc.NetworkObjectId : 0UL;
             ulong holderId = ulong.MaxValue;
             sbyte syncedStyle = UltimateNetworkSync.ClientSyncedThrowStyle;
             float syncedWobble = UltimateNetworkSync.ClientSyncedFlightWobble;
-            if (UltimateNetworkSync.ClientDiscStates.TryGetValue(discNetId, out var syncEntry))
+
+            if (!isReplayDisc)
             {
-                holderId = syncEntry.HolderClientId;
-                syncedStyle = syncEntry.ThrowStyle;
-                syncedWobble = syncEntry.FlightWobble;
-            }
-            else if (!UltimateRulesManager.IsWarmup)
-            {
-                holderId = UltimateNetworkSync.ClientSyncedHolderId;
+                if (UltimateNetworkSync.ClientDiscStates.TryGetValue(discNetId, out var syncEntry))
+                {
+                    holderId = syncEntry.HolderClientId;
+                    syncedStyle = syncEntry.ThrowStyle;
+                    syncedWobble = syncEntry.FlightWobble;
+                }
+                else if (!UltimateRulesManager.IsWarmup)
+                {
+                    holderId = UltimateNetworkSync.ClientSyncedHolderId;
+                }
             }
 
             
@@ -761,25 +767,49 @@ namespace PuckUltimateFrisbeeMod
         {
             if (__instance == null) return;
 
-            ulong discNetId = (__instance.NetworkObject != null) ? __instance.NetworkObjectId : 0UL;
-            UltimateNetworkSync.ClientDiscStates.Remove(discNetId);
+            // Never let a replay puck despawn wipe live possession!
+            if (__instance.IsReplay != null && __instance.IsReplay.Value) return;
 
+            ulong discNetId = (__instance.NetworkObject != null) ? __instance.NetworkObjectId : 0UL;
+            UltimateNetworkSync.OnDiscDespawned(discNetId);
+
+            Player despawnedHolder = null;
             if (UltimateRulesManager.DiscStates.TryGetValue(__instance, out var ds))
             {
-                if (NetworkRoles.IsServer && ds.Holder != null && ds.Holder.PlayerBody != null)
-                {
-                    ds.Holder.PlayerBody.Server_Unfreeze();
-                }
+                despawnedHolder = ds.Holder;
                 UltimateRulesManager.DiscStates.Remove(__instance);
             }
 
-            if (NetworkRoles.IsServer && UltimateRulesManager.Holder != null)
+            if (NetworkRoles.IsServer)
             {
-                if (UltimateRulesManager.Holder.PlayerBody != null)
+                if (despawnedHolder == null && !UltimateRulesManager.IsWarmup && UltimateRulesManager.Holder != null)
                 {
-                    UltimateRulesManager.Holder.PlayerBody.Server_Unfreeze();
+                    despawnedHolder = UltimateRulesManager.Holder;
                 }
-                UltimateRulesManager.Holder = null;
+
+                if (despawnedHolder != null)
+                {
+                    if (despawnedHolder.PlayerBody != null)
+                    {
+                        despawnedHolder.PlayerBody.Server_Unfreeze();
+                    }
+
+                    UltimateRulesManager.ClearPivotAnchor(despawnedHolder.OwnerClientId);
+
+                    if (UltimateRulesManager.WindupTrackers.TryGetValue(despawnedHolder.OwnerClientId, out var tracker))
+                    {
+                        tracker.Reset();
+                    }
+
+                    if (UltimateRulesManager.Holder == despawnedHolder)
+                    {
+                        UltimateRulesManager.Holder = null;
+                        UltimateRulesManager.IsHolderPivotLocked = false;
+                    }
+
+                    // Notify all clients so they immediately exit the held-disc state
+                    UltimateNetworkSync.ServerBroadcastHolderState(null, 0, __instance);
+                }
             }
         }
     }
