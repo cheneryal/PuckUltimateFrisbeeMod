@@ -47,6 +47,7 @@ namespace PuckUltimateFrisbeeMod
                 UltimateMatchReporter.Initialize();
                 UltimateWindManager.Initialize();
                 UltimateDiveMod.EnsureNetworkRegistered();
+                UltimateKeybindManager.Initialize(PluginDirectory);
                 UltimateAppearanceManager.Initialize(PluginDirectory);
 
                 Level existingLevel = UnityEngine.Object.FindFirstObjectByType<Level>();
@@ -83,6 +84,7 @@ namespace PuckUltimateFrisbeeMod
                 UltimateMatchReporter.Dispose();
                 UltimateWindManager.Dispose();
                 UltimateDiveMod.Dispose();
+                UltimateKeybindManager.Dispose();
                 UltimateAppearanceManager.Dispose();
                 UltimateAudioManager.UnregisterNetwork();
                 // Do NOT unload the AssetBundle here; unloading destroys runtime shaders on reconnect!

@@ -145,20 +145,56 @@ namespace PuckUltimateFrisbeeMod
     [HarmonyPatch(typeof(PlayerBody), "OnNetworkPostSpawn")]
     public static class PlayerBody_RunningStrideAndMuteSkateAudio_Patch
     {
+        private static readonly PropertyInfo _playerIsReplayProp = AccessTools.Property(typeof(Player), "IsReplay");
+        private static readonly FieldInfo _playerIsReplayField = AccessTools.Field(typeof(Player), "IsReplay");
+
+        private static bool IsReplayPlayerBody(PlayerBody body)
+        {
+            if (body == null) return false;
+
+            if (NetworkBehaviourSingleton<GameManager>.Instance != null &&
+                NetworkBehaviourSingleton<GameManager>.Instance.Phase.ToString()
+                    .IndexOf("Replay", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return true;
+            }
+
+            Player p = body.Player;
+            if (p != null)
+            {
+                try
+                {
+                    object val = _playerIsReplayProp != null
+                        ? _playerIsReplayProp.GetValue(p)
+                        : (_playerIsReplayField != null ? _playerIsReplayField.GetValue(p) : null);
+
+                    if (val is bool b) return b;
+                    if (val is NetworkVariable<bool> nv) return nv.Value;
+                }
+                catch { }
+            }
+
+            return false;
+        }
+
         [HarmonyPostfix]
         public static void Postfix(PlayerBody __instance)
         {
             if (__instance == null) return;
 
-            if (NetworkRoles.IsServer)
+            if (NetworkRoles.IsServer && !IsReplayPlayerBody(__instance))
             {
                 ulong spawnClientId = __instance.Player != null ? __instance.Player.OwnerClientId : __instance.OwnerClientId;
                 UltimateNetworkSync.ServerSyncActiveHoldersToClient(spawnClientId);
-                UltimateAppearanceManager.ServerBroadcastAllAppearances();
+                UltimateAppearanceManager.ServerSendAllAppearancesToClient(spawnClientId);
             }
 
             if (!UltimateFrisbeePlugin.IsHeadlessServer)
             {
+                if (__instance.Player != null && __instance.Player.IsLocalPlayer)
+                {
+                    UltimateKeybindManager.RequestRescan();
+                }
                 // Attach the full-body rigged Ultimate Frisbee athlete!
                 UltimatePlayerRigManager.AttachRigToPlayerBody(__instance);
                 // Ensure the newly spawned PlayerCamera also has 5,000m far clip distance!
@@ -957,6 +993,11 @@ namespace PuckUltimateFrisbeeMod
 
         public static bool IsCrouchHeldClient(Player localPlayer)
         {
+            if (UltimateKeybindManager.HasOverride(UltimateBindAction.Crouch))
+            {
+                return UltimateKeybindManager.IsPressed(UltimateBindAction.Crouch);
+            }
+
             EnsureMembersScanned();
             RefreshClientActions(localPlayer);
 
@@ -977,6 +1018,13 @@ namespace PuckUltimateFrisbeeMod
 
         public static void CheckJumpClient(Player localPlayer, out bool pressedThisFrame, out bool isHeld)
         {
+            if (UltimateKeybindManager.HasOverride(UltimateBindAction.Jump))
+            {
+                pressedThisFrame = UltimateKeybindManager.WasPressedThisFrame(UltimateBindAction.Jump);
+                isHeld = UltimateKeybindManager.IsPressed(UltimateBindAction.Jump);
+                return;
+            }
+
             EnsureMembersScanned();
             RefreshClientActions(localPlayer);
 
@@ -1447,6 +1495,7 @@ namespace PuckUltimateFrisbeeMod
 
         private static bool IsTypingOrPaused()
         {
+            if (UltimateCustomizationUI.PanelOpen) return true;
             if (Time.timeScale <= 0f) return true;
             if (Cursor.visible && Cursor.lockState != CursorLockMode.Locked) return true;
             
@@ -1476,23 +1525,21 @@ namespace PuckUltimateFrisbeeMod
             if (Body == null || Body.Player == null || !Body.Player.IsLocalPlayer) return;
             _localInstance = this;
 
-            var kb = UnityEngine.InputSystem.Keyboard.current;
-            var mouse = UnityEngine.InputSystem.Mouse.current;
             Player player = Body.Player;
+            UltimateKeybindManager.TickBaseGameOverrideSync(player);
 
             bool isHolding = UltimateNetworkSync.IsPlayerHoldingAnyDisc(player.OwnerClientId);
 
-            // Toggle LMB disc tracking suppression cleanly on state transitions
+            // Toggle disc tracking suppression cleanly on state transitions
             if (isHolding != _wasHoldingDisc)
             {
                 if (isHolding)
                 {
-                    // Just caught/picked up disc: suppress LMB disc track immediately!
                     UltimateDiscTrackSuppressor.ApplySuppressionState(player, true);
 
-                    // Guard against accidental throw if player was holding LMB to track the incoming disc!
-                    bool lmbHeldOnCatch = mouse != null && mouse.leftButton.isPressed;
-                    _requireFreshLmbPress = lmbHeldOnCatch;
+                    // Guard against accidental throw if player was holding their Throw button on catch
+                    bool throwHeldOnCatch = UltimateKeybindManager.IsPressed(UltimateBindAction.Throw);
+                    _requireFreshLmbPress = throwHeldOnCatch;
                     _isLmbClutchSent = false;
                     _localCatchStartTime = Time.time;
                     _hasLocalPivotAnchor = false;
@@ -1501,7 +1548,6 @@ namespace PuckUltimateFrisbeeMod
                 }
                 else
                 {
-                    // No longer holding disc: restore LMB disc tracking immediately!
                     if (_isLmbClutchSent)
                     {
                         _isLmbClutchSent = false;
@@ -1538,28 +1584,26 @@ namespace PuckUltimateFrisbeeMod
                 return;
             }
 
-            // --- 1. Q / E LATERAL STRAFE (works for BOTH Running & Pivot Lunge!) ---
+            // --- 1. LATERAL STRAFE (works for BOTH Running & Pivot Lunge!) ---
             sbyte currentStrafe = 0;
-            if (kb != null)
-            {
-                if (kb.qKey.isPressed) currentStrafe -= 1;
-                if (kb.eKey.isPressed) currentStrafe += 1;
-            }
+            if (UltimateKeybindManager.IsPressed(UltimateBindAction.StrafeLeft))  currentStrafe -= 1;
+            if (UltimateKeybindManager.IsPressed(UltimateBindAction.StrafeRight)) currentStrafe += 1;
+
             if (currentStrafe != _lastSentStrafe)
             {
                 _lastSentStrafe = currentStrafe;
                 UltimateDiveMod.ClientSendStrafeState(currentStrafe);
             }
 
-            // --- 2. HOLDING DISC: LMB CLUTCH + COIL/WHIP + PUMP FAKE + LIVE HUD TELEMETRY ---
+            // --- 2. HOLDING DISC: THROW CLUTCH + COIL/WHIP + PUMP FAKE + LIVE HUD TELEMETRY ---
             if (isHolding)
             {
                 UltimateKeybindReader.CheckJumpClient(player, out _, out _wasJumpHeldLastFrame);
-                UpdateHoldingDiscControls(player, kb, mouse);
+                UpdateHoldingDiscControls(player);
                 return;
             }
 
-            // --- 3. CROUCH + JUMP (RESPECTS CUSTOM BASE-GAME KEYBINDS) SKY JUMP ---
+            // --- 3. CROUCH + JUMP (USES MOD OVERRIDES OR BASE-GAME BINDS) SKY JUMP ---
             bool isCrouchHeld = UltimateKeybindReader.IsCrouchHeldClient(player) ||
                                 (Body.IsSliding != null && Body.IsSliding.Value);
             if (isCrouchHeld)
@@ -1579,8 +1623,8 @@ namespace PuckUltimateFrisbeeMod
                 UltimateDiveMod.ClientSendSkyJumpAction();
             }
 
-            // --- 4. F KEY DIVE / LAYOUT ---
-            bool divePressed = (kb != null && kb.fKey.wasPressedThisFrame);
+            // --- 4. DIVE / LAYOUT ---
+            bool divePressed = UltimateKeybindManager.WasPressedThisFrame(UltimateBindAction.Dive);
             if (divePressed && (Time.unscaledTime - _lastDiveSendTime) >= ClientDiveCooldown)
             {
                 _lastDiveSendTime = Time.unscaledTime;
@@ -1588,10 +1632,7 @@ namespace PuckUltimateFrisbeeMod
             }
         }
 
-        private void UpdateHoldingDiscControls(
-            Player player,
-            UnityEngine.InputSystem.Keyboard kb,
-            UnityEngine.InputSystem.Mouse mouse)
+        private void UpdateHoldingDiscControls(Player player)
         {
             if (player.Stick == null || player.PlayerInput == null) return;
 
@@ -1628,9 +1669,8 @@ namespace PuckUltimateFrisbeeMod
             UltimateLocalThrowTelemetry.PivotExtension01 = pivotExt01;
             UltimateLocalThrowTelemetry.WaitingForFreshLmb = _requireFreshLmbPress;
 
-            bool lmbPressed = mouse != null && mouse.leftButton.isPressed;
-            bool cancelPressed = (kb != null && (kb.rKey.wasPressedThisFrame || kb.spaceKey.wasPressedThisFrame)) ||
-                                 (mouse != null && mouse.rightButton.wasPressedThisFrame);
+            bool lmbPressed = UltimateKeybindManager.IsPressed(UltimateBindAction.Throw);
+            bool cancelPressed = UltimateKeybindManager.WasPressedThisFrame(UltimateBindAction.CancelThrow);
 
             // Pump Fake / Cancel while armed
             if (cancelPressed && _isLmbClutchSent)
@@ -1658,20 +1698,20 @@ namespace PuckUltimateFrisbeeMod
                 return;
             }
 
-            // LMB Pressed -> Arm Throw!
+            // Throw Button Pressed -> Arm Throw!
             if (lmbPressed && !_isLmbClutchSent)
             {
                 _isLmbClutchSent = true;
                 UltimateDiveMod.ClientSendThrowClutchState(true);
                 UltimateLocalThrowTelemetry.LocalTracker.BeginArm(Body, player.Stick, stickAngle, bladeAngle, liveType);
             }
-            // LMB Held -> Update Live Coil, Whip & Wobble Telemetry!
+            // Throw Button Held -> Update Live Coil, Whip & Wobble Telemetry!
             else if (lmbPressed && _isLmbClutchSent)
             {
                 UltimateLocalThrowTelemetry.LocalTracker.UpdateArm(
                     Body, player.Stick, stickAngle, bladeAngle, isLeft, liveType, pivotExt01, Time.deltaTime);
             }
-            // LMB Released -> Fire Throw!
+            // Throw Button Released -> Fire Throw!
             else if (!lmbPressed && _isLmbClutchSent)
             {
                 var tr = UltimateLocalThrowTelemetry.LocalTracker;

@@ -125,6 +125,25 @@ namespace PuckUltimateFrisbeeMod
             new Color(0.18f, 0.58f, 0.95f, 1f),
         };
 
+        public static void ServerSendAllAppearancesToClient(ulong targetClientId)
+        {
+            var nm = NetworkManager.Singleton;
+            if (nm == null || !nm.IsServer || nm.CustomMessagingManager == null) return;
+            if (targetClientId == NetworkManager.ServerClientId) return;
+            if (SyncedAppearances.Count == 0) return;
+
+            using (var writer = new FastBufferWriter(16 + SyncedAppearances.Count * 16, Allocator.Temp))
+            {
+                writer.WriteValueSafe((ushort)SyncedAppearances.Count);
+                foreach (var kvp in SyncedAppearances)
+                {
+                    writer.WriteValueSafe(kvp.Key);
+                    WriteAppearance(writer, kvp.Value);
+                }
+                nm.CustomMessagingManager.SendNamedMessage(ServerToAllMsg, targetClientId, writer, NetworkDelivery.Reliable);
+            }
+        }
+
         public static void Initialize(string pluginDirectory)
         {
             _configPath = Path.Combine(pluginDirectory ?? "", "ultimate_appearance.json");
@@ -299,8 +318,13 @@ namespace PuckUltimateFrisbeeMod
                 {
                     reader.ReadValueSafe(out ulong clientId);
                     PlayerAppearanceData data = ReadAppearance(reader);
+
+                    bool changed = !SyncedAppearances.TryGetValue(clientId, out var prev) || !prev.Equals(data);
                     SyncedAppearances[clientId] = data;
-                    RefreshPlayerVisualsByClientId(clientId);
+                    if (changed)
+                    {
+                        RefreshPlayerVisualsByClientId(clientId);
+                    }
                 }
             }
             catch { }
@@ -361,19 +385,62 @@ namespace PuckUltimateFrisbeeMod
 
     public sealed class UltimateCustomizationUI : MonoBehaviour
     {
+        private enum MenuTab
+        {
+            Appearance = 0,
+            Keybinds = 1
+        }
+
+        private struct KeybindRowInfo
+        {
+            public UltimateBindAction Action;
+            public string Title;
+            public string Description;
+        }
+
+        private static readonly KeybindRowInfo[] ModMechanicRows =
+        {
+            new KeybindRowInfo { Action = UltimateBindAction.Throw,       Title = "Throw (Hold & Release)",   Description = "Hold to arm & whip, release to throw disc." },
+            new KeybindRowInfo { Action = UltimateBindAction.CancelThrow, Title = "Cancel Throw / Fake",      Description = "Cancel an armed throw mid-windup." },
+            new KeybindRowInfo { Action = UltimateBindAction.Dive,        Title = "Layout Dive",              Description = "Dive horizontally to catch or block." },
+            new KeybindRowInfo { Action = UltimateBindAction.StrafeLeft,  Title = "Strafe / Pivot Left",      Description = "Run left or lunge left around pivot foot." },
+            new KeybindRowInfo { Action = UltimateBindAction.StrafeRight, Title = "Strafe / Pivot Right",     Description = "Run right or lunge right around pivot foot." },
+            new KeybindRowInfo { Action = UltimateBindAction.ToggleHud,   Title = "Toggle Controls HUD",      Description = "Show or hide the bottom-right controls overlay." },
+            new KeybindRowInfo { Action = UltimateBindAction.ToggleMenu,  Title = "Open / Close Mod Menu",    Description = "Toggle this Athlete & Keybinds window." }
+        };
+
+        private static readonly KeybindRowInfo[] BaseOverrideRows =
+        {
+            new KeybindRowInfo { Action = UltimateBindAction.DiscTrack, Title = "Disc Track",     Description = "Hold to lock camera onto the disc." },
+            new KeybindRowInfo { Action = UltimateBindAction.Jump,      Title = "Jump",           Description = "Jump, or combine with Crouch for Sky Jump." },
+            new KeybindRowInfo { Action = UltimateBindAction.Crouch,    Title = "Crouch / Slide", Description = "Crouch/slide; combine with Jump for Sky Jump." },
+            new KeybindRowInfo { Action = UltimateBindAction.Sprint,    Title = "Sprint",         Description = "Sprint while running without the disc." }
+        };
+
         public static UltimateCustomizationUI Instance { get; private set; }
         public static bool PanelOpen => Instance != null && Instance._isVisible;
+        public static bool IsCapturingKeybind => Instance != null && Instance._isVisible && Instance._listeningAction.HasValue;
         public static Key ToggleKey = Key.F4;
 
         private bool _isVisible;
+        private MenuTab _activeTab = MenuTab.Appearance;
         private bool _savedCursorState;
         private CursorLockMode _prevLockState = CursorLockMode.None;
         private bool _prevCursorVisible;
         private bool _savedMouseRequired;
         private bool _prevIsMouseRequired;
 
+        // Keybind Capture State
+        private UltimateBindAction? _listeningAction = null;
+        private bool _waitForLmbRelease = false;
+        private int _listenStartFrame = -1;
+        private float _listenStartTime = 0f;
+        private int _suppressToggleUntilFrame = -1;
+        private float _swallowGuiMouseUntilTime = -1f;
+
         private Texture2D _whiteTex;
         private GUIStyle _titleStyle, _subStyle, _secStyle, _rowLabelStyle, _rowDescStyle, _valStyle, _hintOverlayStyle;
+        private GUIStyle _bindTitleStyle, _bindDescStyle, _infoBodyStyle;
 
         // --- 3D PREVIEW BOOTH OBJECTS ---
         private GameObject _boothRoot;
@@ -381,21 +448,23 @@ namespace PuckUltimateFrisbeeMod
         private RenderTexture _previewRT;
         private GameObject _previewAvatar;
         private UltimatePlayerMarker _previewMarker;
-        private float _previewYaw = 155f; // Angled slightly so you see face + cap brim
-        private float _previewZoom = 0f;  // 0 = Full Body, 1 = Head/Upper Torso Closeup
+        private float _previewYaw = 155f;
+        private float _previewZoom = 0f;
         private bool _isDraggingPreview = false;
         private PlayerTeam _previewTeam = PlayerTeam.Blue;
 
         // MapHack Dark Slate & Blue Accent Palette
-        private static readonly Color BackdropCol = new Color32(0, 0, 0, 145);
-        private static readonly Color PanelBg     = new Color32(20, 20, 24, 248);
-        private static readonly Color PanelBorder = new Color32(48, 48, 56, 255);
-        private static readonly Color SectionBg   = new Color32(26, 26, 32, 255);
-        private static readonly Color RowBg       = new Color32(34, 34, 40, 255);
-        private static readonly Color ButtonBg    = new Color32(48, 48, 56, 255);
-        private static readonly Color Accent      = new Color32(74, 158, 255, 255);
-        private static readonly Color TextPrimary = new Color32(240, 240, 245, 255);
-        private static readonly Color TextMuted   = new Color32(155, 155, 165, 255);
+        private static readonly Color BackdropCol  = new Color32(0, 0, 0, 145);
+        private static readonly Color PanelBg      = new Color32(20, 20, 24, 248);
+        private static readonly Color PanelBorder  = new Color32(48, 48, 56, 255);
+        private static readonly Color SectionBg    = new Color32(26, 26, 32, 255);
+        private static readonly Color RowBg        = new Color32(34, 34, 40, 255);
+        private static readonly Color ButtonBg     = new Color32(48, 48, 56, 255);
+        private static readonly Color Accent       = new Color32(74, 158, 255, 255);
+        private static readonly Color ListenAccent = new Color32(235, 165, 45, 255);
+        private static readonly Color OverrideCol  = new Color32(46, 204, 113, 255);
+        private static readonly Color TextPrimary  = new Color32(240, 240, 245, 255);
+        private static readonly Color TextMuted    = new Color32(155, 155, 165, 255);
 
         public static void Initialize()
         {
@@ -429,33 +498,93 @@ namespace PuckUltimateFrisbeeMod
             DestroyPreviewBooth();
         }
 
+        private void StartListeningForBind(UltimateBindAction action)
+        {
+            _listeningAction = action;
+            _waitForLmbRelease = Mouse.current != null && Mouse.current.leftButton.isPressed;
+            _listenStartFrame = Time.frameCount;
+            _listenStartTime = Time.unscaledTime;
+        }
+
+        private void CancelListening()
+        {
+            _listeningAction = null;
+            _waitForLmbRelease = false;
+        }
+
         private void Update()
         {
             UltimateAppearanceManager.TickClientSyncCheck();
+            UltimateKeybindManager.TickBaseGameOverrideSync(null);
 
             var kb = Keyboard.current;
-            if (kb == null || IsChatOpen()) return;
+            if (IsChatOpen()) return;
 
-            if (kb[ToggleKey].wasPressedThisFrame)
+            // --- 1. ACTIVE KEYBIND CAPTURE ---
+            if (_isVisible && _listeningAction.HasValue)
             {
-                if (_isVisible) Hide();
-                else Show();
-            }
-            else if (_isVisible && kb[Key.Escape].wasPressedThisFrame)
-            {
-                Hide();
+                if (_waitForLmbRelease)
+                {
+                    if (Mouse.current == null || !Mouse.current.leftButton.isPressed)
+                        _waitForLmbRelease = false;
+                    return;
+                }
+
+                if (Time.frameCount <= _listenStartFrame || (Time.unscaledTime - _listenStartTime) < 0.06f)
+                    return;
+
+                if (kb != null && kb.escapeKey.wasPressedThisFrame)
+                {
+                    CancelListening();
+                    _suppressToggleUntilFrame = Time.frameCount + 1;
+                    return;
+                }
+
+                UltimateBindAction targetAction = _listeningAction.Value;
+
+                if (UltimateKeybindManager.IsBaseGameOverrideAction(targetAction) &&
+                    kb != null && (kb.backspaceKey.wasPressedThisFrame || kb.deleteKey.wasPressedThisFrame))
+                {
+                    UltimateKeybindManager.SetBinding(targetAction, "");
+                    CancelListening();
+                    _suppressToggleUntilFrame = Time.frameCount + 1;
+                    return;
+                }
+
+                bool allowMouse = (targetAction != UltimateBindAction.ToggleMenu);
+                if (UltimateKeybindManager.TryCapturePressedBinding(allowMouse, out string capturedPath))
+                {
+                    UltimateKeybindManager.SetBinding(targetAction, capturedPath);
+                    CancelListening();
+                    _suppressToggleUntilFrame = Time.frameCount + 2;
+                    _swallowGuiMouseUntilTime = Time.unscaledTime + 0.22f;
+                }
+                return;
             }
 
-            if (_isVisible && _previewAvatar != null)
+            // --- 2. MENU TOGGLE & ESCAPE ---
+            if (Time.frameCount > _suppressToggleUntilFrame)
             {
-                // Slowly turntable-rotate when not actively dragging
+                if (UltimateKeybindManager.WasPressedThisFrame(UltimateBindAction.ToggleMenu))
+                {
+                    if (_isVisible) Hide();
+                    else Show();
+                }
+                else if (_isVisible && kb != null && kb.escapeKey.wasPressedThisFrame)
+                {
+                    Hide();
+                }
+            }
+
+            // --- 3. 3D PREVIEW BOOTH ANIMATION ---
+            if (_isVisible && _activeTab == MenuTab.Appearance && _previewAvatar != null)
+            {
                 if (!_isDraggingPreview)
                 {
                     _previewYaw = (_previewYaw + Time.unscaledDeltaTime * 14f) % 360f;
                 }
                 _previewAvatar.transform.localRotation = Quaternion.Euler(0f, _previewYaw, 0f);
 
-                // Smoothly interpolate camera between Full Body (zoom=0) and Head/Torso Closeup (zoom=1)
                 if (_previewCam != null)
                 {
                     Vector3 fullBodyCamPos = new Vector3(0f, 0.96f, -3.45f);
@@ -499,10 +628,8 @@ namespace PuckUltimateFrisbeeMod
             {
                 _boothRoot = new GameObject("__Ultimate3DPreviewBooth__");
                 DontDestroyOnLoad(_boothRoot);
-                // Place 500m underground so it never overlaps the stadium or players
                 _boothRoot.transform.position = new Vector3(0f, -500f, 0f);
 
-                // Studio Camera
                 GameObject camObj = new GameObject("PreviewCamera");
                 camObj.transform.SetParent(_boothRoot.transform, false);
                 _previewCam = camObj.AddComponent<Camera>();
@@ -514,7 +641,6 @@ namespace PuckUltimateFrisbeeMod
                 _previewCam.targetTexture = _previewRT;
                 _previewCam.useOcclusionCulling = false;
 
-                // Studio Key Light
                 GameObject keyLightObj = new GameObject("PreviewKeyLight");
                 keyLightObj.transform.SetParent(_boothRoot.transform, false);
                 keyLightObj.transform.localPosition = new Vector3(1.5f, 2.6f, -2.2f);
@@ -526,7 +652,6 @@ namespace PuckUltimateFrisbeeMod
                 keyLight.color = new Color(1.0f, 0.98f, 0.94f);
                 keyLight.shadows = LightShadows.None;
 
-                // Studio Rim/Fill Light
                 GameObject fillLightObj = new GameObject("PreviewFillLight");
                 fillLightObj.transform.SetParent(_boothRoot.transform, false);
                 fillLightObj.transform.localPosition = new Vector3(-1.8f, 1.5f, -1.5f);
@@ -537,7 +662,6 @@ namespace PuckUltimateFrisbeeMod
                 fillLight.color = new Color(0.65f, 0.80f, 1.0f);
                 fillLight.shadows = LightShadows.None;
 
-                // Instantiate the Modular Athlete Model
                 _previewAvatar = Instantiate(UltimateAssetLoader.CustomPlayerPrefab, _boothRoot.transform);
                 _previewAvatar.name = "PreviewAthleteMannequin";
                 _previewAvatar.transform.localPosition = Vector3.zero;
@@ -551,13 +675,11 @@ namespace PuckUltimateFrisbeeMod
                     smr.updateWhenOffscreen = true;
                 }
 
-                // Relax the T-Pose arms into a natural athletic standing stance if no Animator is playing
                 RelaxTPoseArms(_previewAvatar.transform);
 
                 _previewMarker = _previewAvatar.AddComponent<UltimatePlayerMarker>();
             }
 
-            // Detect local player's current team if spawned
             var nm = NetworkManager.Singleton;
             if (nm != null && nm.IsClient)
             {
@@ -569,20 +691,18 @@ namespace PuckUltimateFrisbeeMod
                 }
             }
 
-            _boothRoot.SetActive(true);
+            _boothRoot.SetActive(_activeTab == MenuTab.Appearance);
             RefreshPreviewMannequin();
         }
 
         private static void RelaxTPoseArms(Transform avatarRoot)
         {
-            // Disable Animator if it has no controller or is stuck in T-Pose
             Animator anim = avatarRoot.GetComponent<Animator>();
             if (anim != null && anim.runtimeAnimatorController == null)
             {
                 anim.enabled = false;
             }
 
-            // Rotate LeftArm and RightArm down from horizontal T-Pose (~68 degrees) for a clean athletic stance
             Transform leftArm = FindBone(avatarRoot, "mixamorig:LeftArm");
             Transform rightArm = FindBone(avatarRoot, "mixamorig:RightArm");
             Transform leftForeArm = FindBone(avatarRoot, "mixamorig:LeftForeArm");
@@ -617,10 +737,8 @@ namespace PuckUltimateFrisbeeMod
                 fallbackHead = localP?.PlayerBody?.PlayerMesh?.PlayerHead;
             }
 
-            // 1. Apply Gender, Hair, Headgear, Skin Color & Hair Color
             UltimateSkinAndTeamSync.ApplyToTarget(_previewAvatar.transform, UltimateAppearanceManager.LocalAppearance, fallbackHead);
 
-            // 2. Re-apply Team Color (since enabling/disabling new headgear meshes needs team tinting)
             if (_previewMarker != null)
             {
                 _previewMarker.LastAppliedTeam = null;
@@ -646,6 +764,7 @@ namespace PuckUltimateFrisbeeMod
         public void Show()
         {
             if (_isVisible) return;
+            CancelListening();
             _prevLockState = Cursor.lockState;
             _prevCursorVisible = Cursor.visible;
             _savedCursorState = true;
@@ -675,6 +794,7 @@ namespace PuckUltimateFrisbeeMod
         public void Hide()
         {
             if (!_isVisible) return;
+            CancelListening();
             _isVisible = false;
             _isDraggingPreview = false;
 
@@ -692,6 +812,9 @@ namespace PuckUltimateFrisbeeMod
                 Cursor.visible = _prevCursorVisible;
                 _savedCursorState = false;
             }
+
+            // Re-scan and apply overrides now that Puck re-enables gameplay InputActions
+            UltimateKeybindManager.RequestRescan();
         }
 
         private void EnsureStyles()
@@ -710,6 +833,15 @@ namespace PuckUltimateFrisbeeMod
 
             _rowDescStyle = new GUIStyle(GUI.skin.label) { fontSize = 11, alignment = TextAnchor.MiddleLeft, wordWrap = true };
             _rowDescStyle.normal.textColor = TextMuted;
+
+            _bindTitleStyle = new GUIStyle(GUI.skin.label) { fontSize = 13, fontStyle = FontStyle.Bold, alignment = TextAnchor.MiddleLeft };
+            _bindTitleStyle.normal.textColor = TextPrimary;
+
+            _bindDescStyle = new GUIStyle(GUI.skin.label) { fontSize = 10, alignment = TextAnchor.MiddleLeft, wordWrap = false };
+            _bindDescStyle.normal.textColor = TextMuted;
+
+            _infoBodyStyle = new GUIStyle(GUI.skin.label) { fontSize = 11, alignment = TextAnchor.UpperLeft, wordWrap = true };
+            _infoBodyStyle.normal.textColor = TextMuted;
 
             _valStyle = new GUIStyle(GUI.skin.label) { fontSize = 12, fontStyle = FontStyle.Bold, alignment = TextAnchor.MiddleCenter };
             _valStyle.normal.textColor = Accent;
@@ -734,15 +866,15 @@ namespace PuckUltimateFrisbeeMod
             DrawRect(new Rect(r.xMax - t, r.y, t, r.height), c);
         }
 
-        private bool DrawStyledButton(Rect r, string text, Color? overrideBg = null)
+        private bool DrawStyledButton(Rect r, string text, Color? overrideBg = null, Color? overrideBorder = null, Color? overrideText = null)
         {
-            bool hover = r.Contains(Event.current.mousePosition);
+            bool hover = !_listeningAction.HasValue && r.Contains(Event.current.mousePosition);
             Color baseCol = overrideBg ?? ButtonBg;
             DrawRect(r, hover ? Color.Lerp(baseCol, Accent, 0.35f) : baseCol);
-            DrawBorder(r, (hover || overrideBg.HasValue) ? Accent : PanelBorder, 1f);
+            DrawBorder(r, overrideBorder ?? ((hover || overrideBg.HasValue) ? Accent : PanelBorder), 1f);
 
             Color prevTextCol = _valStyle.normal.textColor;
-            _valStyle.normal.textColor = (overrideBg.HasValue || hover) ? TextPrimary : Accent;
+            _valStyle.normal.textColor = overrideText ?? ((overrideBg.HasValue || hover) ? TextPrimary : Accent);
             bool clicked = GUI.Button(r, text, _valStyle);
             _valStyle.normal.textColor = prevTextCol;
 
@@ -754,11 +886,21 @@ namespace PuckUltimateFrisbeeMod
             if (!_isVisible || _whiteTex == null) return;
             EnsureStyles();
 
+            // Swallow GUI mouse clicks while actively capturing a keybind (or immediately after capturing a mouse button)
+            Event ev = Event.current;
+            if (ev != null && (_listeningAction.HasValue || Time.unscaledTime < _swallowGuiMouseUntilTime))
+            {
+                if (ev.type == EventType.MouseDown || ev.type == EventType.MouseUp || ev.type == EventType.MouseDrag)
+                {
+                    ev.Use();
+                }
+            }
+
             // Fullscreen dimmed backdrop
             DrawRect(new Rect(0, 0, Screen.width, Screen.height), BackdropCol);
 
             float panelW = 940f;
-            float panelH = 580f; // Increased to fit 6 rows
+            float panelH = 580f;
             Rect panelRect = new Rect((Screen.width - panelW) * 0.5f, (Screen.height - panelH) * 0.5f, panelW, panelH);
 
             DrawRect(panelRect, PanelBg);
@@ -766,24 +908,63 @@ namespace PuckUltimateFrisbeeMod
 
             float x = panelRect.x + 22f;
             float y = panelRect.y + 18f;
+            float usableW = panelW - 44f;
+
+            // Header Title
+            _titleStyle.normal.textColor = TextPrimary;
+            GUI.Label(new Rect(x, y, 145f, 34f), "ULTIMATE", _titleStyle);
+            _titleStyle.normal.textColor = Accent;
+            GUI.Label(new Rect(x + 140f, y, 220f, 34f), _activeTab == MenuTab.Appearance ? "ATHLETE" : "CONTROLS", _titleStyle);
+
+            // Top-Right Tab Switcher (APPEARANCE | KEYBINDS)
+            Rect keybindsTabRect   = new Rect(panelRect.xMax - 22f - 132f, y + 2f, 132f, 30f);
+            Rect appearanceTabRect = new Rect(keybindsTabRect.x - 138f,    y + 2f, 132f, 30f);
+
+            if (DrawStyledButton(appearanceTabRect, "APPEARANCE",
+                _activeTab == MenuTab.Appearance ? new Color(0.16f, 0.42f, 0.78f) : (Color?)null))
+            {
+                CancelListening();
+                _activeTab = MenuTab.Appearance;
+                if (_boothRoot != null) _boothRoot.SetActive(true);
+            }
+
+            if (DrawStyledButton(keybindsTabRect, "KEYBINDS",
+                _activeTab == MenuTab.Keybinds ? new Color(0.16f, 0.42f, 0.78f) : (Color?)null))
+            {
+                CancelListening();
+                _activeTab = MenuTab.Keybinds;
+                if (_boothRoot != null) _boothRoot.SetActive(false);
+            }
+
+            y += 34f;
+
+            string menuKeyLabel = UltimateKeybindManager.GetDisplayLabel(UltimateBindAction.ToggleMenu);
+            string subText = _activeTab == MenuTab.Appearance
+                ? $"Character appearance & gear  ·  Synced across server  ·  {menuKeyLabel} to toggle  ·  Esc to close"
+                : $"Mod-only keybinds  ·  Base game binds remain untouched  ·  {menuKeyLabel} to toggle  ·  Esc to close";
+            GUI.Label(new Rect(x, y, usableW, 20f), subText, _subStyle);
+            y += 28f;
+
+            float secH = 420f;
+            float footerY = panelRect.yMax - 48f;
+
+            if (_activeTab == MenuTab.Appearance)
+            {
+                DrawAppearanceTab(panelRect, x, y, secH, footerY);
+            }
+            else
+            {
+                DrawKeybindsTab(panelRect, x, y, usableW, secH, footerY);
+            }
+        }
+
+        private void DrawAppearanceTab(Rect panelRect, float x, float y, float secH, float footerY)
+        {
             float leftColW = 610f;
             float rightColW = 272f;
             float rightColX = x + leftColW + 14f;
 
-            // Header
-            _titleStyle.normal.textColor = TextPrimary;
-            GUI.Label(new Rect(x, y, 145f, 34f), "ULTIMATE", _titleStyle);
-            _titleStyle.normal.textColor = Accent;
-            GUI.Label(new Rect(x + 140f, y, 200f, 34f), "ATHLETE", _titleStyle);
-            y += 34f;
-
-            GUI.Label(new Rect(x, y, panelW - 44f, 20f), $"Character appearance & gear  ·  Synced across server  ·  {ToggleKey} to toggle  ·  Esc to close", _subStyle);
-            y += 28f;
-
-            // =================================================================
             // LEFT COLUMN: CUSTOMIZATION CONTROLS
-            // =================================================================
-            float secH = 420f; // Increased to fit 6 rows
             Rect secRect = new Rect(x, y, leftColW, secH);
             DrawRect(secRect, SectionBg);
             DrawBorder(secRect, PanelBorder, 1f);
@@ -829,9 +1010,7 @@ namespace PuckUltimateFrisbeeMod
                 UltimateAppearanceManager.HairColorNames, UltimateAppearanceManager.HairColorPalette, d.HairColorIndex,
                 next => { d.HairColorIndex = (byte)next; ApplyAndSync(d); });
 
-            // =================================================================
             // RIGHT COLUMN: LIVE 3D PREVIEW BOOTH
-            // =================================================================
             Rect previewCard = new Rect(rightColX, y, rightColW, secH);
             DrawRect(previewCard, SectionBg);
             DrawBorder(previewCard, PanelBorder, 1f);
@@ -839,7 +1018,6 @@ namespace PuckUltimateFrisbeeMod
             DrawRect(new Rect(rightColX + 14f, y + 14f, 4f, 18f), Accent);
             GUI.Label(new Rect(rightColX + 26f, y + 12f, 140f, 22f), "3D PREVIEW", _secStyle);
 
-            // Team Kit Preview Toggle (BLUE / RED) in top-right of Preview Card
             Rect blueBtn = new Rect(previewCard.xMax - 114f, y + 10f, 48f, 24f);
             Rect redBtn  = new Rect(previewCard.xMax - 60f,  y + 10f, 48f, 24f);
             if (DrawStyledButton(blueBtn, "BLUE", _previewTeam == PlayerTeam.Blue ? new Color(0.16f, 0.45f, 0.82f) : (Color?)null))
@@ -862,7 +1040,6 @@ namespace PuckUltimateFrisbeeMod
             }
             DrawBorder(viewportRect, PanelBorder, 1f);
 
-            // Handle Mouse Drag (Rotate) & Scroll Wheel (Zoom) inside the 3D Viewport
             Event ev = Event.current;
             if (ev != null)
             {
@@ -890,10 +1067,7 @@ namespace PuckUltimateFrisbeeMod
             GUI.Label(new Rect(viewportRect.x, viewportRect.yMax - 22f, viewportRect.width, 20f),
                 "Drag to Rotate  ·  Scroll to Zoom", _hintOverlayStyle);
 
-            // =================================================================
             // FOOTER
-            // =================================================================
-            float footerY = panelRect.yMax - 48f;
             GUI.Label(new Rect(x, footerY + 6f, 380f, 22f), "Changes save automatically & sync live to all players.", _subStyle);
 
             if (DrawStyledButton(new Rect(panelRect.xMax - 362f, footerY, 108f, 32f), "RANDOMIZE"))
@@ -917,6 +1091,158 @@ namespace PuckUltimateFrisbeeMod
             if (DrawStyledButton(new Rect(panelRect.xMax - 130f, footerY, 108f, 32f), "CLOSE"))
             {
                 Hide();
+            }
+        }
+
+        private void DrawKeybindsTab(Rect panelRect, float x, float y, float usableW, float secH, float footerY)
+        {
+            float colGap = 16f;
+            float colW = (usableW - colGap) * 0.5f;
+            float rightX = x + colW + colGap;
+
+            // =================================================================
+            // LEFT COLUMN: MOD-NATIVE MECHANICS
+            // =================================================================
+            Rect leftCard = new Rect(x, y, colW, secH);
+            DrawRect(leftCard, SectionBg);
+            DrawBorder(leftCard, PanelBorder, 1f);
+
+            DrawRect(new Rect(x + 14f, y + 14f, 4f, 18f), Accent);
+            GUI.Label(new Rect(x + 26f, y + 12f, colW - 40f, 22f), "ULTIMATE MECHANICS", _secStyle);
+
+            float rowY = y + 42f;
+            for (int i = 0; i < ModMechanicRows.Length; i++)
+            {
+                DrawKeybindRow(new Rect(x + 12f, rowY, colW - 24f, 47f), ModMechanicRows[i], isOverrideRow: false);
+                rowY += 52f;
+            }
+
+            // =================================================================
+            // RIGHT COLUMN: BASE-GAME OVERRIDES (MOD-ONLY)
+            // =================================================================
+            Rect rightCard = new Rect(rightX, y, colW, secH);
+            DrawRect(rightCard, SectionBg);
+            DrawBorder(rightCard, PanelBorder, 1f);
+
+            DrawRect(new Rect(rightX + 14f, y + 14f, 4f, 18f), OverrideCol);
+            GUI.Label(new Rect(rightX + 26f, y + 12f, colW - 40f, 22f), "BASE-GAME OVERRIDES (MOD-ONLY)", _secStyle);
+
+            float oRowY = y + 42f;
+            for (int i = 0; i < BaseOverrideRows.Length; i++)
+            {
+                DrawKeybindRow(new Rect(rightX + 12f, oRowY, colW - 24f, 52f), BaseOverrideRows[i], isOverrideRow: true);
+                oRowY += 58f;
+            }
+
+            // Info Box explaining base-game isolation
+            Rect infoRect = new Rect(rightX + 12f, oRowY + 4f, colW - 24f, (y + secH) - (oRowY + 16f));
+            DrawRect(infoRect, RowBg);
+            DrawRect(new Rect(infoRect.x, infoRect.y, 3f, infoRect.height), OverrideCol);
+            DrawBorder(infoRect, PanelBorder, 1f);
+
+            GUI.Label(new Rect(infoRect.x + 14f, infoRect.y + 8f, infoRect.width - 24f, 20f),
+                "BASE GAME BINDS STAY UNTOUCHED", _bindTitleStyle);
+            GUI.Label(new Rect(infoRect.x + 14f, infoRect.y + 30f, infoRect.width - 24f, infoRect.height - 36f),
+                "• Overrides apply in memory only while this mod is active and never write to Puck's settings.\n" +
+                "• Leave as GAME DEFAULT to keep your Puck bind, or bind a separate mod key (e.g. Space to Jump while base Puck uses Mouse 4).\n" +
+                "• Supports Keyboard & Mouse 1–5. Press ESC to cancel or click ✕ to revert.",
+                _infoBodyStyle);
+
+            // =================================================================
+            // FOOTER
+            // =================================================================
+            if (_listeningAction.HasValue)
+            {
+                string extra = UltimateKeybindManager.IsBaseGameOverrideAction(_listeningAction.Value)
+                    ? "  ·  BKSP for Game Default"
+                    : "";
+                Color prevSub = _subStyle.normal.textColor;
+                _subStyle.normal.textColor = ListenAccent;
+                GUI.Label(new Rect(x, footerY + 6f, 560f, 22f),
+                    $"LISTENING — Press any key or mouse button  ·  ESC to cancel{extra}", _subStyle);
+                _subStyle.normal.textColor = prevSub;
+            }
+            else
+            {
+                GUI.Label(new Rect(x, footerY + 6f, 500f, 22f),
+                    "Keybinds save automatically to ultimate_keybinds.json.", _subStyle);
+            }
+
+            if (DrawStyledButton(new Rect(panelRect.xMax - 266f, footerY, 128f, 32f), "RESET BINDS"))
+            {
+                CancelListening();
+                UltimateKeybindManager.ResetAllToDefaults();
+            }
+
+            if (DrawStyledButton(new Rect(panelRect.xMax - 130f, footerY, 108f, 32f), "CLOSE"))
+            {
+                Hide();
+            }
+        }
+
+        private void DrawKeybindRow(Rect rowRect, KeybindRowInfo info, bool isOverrideRow)
+        {
+            DrawRect(rowRect, RowBg);
+
+            bool isListening = _listeningAction.HasValue && _listeningAction.Value == info.Action;
+            bool hasOverride = isOverrideRow && UltimateKeybindManager.HasOverride(info.Action);
+
+            float textW = isOverrideRow ? (rowRect.width - 186f) : (rowRect.width - 158f);
+            GUI.Label(new Rect(rowRect.x + 12f, rowRect.y + 5f, textW, 19f), info.Title, _bindTitleStyle);
+            GUI.Label(new Rect(rowRect.x + 12f, rowRect.y + 24f, textW, 19f), info.Description, _bindDescStyle);
+
+            string btnLabel = isListening ? "PRESS KEY..." : UltimateKeybindManager.GetDisplayLabel(info.Action);
+
+            Color? bgOverride = null;
+            Color? borderOverride = null;
+            Color? textOverride = null;
+
+            if (isListening)
+            {
+                bgOverride = new Color(0.55f, 0.38f, 0.10f, 1f);
+                borderOverride = ListenAccent;
+                textOverride = TextPrimary;
+            }
+            else if (hasOverride)
+            {
+                bgOverride = new Color(0.12f, 0.30f, 0.22f, 1f);
+                borderOverride = OverrideCol;
+                textOverride = new Color(0.55f, 0.96f, 0.72f, 1f);
+            }
+            else if (isOverrideRow)
+            {
+                textOverride = TextMuted;
+            }
+
+            if (isOverrideRow)
+            {
+                Rect clearBtn = new Rect(rowRect.xMax - 36f, rowRect.y + (rowRect.height - 29f) * 0.5f, 28f, 29f);
+                Rect bindBtn  = new Rect(clearBtn.x - 134f,  rowRect.y + (rowRect.height - 29f) * 0.5f, 128f, 29f);
+
+                if (DrawStyledButton(bindBtn, btnLabel, bgOverride, borderOverride, textOverride))
+                {
+                    StartListeningForBind(info.Action);
+                }
+
+                if (DrawStyledButton(clearBtn, "X",
+                    hasOverride ? new Color(0.42f, 0.18f, 0.18f, 1f) : (Color?)null,
+                    hasOverride ? new Color(0.85f, 0.32f, 0.32f, 1f) : (Color?)null,
+                    hasOverride ? TextPrimary : new Color(0.42f, 0.42f, 0.48f, 1f)))
+                {
+                    if (hasOverride)
+                    {
+                        CancelListening();
+                        UltimateKeybindManager.SetBinding(info.Action, "");
+                    }
+                }
+            }
+            else
+            {
+                Rect bindBtn = new Rect(rowRect.xMax - 142f, rowRect.y + (rowRect.height - 29f) * 0.5f, 132f, 29f);
+                if (DrawStyledButton(bindBtn, btnLabel, bgOverride, borderOverride, textOverride))
+                {
+                    StartListeningForBind(info.Action);
+                }
             }
         }
 

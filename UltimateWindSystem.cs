@@ -694,28 +694,10 @@ namespace PuckUltimateFrisbeeMod
         private GUIStyle _throwStatusStyle;
         private GUIStyle _throwMicroStyle;
 
-        private static readonly (string Action, string Key)[] _runningControls = new[]
-        {
-            ("Sprint / Charge", "Hold Shift"),
-            ("Layout Dive",     "F"),
-            ("Sky Jump",        "Ctrl + Space"),
-            ("Strafe Run",      "Q / E"),
-            ("Wrist Angle",     "Scroll Wheel"),
-            ("Cancel Charge",   "RMB / Space"),
-            ("Track Disc",      "Hold LMB"),
-            ("Customize Gear", "F4")
-        };
-
-        private static readonly (string Action, string Key)[] _holdingDiscControls = new[]
-        {
-            ("Coil + Whip Throw", "Hold + Release LMB"),
-            ("Pump Fake / Cancel", "Free Mouse / RMB"),
-            ("Back / Forehand",   "Hand Left / Right"),
-            ("IO / OI / Flip",    "Scroll Wheel"),
-            ("Hammer / Scoober",  "Aim High / Flip"),
-            ("Pivot Lunge",       "WASD / Q / E"),
-            ("Customize Gear",    "F4")
-        };
+        private readonly (string Action, string Key)[] _runningControls = new (string, string)[7];
+        private readonly (string Action, string Key)[] _holdingDiscControls = new (string, string)[7];
+        private string _cachedHudKeyLabel = "F1";
+        private float _lastHudLabelRefreshTime = -999f;
 
         private void Start()
         {
@@ -1062,8 +1044,8 @@ namespace PuckUltimateFrisbeeMod
         {
             UltimateBroadcastPopupManager.EnsureNetworkRegistered();
             // Toggle Minimalist Controls HUD with F1
-            if (UnityEngine.InputSystem.Keyboard.current != null &&
-                UnityEngine.InputSystem.Keyboard.current.f1Key.wasPressedThisFrame)
+            if (!UltimateCustomizationUI.IsCapturingKeybind &&
+                UltimateKeybindManager.WasPressedThisFrame(UltimateBindAction.ToggleHud))
             {
                 _showControlsHud = !_showControlsHud;
             }
@@ -1377,9 +1359,14 @@ namespace PuckUltimateFrisbeeMod
 
             string statusText;
             Color statusCol;
+
+            string throwKey  = UltimateKeybindManager.GetDisplayLabel(UltimateBindAction.Throw);
+            string cancelKey = UltimateKeybindManager.GetDisplayLabel(UltimateBindAction.CancelThrow);
+            string strafeKeys = $"{UltimateKeybindManager.GetDisplayLabel(UltimateBindAction.StrafeLeft)}-{UltimateKeybindManager.GetDisplayLabel(UltimateBindAction.StrafeRight)}";
+
             if (UltimateLocalThrowTelemetry.WaitingForFreshLmb)
             {
-                statusText = "RELEASE LMB";
+                statusText = $"RELEASE {throwKey}";
                 statusCol = new Color(1f, 0.82f, 0.35f);
             }
             else if (armed)
@@ -1389,11 +1376,13 @@ namespace PuckUltimateFrisbeeMod
             }
             else
             {
-                statusText = "HOLD LMB TO THROW";
+                statusText = $"HOLD {throwKey} TO THROW";
                 statusCol = new Color(0.75f, 0.82f, 0.90f, 0.90f);
             }
             _throwStatusStyle.normal.textColor = statusCol;
-            GUI.Label(new Rect(panel.x + 188f, panel.y + 10f, 168f, 22f), statusText, _throwStatusStyle);
+            GUI.Label(new Rect(panel.x + 172f, panel.y + 68f, 184f, 20f),
+            armed ? $"{cancelKey}: CANCEL" : $"WASD / {strafeKeys}: PIVOT",
+            _throwStatusStyle);
 
             // 2. MIDDLE ROW (y + 40): Power Bar with Coil Ceiling Marker
             Rect barBg = new Rect(panel.x + 12f, panel.y + 40f, panelW - 24f, 20f);
@@ -1455,10 +1444,50 @@ namespace PuckUltimateFrisbeeMod
             GUI.color = prev;
         }
 
+        private void RefreshControlsHudLabelsIfNeeded()
+        {
+            // Refresh 4x/sec so rebinds and discovered base-game defaults appear immediately
+            // without doing string formatting on every OnGUI repaint/layout pass.
+            if (Time.unscaledTime - _lastHudLabelRefreshTime < 0.25f) return;
+            _lastHudLabelRefreshTime = Time.unscaledTime;
+
+            _cachedHudKeyLabel = UltimateKeybindManager.GetDisplayLabel(UltimateBindAction.ToggleHud);
+            string menuKey     = UltimateKeybindManager.GetDisplayLabel(UltimateBindAction.ToggleMenu);
+            string throwKey    = UltimateKeybindManager.GetDisplayLabel(UltimateBindAction.Throw);
+            string cancelKey   = UltimateKeybindManager.GetDisplayLabel(UltimateBindAction.CancelThrow);
+            string diveKey     = UltimateKeybindManager.GetDisplayLabel(UltimateBindAction.Dive);
+            string strafeLeft  = UltimateKeybindManager.GetDisplayLabel(UltimateBindAction.StrafeLeft);
+            string strafeRight = UltimateKeybindManager.GetDisplayLabel(UltimateBindAction.StrafeRight);
+            string strafePair  = $"{strafeLeft} / {strafeRight}";
+
+            // Base-game overrides: show mod override if set, otherwise show live Puck bind (or fallback)
+            string sprintKey = UltimateKeybindManager.GetEffectiveDisplayLabel(UltimateBindAction.Sprint, "Shift");
+            string crouchKey = UltimateKeybindManager.GetEffectiveDisplayLabel(UltimateBindAction.Crouch, "Ctrl");
+            string jumpKey   = UltimateKeybindManager.GetEffectiveDisplayLabel(UltimateBindAction.Jump, "Space");
+            string trackKey  = UltimateKeybindManager.GetEffectiveDisplayLabel(UltimateBindAction.DiscTrack, "LMB");
+
+            _runningControls[0] = ("Sprint",            $"Hold {sprintKey}");
+            _runningControls[1] = ("Layout Dive",       diveKey);
+            _runningControls[2] = ("Sky Jump",          $"{crouchKey} + {jumpKey}");
+            _runningControls[3] = ("Strafe Run",        strafePair);
+            _runningControls[4] = ("Wrist Angle",       "Scroll Wheel");
+            _runningControls[5] = ("Track Disc",        $"Hold {trackKey}");
+            _runningControls[6] = ("Customize / Binds", menuKey);
+
+            _holdingDiscControls[0] = ("Coil + Whip Throw",  $"Hold/Rel {throwKey}");
+            _holdingDiscControls[1] = ("Pump Fake / Cancel", $"Free / {cancelKey}");
+            _holdingDiscControls[2] = ("Back / Forehand",    "Hand Left / Right");
+            _holdingDiscControls[3] = ("IO / OI / Flip",     "Scroll Wheel");
+            _holdingDiscControls[4] = ("Hammer / Scoober",   "Aim High / Flip");
+            _holdingDiscControls[5] = ("Pivot Lunge",        $"WASD / {strafePair}");
+            _holdingDiscControls[6] = ("Customize / Binds",  menuKey);
+        }
+
         private void DrawMinimalistControlsHUD()
         {
             if (_whiteTex == null) return;
             EnsureControlsHudStyles();
+            RefreshControlsHudLabelsIfNeeded();
 
             // Check if the local player is currently holding any disc
             bool isHoldingDisc = false;
@@ -1476,11 +1505,12 @@ namespace PuckUltimateFrisbeeMod
             float margin = 22f;
 
             // -----------------------------------------------------------------
-            // 1. COLLAPSED PILL STATE: "[F1] Show Controls" in bottom-right
+            // 1. COLLAPSED PILL STATE: "[<ToggleHud>] Show Controls"
             // -----------------------------------------------------------------
             if (!_showControlsHud)
             {
-                float pillW = 148f;
+                string pillText = $"[{_cachedHudKeyLabel}] Show Controls";
+                float pillW = Mathf.Max(148f, pillText.Length * 6.8f + 22f);
                 float pillH = 26f;
                 Rect pillRect = new Rect(Screen.width - pillW - margin, Screen.height - pillH - margin, pillW, pillH);
 
@@ -1490,7 +1520,7 @@ namespace PuckUltimateFrisbeeMod
                 DrawSolidRect(new Rect(pillRect.x, pillRect.y, pillRect.width, 1f), new Color(1f, 1f, 1f, 0.12f));
                 DrawSolidRect(new Rect(pillRect.x, pillRect.yMax - 1f, pillRect.width, 1f), new Color(1f, 1f, 1f, 0.12f));
 
-                GUI.Label(pillRect, "[F1] Show Controls", _hudPillTextStyle);
+                GUI.Label(pillRect, pillText, _hudPillTextStyle);
                 return;
             }
 
@@ -1500,7 +1530,7 @@ namespace PuckUltimateFrisbeeMod
             var controls = isHoldingDisc ? _holdingDiscControls : _runningControls;
             string modeTitle = isHoldingDisc ? "HOLDING DISC" : "RUNNING / DEFENSE";
 
-            float panelW = 262f;
+            float panelW = 282f;
             float headerH = 26f;
             float rowH = 21f;
             float padBottom = 8f;
@@ -1529,10 +1559,10 @@ namespace PuckUltimateFrisbeeMod
             DrawSolidRect(new Rect(panelRect.x + 3.5f, panelRect.y, panelRect.width - 3.5f, headerH), new Color(accentColor.r, accentColor.g, accentColor.b, 0.12f));
             DrawSolidRect(new Rect(panelRect.x + 10f, panelRect.y + headerH, panelRect.width - 20f, 1f), new Color(1f, 1f, 1f, 0.08f));
 
-            // Header Title & "[F1] Hide" Hint
+            // Header Title & "[<ToggleHud>] Hide" Hint
             _hudTitleStyle.normal.textColor = accentColor;
-            GUI.Label(new Rect(panelRect.x + 12f, panelRect.y + 3f, 165f, 20f), modeTitle, _hudTitleStyle);
-            GUI.Label(new Rect(panelRect.xMax - 80f, panelRect.y + 3f, 70f, 20f), "[F1] Hide", _hudHintStyle);
+            GUI.Label(new Rect(panelRect.x + 12f, panelRect.y + 3f, 150f, 20f), modeTitle, _hudTitleStyle);
+            GUI.Label(new Rect(panelRect.xMax - 118f, panelRect.y + 3f, 108f, 20f), $"[{_cachedHudKeyLabel}] Hide", _hudHintStyle);
 
             // Rows
             float y = panelRect.y + headerH + 4f;
@@ -1543,22 +1573,24 @@ namespace PuckUltimateFrisbeeMod
                 0.98f
             );
 
+            float maxBadgeW = panelW - 142f;
             for (int i = 0; i < controls.Length; i++)
             {
                 var item = controls[i];
+                string keyText = item.Key ?? "";
 
                 // Action Name on the left
-                GUI.Label(new Rect(panelRect.x + 12f, y, 122f, rowH - 2f), item.Action, _hudActionStyle);
+                GUI.Label(new Rect(panelRect.x + 12f, y, 124f, rowH - 2f), item.Action, _hudActionStyle);
 
-                // Keybind Badge on the right
-                float badgeW = Mathf.Max(46f, item.Key.Length * 6.2f + 14f);
+                // Keybind Badge on the right (clamped so it never overlaps Action Name)
+                float badgeW = Mathf.Clamp(keyText.Length * 6.2f + 14f, 46f, maxBadgeW);
                 float badgeH = 16f;
                 Rect badgeRect = new Rect(panelRect.xMax - badgeW - 10f, y + 2f, badgeW, badgeH);
 
                 DrawSolidRect(badgeRect, new Color(1f, 1f, 1f, 0.08f));
                 DrawSolidRect(new Rect(badgeRect.x, badgeRect.y, badgeRect.width, 1f), new Color(accentColor.r, accentColor.g, accentColor.b, 0.28f));
 
-                GUI.Label(badgeRect, item.Key, _hudKeyTextStyle);
+                GUI.Label(badgeRect, keyText, _hudKeyTextStyle);
 
                 y += rowH;
             }
