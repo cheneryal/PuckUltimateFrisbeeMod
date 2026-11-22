@@ -1122,6 +1122,7 @@ namespace PuckUltimateFrisbeeMod
         private void OnDestroy()
         {
             UltimateStaminaBarHider.RestoreAll();
+            UltimateDiscTrackerHUD.Cleanup();
         }
 
         private void OnGUI()
@@ -1130,7 +1131,8 @@ namespace PuckUltimateFrisbeeMod
             UltimateBroadcastPopupManager.DrawPopups(_whiteTex);
             Camera cam = Camera.main;
             if (cam == null) return;
-
+            // Rocket League-style first-person disc tracking indicator
+            UltimateDiscTrackerHUD.Draw(cam);
             // Top-right HUD Wind Indicator Compass
             float boxW = 136f;
             float boxH = 148f;
@@ -1878,6 +1880,326 @@ namespace PuckUltimateFrisbeeMod
                 }
                 CollectTargetTransforms(child, seenGO);
             }
+        }
+    }
+    // =========================================================================
+    // ROCKET LEAGUE-STYLE FIRST-PERSON DISC TRACKING INDICATOR (C# 7.3)
+    // =========================================================================
+    public static class UltimateDiscTrackerHUD
+    {
+        public static bool Enabled = true;
+
+        private static Texture2D _chevronTex;
+        private static Texture2D _ringTex;
+        private static GUIStyle _distStyle;
+        private static GUIStyle _distShadowStyle;
+        private static GUIStyle _subTagStyle;
+
+        public static void Cleanup()
+        {
+            if (_chevronTex != null)
+            {
+                UnityEngine.Object.Destroy(_chevronTex);
+                _chevronTex = null;
+            }
+            if (_ringTex != null)
+            {
+                UnityEngine.Object.Destroy(_ringTex);
+                _ringTex = null;
+            }
+        }
+
+        private static void EnsureAssets()
+        {
+            if (_chevronTex == null)
+            {
+                // 128x128 crisp anti-aliased directional chevron pointing straight UP (+Y in Texture2D = top of screen)
+                const int size = 128;
+                _chevronTex = new Texture2D(size, size, TextureFormat.ARGB32, false);
+                _chevronTex.wrapMode = TextureWrapMode.Clamp;
+
+                for (int y = 0; y < size; y++)
+                {
+                    float ny = (y / (float)(size - 1)) * 2f - 1f; // -1 bottom, +1 top
+                    for (int x = 0; x < size; x++)
+                    {
+                        float nx = (x / (float)(size - 1)) * 2f - 1f;
+                        float ax = Mathf.Abs(nx);
+
+                        // Bold, sleek dart/chevron silhouette
+                        float upperEdge = 0.88f - ax * 1.80f;
+                        float lowerEdge = -0.22f - ax * 0.48f;
+
+                        float dTop = (upperEdge - ny) * 24f;
+                        float dBot = (ny - lowerEdge) * 24f;
+                        float dWing = (0.76f - ax) * 24f;
+                        float inside = Mathf.Clamp01(Mathf.Min(dTop, Mathf.Min(dBot, dWing)));
+
+                        // Clean dark outline halo for instant readability over bright sky & stadium lights
+                        float haloTop = (upperEdge + 0.12f - ny) * 18f;
+                        float haloBot = (ny - (lowerEdge - 0.11f)) * 18f;
+                        float haloWing = (0.85f - ax) * 18f;
+                        float halo = Mathf.Clamp01(Mathf.Min(haloTop, Mathf.Min(haloBot, haloWing)));
+
+                        if (inside > 0.01f)
+                        {
+                            Color c = Color.Lerp(new Color(0.03f, 0.05f, 0.08f, 0.86f * halo), Color.white, inside);
+                            _chevronTex.SetPixel(x, y, c);
+                        }
+                        else if (halo > 0.01f)
+                        {
+                            _chevronTex.SetPixel(x, y, new Color(0.03f, 0.05f, 0.08f, 0.80f * halo));
+                        }
+                        else
+                        {
+                            _chevronTex.SetPixel(x, y, Color.clear);
+                        }
+                    }
+                }
+                _chevronTex.Apply();
+            }
+
+            if (_ringTex == null)
+            {
+                const int size = 64;
+                _ringTex = new Texture2D(size, size, TextureFormat.ARGB32, false);
+                _ringTex.wrapMode = TextureWrapMode.Clamp;
+
+                float half = (size - 1) * 0.5f;
+                for (int y = 0; y < size; y++)
+                {
+                    for (int x = 0; x < size; x++)
+                    {
+                        float dx = (x - half) / half;
+                        float dy = (y - half) / half;
+                        float d = Mathf.Sqrt(dx * dx + dy * dy);
+
+                        float ring = Mathf.SmoothStep(0.68f, 0.76f, d) * (1f - Mathf.SmoothStep(0.86f, 0.94f, d));
+                        float halo = Mathf.SmoothStep(0.60f, 0.70f, d) * (1f - Mathf.SmoothStep(0.90f, 1.00f, d));
+
+                        if (ring > 0.01f)
+                        {
+                            Color c = Color.Lerp(new Color(0f, 0f, 0f, 0.65f * halo), Color.white, ring);
+                            _ringTex.SetPixel(x, y, c);
+                        }
+                        else if (halo > 0.01f)
+                        {
+                            _ringTex.SetPixel(x, y, new Color(0f, 0f, 0f, 0.55f * halo));
+                        }
+                        else
+                        {
+                            _ringTex.SetPixel(x, y, Color.clear);
+                        }
+                    }
+                }
+                _ringTex.Apply();
+            }
+
+            if (_distStyle == null)
+            {
+                _distStyle = new GUIStyle(GUI.skin.label)
+                {
+                    alignment = TextAnchor.MiddleCenter,
+                    fontSize = 15,
+                    fontStyle = FontStyle.Bold,
+                    wordWrap = false
+                };
+
+                _distShadowStyle = new GUIStyle(_distStyle);
+
+                _subTagStyle = new GUIStyle(GUI.skin.label)
+                {
+                    alignment = TextAnchor.MiddleCenter,
+                    fontSize = 11,
+                    fontStyle = FontStyle.Bold,
+                    wordWrap = false
+                };
+            }
+        }
+
+        public static void Draw(Camera cam)
+        {
+            if (!Enabled || UltimateFrisbeePlugin.IsHeadlessServer || cam == null) return;
+
+            var nm = NetworkManager.Singleton;
+            if (nm == null || !nm.IsClient) return;
+
+            ulong localClientId = nm.LocalClientId;
+
+            // Never clutter the screen while the local player is holding the disc
+            if (UltimateNetworkSync.IsPlayerHoldingAnyDisc(localClientId)) return;
+
+            Puck disc = UltimateNetworkSync.GetPreferredDiscForClient(localClientId);
+            if (disc == null || !disc.IsSpawned || !disc.gameObject.activeInHierarchy) return;
+            if (disc.IsReplay != null && disc.IsReplay.Value) return;
+
+            EnsureAssets();
+
+            // Determine possession & flight state for intuitive color-coding
+            ulong holderId = ulong.MaxValue;
+            if (disc.NetworkObject != null &&
+                UltimateNetworkSync.ClientDiscStates.TryGetValue(disc.NetworkObjectId, out var syncEntry))
+            {
+                holderId = syncEntry.HolderClientId;
+            }
+            else if (!UltimateRulesManager.IsWarmup)
+            {
+                holderId = UltimateNetworkSync.ClientSyncedHolderId;
+            }
+
+            if (holderId == localClientId) return;
+
+            Vector3 discPos = disc.transform.position;
+            Vector3 camPos = cam.transform.position;
+            float distance = Vector3.Distance(camPos, discPos);
+            if (distance < 0.25f) return;
+
+            float groundY = Level_GrassStadiumSetup_Patch.VisualGroundSurfaceY;
+            float discHeight = Mathf.Max(0f, discPos.y - groundY);
+            bool isHeld = holderId != ulong.MaxValue;
+            bool isAirborne = !isHeld && discHeight > 0.35f;
+
+            Color accentColor = GetIndicatorColor(isHeld, isAirborne, holderId);
+
+            // Project into viewport & camera-local coordinates
+            Vector3 vp = cam.WorldToViewportPoint(discPos);
+            Vector3 localPos = cam.transform.InverseTransformPoint(discPos);
+
+            bool isInFront = vp.z > 0.05f;
+            bool isOnScreen = isInFront &&
+                              vp.x >= 0.05f && vp.x <= 0.95f &&
+                              vp.y >= 0.06f && vp.y <= 0.94f;
+
+            if (isOnScreen)
+            {
+                DrawSubtleOnScreenMarker(vp, distance, isAirborne, accentColor);
+            }
+            else
+            {
+                DrawOffScreenChevron(localPos, distance, discPos.y - camPos.y, isAirborne, accentColor);
+            }
+        }
+
+        private static Color GetIndicatorColor(bool isHeld, bool isAirborne, ulong holderId)
+        {
+            if (isAirborne)
+            {
+                // High-visibility gold while disc is live in the air
+                return new Color(1.00f, 0.84f, 0.24f, 0.96f);
+            }
+
+            if (isHeld && MonoBehaviourSingleton<PlayerManager>.Instance != null)
+            {
+                Player holder = MonoBehaviourSingleton<PlayerManager>.Instance.GetPlayerByClientId(holderId);
+                if (holder != null)
+                {
+                    PlayerTeam team = UltimateRulesManager.GetTeam(holder);
+                    if (team == PlayerTeam.Blue) return new Color(0.32f, 0.72f, 1.00f, 0.92f);
+                    if (team == PlayerTeam.Red)  return new Color(1.00f, 0.38f, 0.34f, 0.92f);
+                }
+            }
+
+            // Loose on the grass
+            return new Color(0.92f, 0.96f, 1.00f, 0.82f);
+        }
+
+        private static void DrawSubtleOnScreenMarker(Vector3 vp, float distance, bool isAirborne, Color accentColor)
+        {
+            // Stay 100% invisible up close so catching is never obstructed;
+            // softly fade in at medium/long range (or high hucks) so the disc is easy to spot against the sky/trees.
+            float fadeStart = isAirborne ? 11f : 16f;
+            float fadeFull  = isAirborne ? 22f : 28f;
+            float alpha = Mathf.Clamp01((distance - fadeStart) / (fadeFull - fadeStart));
+            if (alpha <= 0.02f) return;
+
+            float screenX = vp.x * Screen.width;
+            float screenY = (1f - vp.y) * Screen.height;
+
+            float pulse = isAirborne ? (1f + 0.08f * Mathf.Sin(Time.unscaledTime * 8f)) : 1f;
+            float ringSize = Mathf.Lerp(26f, 20f, Mathf.Clamp01(distance / 55f)) * pulse;
+
+            Color prevColor = GUI.color;
+            GUI.color = new Color(accentColor.r, accentColor.g, accentColor.b, alpha * 0.62f);
+            GUI.DrawTexture(new Rect(screenX - ringSize * 0.5f, screenY - ringSize * 0.5f, ringSize, ringSize), _ringTex);
+            GUI.color = prevColor;
+
+            if (distance >= 22f)
+            {
+                string distText = $"{Mathf.RoundToInt(distance)}m";
+                Rect labelRect = new Rect(screenX - 24f, screenY + ringSize * 0.5f + 1f, 48f, 16f);
+                _subTagStyle.normal.textColor = new Color(0f, 0f, 0f, 0.65f * alpha);
+                GUI.Label(new Rect(labelRect.x + 1f, labelRect.y + 1f, labelRect.width, labelRect.height), distText, _subTagStyle);
+                _subTagStyle.normal.textColor = new Color(accentColor.r, accentColor.g, accentColor.b, 0.85f * alpha);
+                GUI.Label(labelRect, distText, _subTagStyle);
+            }
+        }
+
+        private static void DrawOffScreenChevron(Vector3 localPos, float distance, float heightDelta, bool isAirborne, Color accentColor)
+        {
+            float mag = Mathf.Max(0.001f, localPos.magnitude);
+
+            float behindBlend = Mathf.Clamp01(-localPos.z / mag);
+            float verticalRatio = localPos.y / mag;
+            float behindDownBias = behindBlend * Mathf.Clamp01(1f - Mathf.Max(0f, verticalRatio) * 2.2f);
+
+            Vector2 guiDir = new Vector2(localPos.x, -localPos.y + behindDownBias * mag * 0.65f);
+            if (guiDir.sqrMagnitude < 0.00001f)
+            {
+                guiDir = new Vector2(0f, 1f);
+            }
+            guiDir.Normalize();
+
+            // Scale cleanly across 1080p / 1440p / 4K monitors
+            float uiScale = Mathf.Clamp(Screen.height / 1080f, 0.85f, 1.50f);
+
+            float cx = Screen.width * 0.5f;
+            float cy = Screen.height * 0.5f;
+            float rx = Mathf.Min(Screen.width * 0.38f, Screen.height * 0.56f);
+            float ry = Screen.height * 0.35f;
+
+            Vector2 arrowPos = new Vector2(cx + guiDir.x * rx, cy + guiDir.y * ry);
+
+            // Larger, punchier chevron size for easy peripheral reading
+            float pulse = isAirborne ? (1f + 0.12f * Mathf.Sin(Time.unscaledTime * 9f)) : 1f;
+            float arrowSize = (isAirborne ? 56f : 46f) * uiScale * pulse;
+            float angleDeg = Mathf.Atan2(guiDir.y, guiDir.x) * Mathf.Rad2Deg + 90f;
+
+            Matrix4x4 savedMatrix = GUI.matrix;
+            Color savedColor = GUI.color;
+
+            GUIUtility.RotateAroundPivot(angleDeg, arrowPos);
+            GUI.color = accentColor;
+            GUI.DrawTexture(
+                new Rect(arrowPos.x - arrowSize * 0.5f, arrowPos.y - arrowSize * 0.5f, arrowSize, arrowSize),
+                _chevronTex);
+
+            GUI.matrix = savedMatrix;
+            GUI.color = savedColor;
+
+            // Keep distance + overhead cue unrotated and tucked inward from the chevron
+            Vector2 textCenter = arrowPos - guiDir * (arrowSize * 0.64f + 14f * uiScale);
+            string highCue = (isAirborne && heightDelta > 2.2f) ? "▲" : "";
+            string label = $"{highCue}{Mathf.RoundToInt(distance)}m";
+
+            int fontPx = Mathf.RoundToInt(15f * uiScale);
+            _distStyle.fontSize = fontPx;
+            _distShadowStyle.fontSize = fontPx;
+
+            float boxW = 86f * uiScale;
+            float boxH = 26f * uiScale;
+            Rect textRect = new Rect(textCenter.x - boxW * 0.5f, textCenter.y - boxH * 0.5f, boxW, boxH);
+
+            // Crisp dark drop shadow for readability against sky or turf
+            _distShadowStyle.normal.textColor = new Color(0f, 0f, 0f, 0.88f);
+            GUI.Label(new Rect(textRect.x + 1.5f, textRect.y + 1.5f, textRect.width, textRect.height), label, _distShadowStyle);
+            GUI.Label(new Rect(textRect.x - 1.0f, textRect.y + 1.0f, textRect.width, textRect.height), label, _distShadowStyle);
+
+            _distStyle.normal.textColor = new Color(
+                Mathf.Lerp(accentColor.r, 1f, 0.28f),
+                Mathf.Lerp(accentColor.g, 1f, 0.28f),
+                Mathf.Lerp(accentColor.b, 1f, 0.28f),
+                0.98f);
+            GUI.Label(textRect, label, _distStyle);
         }
     }
 }

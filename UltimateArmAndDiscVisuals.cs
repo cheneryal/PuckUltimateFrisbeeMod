@@ -10,580 +10,605 @@ using UnityEngine;
 
 namespace PuckUltimateFrisbeeMod
 {
-    // =========================================================================
-    // FULL-SHAFT 3D ARM & HAND CONTROLLER (Stick)
-    // =========================================================================
-    public class CustomArmController : MonoBehaviour
-    {
-        public Stick Stick;
-        public Transform CustomArmInstance;
-        public Transform ProceduralArmCylinder;
-        public Transform ProceduralHandPalm;
-
-        // Measured automatically from your CustomArmHandPrefab's Renderer bounds!
-        public float NativeModelLength = 1.0f;
-        public int LongestLocalAxis = 2; // 0 = X, 1 = Y, 2 = Z
-        public Vector3 NativeModelCenterOffset = Vector3.zero;
-
-        public void CalibrateCustomArmBounds()
+        // =========================================================================
+        // FULL-SHAFT 3D ARM & HAND CONTROLLER (Stick)
+        // =========================================================================
+        public class CustomArmController : MonoBehaviour
         {
-            if (CustomArmInstance == null) return;
+            public Stick Stick;
+            public Transform CustomArmInstance;
+            public Transform ProceduralArmCylinder;
+            public Transform ProceduralHandPalm;
 
-            Quaternion savedRot = CustomArmInstance.rotation;
-            Vector3 savedPos = CustomArmInstance.position;
-            Vector3 savedScale = CustomArmInstance.localScale;
+            // Measured automatically from your CustomArmHandPrefab's Renderer bounds!
+            public float NativeModelLength = 1.0f;
+            public int LongestLocalAxis = 2; // 0 = X, 1 = Y, 2 = Z
+            public Vector3 NativeModelCenterOffset = Vector3.zero;
 
-            CustomArmInstance.position = Vector3.zero;
-            CustomArmInstance.rotation = Quaternion.identity;
-            CustomArmInstance.localScale = Vector3.one;
-
-            Bounds combined = new Bounds(Vector3.zero, Vector3.zero);
-            bool hasBounds = false;
-            foreach (var r in CustomArmInstance.GetComponentsInChildren<Renderer>(true))
+            public void CalibrateCustomArmBounds()
             {
-                if (!hasBounds) { combined = r.bounds; hasBounds = true; }
-                else combined.Encapsulate(r.bounds);
-            }
+                if (CustomArmInstance == null) return;
 
-            if (hasBounds)
-            {
-                Vector3 size = combined.size;
-                if (size.x >= size.y && size.x >= size.z) { LongestLocalAxis = 0; NativeModelLength = Mathf.Max(0.1f, size.x); }
-                else if (size.y >= size.x && size.y >= size.z) { LongestLocalAxis = 1; NativeModelLength = Mathf.Max(0.1f, size.y); }
-                else { LongestLocalAxis = 2; NativeModelLength = Mathf.Max(0.1f, size.z); }
+                Quaternion savedRot = CustomArmInstance.rotation;
+                Vector3 savedPos = CustomArmInstance.position;
+                Vector3 savedScale = CustomArmInstance.localScale;
 
-                NativeModelCenterOffset = combined.center;
-            }
+                CustomArmInstance.position = Vector3.zero;
+                CustomArmInstance.rotation = Quaternion.identity;
+                CustomArmInstance.localScale = Vector3.one;
 
-            CustomArmInstance.position = savedPos;
-            CustomArmInstance.rotation = savedRot;
-            CustomArmInstance.localScale = savedScale;
-        }
-
-        private PlayerTeam _appliedBandTeam = PlayerTeam.None;
-
-        public void UpdateWristbandTeamColor(PlayerTeam team)
-        {
-            if (CustomArmInstance == null || team == _appliedBandTeam) return;
-            if (team != PlayerTeam.Blue && team != PlayerTeam.Red) return;
-
-            _appliedBandTeam = team;
-
-            // Vibrant Blue or Red wristband color matching the team
-            Color bandColor = (team == PlayerTeam.Blue)
-                ? new Color(0.18f, 0.52f, 0.92f, 1f)   // Team Blue
-                : new Color(0.90f, 0.22f, 0.20f, 1f);  // Team Red
-
-            foreach (Renderer rend in CustomArmInstance.GetComponentsInChildren<Renderer>(true))
-            {
-                bool isBandObject = rend.gameObject.name.IndexOf("Band", StringComparison.OrdinalIgnoreCase) >= 0;
-                Material[] mats = rend.materials;
-                bool modified = false;
-
-                for (int i = 0; i < mats.Length; i++)
+                Bounds combined = new Bounds(Vector3.zero, Vector3.zero);
+                bool hasBounds = false;
+                foreach (var r in CustomArmInstance.GetComponentsInChildren<Renderer>(true))
                 {
-                    Material mat = mats[i];
-                    if (mat == null) continue;
+                    if (!hasBounds) { combined = r.bounds; hasBounds = true; }
+                    else combined.Encapsulate(r.bounds);
+                }
 
-                    // Match either the material name ("Stylized_Band_Mat") or the "Band" child mesh
-                    if (isBandObject || mat.name.IndexOf("Stylized_Band_Mat", StringComparison.OrdinalIgnoreCase) >= 0)
+                if (hasBounds)
+                {
+                    Vector3 size = combined.size;
+                    if (size.x >= size.y && size.x >= size.z) { LongestLocalAxis = 0; NativeModelLength = Mathf.Max(0.1f, size.x); }
+                    else if (size.y >= size.x && size.y >= size.z) { LongestLocalAxis = 1; NativeModelLength = Mathf.Max(0.1f, size.y); }
+                    else { LongestLocalAxis = 2; NativeModelLength = Mathf.Max(0.1f, size.z); }
+
+                    NativeModelCenterOffset = combined.center;
+                }
+
+                CustomArmInstance.position = savedPos;
+                CustomArmInstance.rotation = savedRot;
+                CustomArmInstance.localScale = savedScale;
+            }
+
+            private PlayerTeam _appliedBandTeam = PlayerTeam.None;
+
+            public void UpdateWristbandTeamColor(PlayerTeam team)
+            {
+                if (CustomArmInstance == null || team == _appliedBandTeam) return;
+                if (team != PlayerTeam.Blue && team != PlayerTeam.Red) return;
+
+                _appliedBandTeam = team;
+
+                // Vibrant Blue or Red wristband color matching the team
+                Color bandColor = (team == PlayerTeam.Blue)
+                    ? new Color(0.18f, 0.52f, 0.92f, 1f)   // Team Blue
+                    : new Color(0.90f, 0.22f, 0.20f, 1f);  // Team Red
+
+                foreach (Renderer rend in CustomArmInstance.GetComponentsInChildren<Renderer>(true))
+                {
+                    bool isBandObject = rend.gameObject.name.IndexOf("Band", StringComparison.OrdinalIgnoreCase) >= 0;
+                    Material[] mats = rend.materials;
+                    bool modified = false;
+
+                    for (int i = 0; i < mats.Length; i++)
                     {
-                        if (mat.HasProperty("_BaseColor")) mat.SetColor("_BaseColor", bandColor);
-                        if (mat.HasProperty("_Color")) mat.SetColor("_Color", bandColor);
-                        mat.color = bandColor;
-                        modified = true;
-                    }
-                }
+                        Material mat = mats[i];
+                        if (mat == null) continue;
 
-                if (modified)
-                {
-                    rend.materials = mats;
-                }
-            }
-        }
-
-        private void LateUpdate()
-        {
-            if (Stick == null) return;
-
-            if (Stick.StickMesh != null)
-            {
-                foreach (var r in Stick.StickMesh.GetComponentsInChildren<Renderer>(true))
-                {
-                    if (r.enabled) r.enabled = false;
-                }
-            }
-
-            Player ownerPlayer = Stick.Player;
-            if (ownerPlayer != null)
-            {
-                UpdateWristbandTeamColor(UltimateRulesManager.GetTeam(ownerPlayer));
-            }
-
-            // If the full-body Ultimate Athlete rig is active on this player,
-            // ONLY show this floating 1st-person arm for the LocalPlayer!
-            // (Remote players use their rigged body's IK arm instead so they don't have 3 arms!)
-            bool hasFullBodyRig = UltimateAssetLoader.CustomPlayerPrefab != null &&
-                                  ownerPlayer != null &&
-                                  ownerPlayer.PlayerBody != null &&
-                                  ownerPlayer.PlayerBody.GetComponentInChildren<UltimatePlayerMarker>(true) != null;
-
-            bool showFirstPersonArm = !hasFullBodyRig ||
-                UltimatePlayerIKBridge.IsLocalPlayerInFirstPerson(ownerPlayer, ownerPlayer.PlayerBody);
-
-            if (CustomArmInstance != null && CustomArmInstance.gameObject.activeSelf != showFirstPersonArm)
-            {
-                CustomArmInstance.gameObject.SetActive(showFirstPersonArm);
-            }
-            if (!showFirstPersonArm) return;
-
-            bool isLeft = ownerPlayer != null && ownerPlayer.Handedness != null && ownerPlayer.Handedness.Value == PlayerHandedness.Left;
-
-            Vector3 bladeTip = UltimateRulesManager.GetHandWorldPosition(Stick, out Vector3 shaftStart, out Vector3 shaftDir);
-            float armSpanDistance = Mathf.Clamp(Vector3.Distance(bladeTip, shaftStart), 0.45f, 1.35f);
-
-            Quaternion lookRot = Quaternion.LookRotation(shaftDir, Vector3.up);
-            float wristRoll = Stick.BladeAngle * UltimateVisualTuning.WristRollMultiplier;
-            Quaternion aimRot = lookRot * Quaternion.Euler(0f, 0f, wristRoll);
-
-            if (CustomArmInstance != null)
-            {
-                Quaternion finalRot = aimRot * Quaternion.Euler(UltimateVisualTuning.ArmRotationOffset);
-
-                // Scale the arm length dynamically with the actual shoulder-to-hand span so it never looks like a floating stub!
-                float targetWorldLen = armSpanDistance * UltimateVisualTuning.ArmLengthMultiplier * 1.45f;
-                float lengthScale = targetWorldLen / Mathf.Max(0.1f, NativeModelLength);
-                float widthScale = (1.15f / Mathf.Max(0.1f, NativeModelLength)) * 0.55f * UltimateVisualTuning.ArmThicknessMultiplier;
-
-                Vector3 scaleVec = new Vector3(widthScale, widthScale, widthScale);
-                if (LongestLocalAxis == 0) scaleVec.x = lengthScale;
-                else if (LongestLocalAxis == 1) scaleVec.y = lengthScale;
-                else scaleVec.z = lengthScale;
-
-                if (isLeft) scaleVec.x = -scaleVec.x;
-
-                CustomArmInstance.localScale = scaleVec;
-                CustomArmInstance.rotation = finalRot;
-
-                Vector3 worldCenterOffset = finalRot * Vector3.Scale(NativeModelCenterOffset, scaleVec);
-
-                // Position the arm so the hand is at bladeTip and the forearm stretches back to the shoulder
-                Vector3 desiredCenterPos = bladeTip - (shaftDir * (targetWorldLen * 0.35f)) + (aimRot * UltimateVisualTuning.ArmPositionOffset);
-                CustomArmInstance.position = desiredCenterPos - worldCenterOffset;
-            }
-            else if (ProceduralArmCylinder != null && ProceduralHandPalm != null)
-            {
-                ProceduralArmCylinder.position = Vector3.Lerp(shaftStart, bladeTip, 0.5f);
-                ProceduralArmCylinder.rotation = aimRot * Quaternion.Euler(90f, 0f, 0f);
-                ProceduralArmCylinder.localScale = new Vector3(0.11f, armSpanDistance * 0.45f, 0.11f);
-
-                ProceduralHandPalm.position = bladeTip;
-                ProceduralHandPalm.rotation = aimRot;
-                ProceduralHandPalm.localScale = new Vector3(0.22f, 0.08f, 0.26f);
-            }
-        }
-    }
-
-    [HarmonyPatch(typeof(Stick), "OnNetworkPostSpawn")]
-    public static class Stick_ArmAndHandVisuals_Patch
-    {
-        [HarmonyPostfix]
-        public static void Postfix(Stick __instance)
-        {
-            try
-            {
-                if (__instance.StickMesh != null)
-                {
-                    foreach (var renderer in __instance.StickMesh.GetComponentsInChildren<Renderer>(true))
-                    {
-                        renderer.enabled = false;
-                    }
-                }
-
-                foreach (var col in __instance.GetComponentsInChildren<Collider>(true))
-                {
-                    col.enabled = false;
-                }
-
-                if (__instance.transform.Find("UltimateArmRig") == null)
-                {
-                    GameObject rigRoot = new GameObject("UltimateArmRig");
-                    rigRoot.transform.SetParent(__instance.transform, false);
-                    rigRoot.transform.localPosition = Vector3.zero;
-                    rigRoot.transform.localRotation = Quaternion.identity;
-                    rigRoot.transform.localScale = Vector3.one;
-
-                    var controller = rigRoot.AddComponent<CustomArmController>();
-                    controller.Stick = __instance;
-
-                    if (UltimateAssetLoader.CustomArmHandPrefab != null)
-                    {
-                        GameObject customArm = UnityEngine.Object.Instantiate(UltimateAssetLoader.CustomArmHandPrefab, rigRoot.transform);
-                        customArm.name = "CustomArmInstance";
-                        foreach (var col in customArm.GetComponentsInChildren<Collider>(true))
-                            UnityEngine.Object.Destroy(col);
-
-                        UltimateAssetLoader.SmoothMeshNormals(customArm);
-                        UltimateAssetLoader.ApplyRuntimeMaterials(customArm, 0.15f, true);
-
-                        controller.CustomArmInstance = customArm.transform;
-                        controller.CalibrateCustomArmBounds();
-                        if (__instance.Player != null && __instance.Player.PlayerBody != null)
+                        // Match either the material name ("Stylized_Band_Mat") or the "Band" child mesh
+                        if (isBandObject || mat.name.IndexOf("Stylized_Band_Mat", StringComparison.OrdinalIgnoreCase) >= 0)
                         {
-                            var skinSync = __instance.Player.PlayerBody.GetComponentInChildren<UltimateSkinAndTeamSync>(true);
-                            if (skinSync != null) skinSync.ApplyCustomization(force: true);
+                            if (mat.HasProperty("_BaseColor")) mat.SetColor("_BaseColor", bandColor);
+                            if (mat.HasProperty("_Color")) mat.SetColor("_Color", bandColor);
+                            mat.color = bandColor;
+                            modified = true;
                         }
                     }
-                    else
+
+                    if (modified)
                     {
-                        GameObject armObj = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
-                        armObj.name = "UltimateForearm";
-                        UnityEngine.Object.Destroy(armObj.GetComponent<Collider>());
-                        armObj.transform.SetParent(rigRoot.transform, true);
-
-                        GameObject handObj = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-                        handObj.name = "UltimateHandPalm";
-                        UnityEngine.Object.Destroy(handObj.GetComponent<Collider>());
-                        handObj.transform.SetParent(rigRoot.transform, false);
-
-                        Shader std = Shader.Find("Universal Render Pipeline/Lit") ?? Shader.Find("Standard") ?? Shader.Find("Sprites/Default");
-                        var armMat = new Material(std) { color = new Color(0.2f, 0.22f, 0.25f) };
-                        var handMat = new Material(std) { color = new Color(0.95f, 0.8f, 0.68f) };
-
-                        armObj.GetComponent<MeshRenderer>().material = armMat;
-                        handObj.GetComponent<MeshRenderer>().material = handMat;
-
-                        controller.ProceduralArmCylinder = armObj.transform;
-                        controller.ProceduralHandPalm = handObj.transform;
+                        rend.materials = mats;
                     }
                 }
             }
-            catch (Exception ex)
-            {
-                UltimateFrisbeePlugin.ModLogger.Error($"Error setting up Arm/Hand visuals: {ex}");
-            }
-        }
-    }
 
-    // =========================================================================
-    // ZERO-JITTER HELD DISC CLIENT LOCK & SELF-HEALING DISC VISUALS (Puck)
-    // =========================================================================
-    public class ClientDiscFollower : MonoBehaviour
-    {
-        public Puck Disc;
-        public Transform CustomDiscVisual;
-        public PuckElevationIndicator ElevationIndicator;
-        private float _visualSpinAngle = 0f;
-        private Vector3 _lastFrameWorldPos = Vector3.zero;
-        private float _smoothedWorldSpeed = 0f;
-        private float _visualWobble = 0f;
-        private bool _wasHeldLastFrame = false;
-        public static float GetMinimumCenterHeightForRotation(Quaternion rot)
-        {
-            Vector3 discNormal = rot * Vector3.up;
-            float cosTilt = Mathf.Clamp(Mathf.Abs(discNormal.y), 0f, 1f);
-            float sinTilt = Mathf.Sqrt(Mathf.Max(0f, 1f - cosTilt * cosTilt));
-            return (UltimateVisualTuning.DiscWorldRadius * sinTilt) + (UltimateVisualTuning.DiscHalfThickness * cosTilt) + 0.01f;
-        }
-        public void EnsureCustomDiscVisual()
-        {
-            if (Disc == null) return;
-
-            // If CustomFrisbeePrefab is loaded, ensure it is instantiated on this Puck and vanilla puck mesh is hidden!
-            if (UltimateAssetLoader.CustomFrisbeePrefab != null)
+            private void LateUpdate()
             {
-                if (CustomDiscVisual == null)
+                if (Stick == null) return;
+
+                if (Stick.StickMesh != null)
                 {
-                    Transform existing = Disc.transform.Find("CustomFrisbeeMesh");
-                    if (existing != null)
+                    foreach (var r in Stick.StickMesh.GetComponentsInChildren<Renderer>(true))
                     {
-                        CustomDiscVisual = existing;
-                    }
-                    else
-                    {
-                        var customDisc = UnityEngine.Object.Instantiate(UltimateAssetLoader.CustomFrisbeePrefab, Disc.transform);
-                        customDisc.name = "CustomFrisbeeMesh";
-                        foreach (var col in customDisc.GetComponentsInChildren<Collider>(true))
-                            UnityEngine.Object.Destroy(col);
-                        UltimateAssetLoader.SmoothMeshNormals(customDisc);
-                        UltimateAssetLoader.ApplyRuntimeMaterials(customDisc, 0.65f);
-                        CustomDiscVisual = customDisc.transform;
+                        if (r.enabled) r.enabled = false;
                     }
                 }
 
-                // Keep vanilla green/black puck mesh hidden while keeping our CustomFrisbeeMesh visible!
-                foreach (var r in Disc.GetComponentsInChildren<MeshRenderer>(true))
+                Player ownerPlayer = Stick.Player;
+                if (ownerPlayer != null)
                 {
-                    if (CustomDiscVisual != null && (r.transform == CustomDiscVisual || r.transform.IsChildOf(CustomDiscVisual)))
-                    {
-                        r.enabled = true;
-                        continue;
-                    }
-                    if (r.GetComponentInParent<PuckElevationIndicator>() != null)
-                        continue;
-
-                    if (r.enabled) r.enabled = false;
+                    UpdateWristbandTeamColor(UltimateRulesManager.GetTeam(ownerPlayer));
                 }
 
-                Disc.transform.localScale = Vector3.one;
-                CustomDiscVisual.localPosition = Vector3.zero;
-                 Quaternion wobbleRot = Quaternion.identity;
-                if (_visualWobble > 0.02f)
+                // If the full-body Ultimate Athlete rig is active on this player,
+                // ONLY show this floating 1st-person arm for the LocalPlayer!
+                // (Remote players use their rigged body's IK arm instead so they don't have 3 arms!)
+                bool hasFullBodyRig = UltimateAssetLoader.CustomPlayerPrefab != null &&
+                                    ownerPlayer != null &&
+                                    ownerPlayer.PlayerBody != null &&
+                                    ownerPlayer.PlayerBody.GetComponentInChildren<UltimatePlayerMarker>(true) != null;
+
+                bool showFirstPersonArm = !hasFullBodyRig ||
+                    UltimatePlayerIKBridge.IsLocalPlayerInFirstPerson(ownerPlayer, ownerPlayer.PlayerBody);
+
+                if (CustomArmInstance != null && CustomArmInstance.gameObject.activeSelf != showFirstPersonArm)
                 {
-                    float t = Time.time * 42f;
-                    float amp = _visualWobble * 15f;
-                    wobbleRot = Quaternion.Euler(Mathf.Sin(t) * amp, 0f, Mathf.Cos(t * 1.13f) * amp);
+                    CustomArmInstance.gameObject.SetActive(showFirstPersonArm);
                 }
-                CustomDiscVisual.localRotation = wobbleRot * Quaternion.Euler(0f, _visualSpinAngle, 0f) * Quaternion.Euler(UltimateVisualTuning.DiscMeshRotationOffset);
-                CustomDiscVisual.localScale = Vector3.one * UltimateVisualTuning.DiscMeshScale;
-            }
-            else
-            {
-                // Fallback if no custom prefab: flatten vanilla puck into a disc shape
-                Disc.transform.localScale = new Vector3(2.2f, 0.35f, 2.2f);
-            }
-        }
+                if (!showFirstPersonArm) return;
 
-        public static void ComputeHandGripTransform(Player holder, sbyte throwStyle, out Vector3 discPos, out Quaternion discRot)
-        {
-            Stick stick = holder.Stick;
-            bool isLeft = holder.Handedness != null && holder.Handedness.Value == PlayerHandedness.Left;
+                bool isLeft = ownerPlayer != null && ownerPlayer.Handedness != null && ownerPlayer.Handedness.Value == PlayerHandedness.Left;
 
-            // Check if this player is being viewed in 3rd-Person with our Full-Body Athlete Rig!
-            bool isFirstPersonLocal = UltimatePlayerIKBridge.IsLocalPlayerInFirstPerson(holder, holder.PlayerBody);
-            UltimatePlayerIKBridge ikBridge = (!isFirstPersonLocal && holder.PlayerBody != null)
-                ? holder.PlayerBody.GetComponentInChildren<UltimatePlayerIKBridge>(false)
-                : null;
-
-            if (ikBridge != null && ikBridge.TryGetVisualHandGrip(out Vector3 palmWorldPos, out Quaternion handAimRot))
-            {
-                // 3RD-PERSON VIEW: Lock the disc directly to the 3D Athlete's actual Hand Bone!
-                Vector3 thirdPersonOffset = new Vector3(isLeft ? 0.04f : -0.04f, 0.02f, 0.14f);
-                discPos = palmWorldPos + (handAimRot * thirdPersonOffset);
-                discRot = handAimRot * Quaternion.Euler(UltimateVisualTuning.HeldDiscPitchOffset);
-            }
-            else
-            {
-                // 1ST-PERSON VIEW (or fallback): Use the 1st-person floating arm tip
-                Vector3 bladeTip = UltimateRulesManager.GetHandWorldPosition(stick, out _, out Vector3 shaftDir);
+                Vector3 bladeTip = UltimateRulesManager.GetHandWorldPosition(Stick, out Vector3 shaftStart, out Vector3 shaftDir);
+                float armSpanDistance = Mathf.Clamp(Vector3.Distance(bladeTip, shaftStart), 0.45f, 1.35f);
 
                 Quaternion lookRot = Quaternion.LookRotation(shaftDir, Vector3.up);
-                float wristRoll = stick.BladeAngle * UltimateVisualTuning.WristRollMultiplier;
-                Quaternion handGripRot = lookRot * Quaternion.Euler(0f, 0f, wristRoll);
+                float wristRoll = Stick.BladeAngle * UltimateVisualTuning.WristRollMultiplier;
+                Quaternion aimRot = lookRot * Quaternion.Euler(0f, 0f, wristRoll);
 
-                Vector3 localOffset = UltimateVisualTuning.HeldDiscHandOffset;
-                if (isLeft) localOffset.x = -localOffset.x;
-
-                discPos = bladeTip + (handGripRot * localOffset);
-                discRot = handGripRot * Quaternion.Euler(UltimateVisualTuning.HeldDiscPitchOffset);
-            }
-
-            float minY = GetMinimumCenterHeightForRotation(discRot);
-            if (discPos.y < minY) discPos.y = minY;
-        }
-
-        private static bool _showTunerGUI = false;
-
-        private void Update()
-        {
-            if (UnityEngine.InputSystem.Keyboard.current != null &&
-                UnityEngine.InputSystem.Keyboard.current.f8Key.wasPressedThisFrame)
-            {
-                _showTunerGUI = !_showTunerGUI;
-            }
-
-            if (!_showTunerGUI || UnityEngine.InputSystem.Keyboard.current == null) return;
-
-            var kb = UnityEngine.InputSystem.Keyboard.current;
-            float step = 0.01f * Time.deltaTime * 8f;
-            float rotStep = 25f * Time.deltaTime;
-
-            // Live keyboard nudging while F8 Tuner is open:
-            // Arrow Up/Down = Z (Forward/Back along fingers)
-            // PageUp/PageDown (or I/K) = Y (Up/Down above fingers)
-            // Arrow Left/Right = X (Left/Right toward thumb)
-            // [ and ] = Pitch angle of disc in hand
-            if (kb.upArrowKey.isPressed) UltimateVisualTuning.HeldDiscHandOffset.z += step;
-            if (kb.downArrowKey.isPressed) UltimateVisualTuning.HeldDiscHandOffset.z -= step;
-            if (kb.rightArrowKey.isPressed) UltimateVisualTuning.HeldDiscHandOffset.x += step;
-            if (kb.leftArrowKey.isPressed) UltimateVisualTuning.HeldDiscHandOffset.x -= step;
-            if (kb.pageUpKey.isPressed || kb.iKey.isPressed) UltimateVisualTuning.HeldDiscHandOffset.y += step;
-            if (kb.pageDownKey.isPressed || kb.kKey.isPressed) UltimateVisualTuning.HeldDiscHandOffset.y -= step;
-            if (kb.leftBracketKey.isPressed) UltimateVisualTuning.HeldDiscPitchOffset.x -= rotStep;
-            if (kb.rightBracketKey.isPressed) UltimateVisualTuning.HeldDiscPitchOffset.x += rotStep;
-        }
-
-        private void OnGUI()
-        {
-            if (!_showTunerGUI) return;
-
-            GUI.Box(new Rect(20, 120, 430, 390), "ULTIMATE VISUAL TUNER (F8 to Hide)");
-            int y = 148;
-
-            GUI.Label(new Rect(35, y, 390, 22), "Keys: Arrows = X/Z | I/K (PgUp/Dn) = Y Height | [ / ] = Pitch");
-            y += 26;
-
-            Vector3 off = UltimateVisualTuning.HeldDiscHandOffset;
-            GUI.Label(new Rect(35, y, 165, 20), $"Disc Offset X: {off.x:F3}");
-            off.x = GUI.HorizontalSlider(new Rect(205, y + 4, 215, 20), off.x, -0.35f, 0.35f);
-            y += 24;
-
-            GUI.Label(new Rect(35, y, 165, 20), $"Disc Offset Y: {off.y:F3}");
-            off.y = GUI.HorizontalSlider(new Rect(205, y + 4, 215, 20), off.y, -0.25f, 0.35f);
-            y += 24;
-
-            GUI.Label(new Rect(35, y, 165, 20), $"Disc Offset Z: {off.z:F3}");
-            off.z = GUI.HorizontalSlider(new Rect(205, y + 4, 215, 20), off.z, -0.10f, 0.60f);
-            UltimateVisualTuning.HeldDiscHandOffset = off;
-            y += 24;
-
-            Vector3 pitch = UltimateVisualTuning.HeldDiscPitchOffset;
-            GUI.Label(new Rect(35, y, 165, 20), $"Disc Pitch X: {pitch.x:F1}°");
-            pitch.x = GUI.HorizontalSlider(new Rect(205, y + 4, 215, 20), pitch.x, -60f, 45f);
-            y += 24;
-
-            GUI.Label(new Rect(35, y, 165, 20), $"Disc Roll Z: {pitch.z:F1}°");
-            pitch.z = GUI.HorizontalSlider(new Rect(205, y + 4, 215, 20), pitch.z, -45f, 45f);
-            UltimateVisualTuning.HeldDiscPitchOffset = pitch;
-            y += 24;
-
-            GUI.Label(new Rect(35, y, 165, 20), $"Horiz Reach: {UltimateVisualTuning.ArmHorizontalCompression:F2}");
-            UltimateVisualTuning.ArmHorizontalCompression = GUI.HorizontalSlider(new Rect(205, y + 4, 215, 20), UltimateVisualTuning.ArmHorizontalCompression, 0.35f, 1.0f);
-            y += 24;
-
-            GUI.Label(new Rect(35, y, 165, 20), $"Max Horiz (m): {UltimateVisualTuning.ArmMaxHorizontalReach:F2}");
-            UltimateVisualTuning.ArmMaxHorizontalReach = GUI.HorizontalSlider(new Rect(205, y + 4, 215, 20), UltimateVisualTuning.ArmMaxHorizontalReach, 0.50f, 1.60f);
-            y += 24;
-
-            GUI.Label(new Rect(35, y, 165, 20), $"Vert/High Reach: {UltimateVisualTuning.ArmVerticalMultiplier:F2}");
-            UltimateVisualTuning.ArmVerticalMultiplier = GUI.HorizontalSlider(new Rect(205, y + 4, 215, 20), UltimateVisualTuning.ArmVerticalMultiplier, 0.80f, 2.00f);
-            y += 24;
-
-            GUI.Label(new Rect(35, y, 165, 20), $"Arm Length: {UltimateVisualTuning.ArmLengthMultiplier:F2}");
-            UltimateVisualTuning.ArmLengthMultiplier = GUI.HorizontalSlider(new Rect(205, y + 4, 215, 20), UltimateVisualTuning.ArmLengthMultiplier, 0.30f, 1.20f);
-            y += 24;
-
-            GUI.Label(new Rect(35, y, 165, 20), $"Arm Thickness: {UltimateVisualTuning.ArmThicknessMultiplier:F2}");
-            UltimateVisualTuning.ArmThicknessMultiplier = GUI.HorizontalSlider(new Rect(205, y + 4, 215, 20), UltimateVisualTuning.ArmThicknessMultiplier, 0.5f, 2.5f);
-            y += 28;
-
-            string codeSnippet = $"HReach={UltimateVisualTuning.ArmHorizontalCompression:F2}f | MaxH={UltimateVisualTuning.ArmMaxHorizontalReach:F2}f | VMult={UltimateVisualTuning.ArmVerticalMultiplier:F2}f | ArmLen={UltimateVisualTuning.ArmLengthMultiplier:F2}f";
-            GUI.TextField(new Rect(35, y, 395, 22), codeSnippet);
-        }
-
-        private void LateUpdate()
-        {
-            if (Disc == null) return;
-
-            bool isReplayDisc = Disc.IsReplay != null && Disc.IsReplay.Value;
-
-            ulong discNetId = (Disc.NetworkObject != null) ? Disc.NetworkObjectId : 0UL;
-            ulong holderId = ulong.MaxValue;
-            sbyte syncedStyle = UltimateNetworkSync.ClientSyncedThrowStyle;
-            float syncedWobble = UltimateNetworkSync.ClientSyncedFlightWobble;
-
-            if (!isReplayDisc)
-            {
-                if (UltimateNetworkSync.ClientDiscStates.TryGetValue(discNetId, out var syncEntry))
+                if (CustomArmInstance != null)
                 {
-                    holderId = syncEntry.HolderClientId;
-                    syncedStyle = syncEntry.ThrowStyle;
-                    syncedWobble = syncEntry.FlightWobble;
+                    Quaternion finalRot = aimRot * Quaternion.Euler(UltimateVisualTuning.ArmRotationOffset);
+
+                    // Scale the arm length dynamically with the actual shoulder-to-hand span so it never looks like a floating stub!
+                    float targetWorldLen = armSpanDistance * UltimateVisualTuning.ArmLengthMultiplier * 1.45f;
+                    float lengthScale = targetWorldLen / Mathf.Max(0.1f, NativeModelLength);
+                    float widthScale = (1.15f / Mathf.Max(0.1f, NativeModelLength)) * 0.55f * UltimateVisualTuning.ArmThicknessMultiplier;
+
+                    Vector3 scaleVec = new Vector3(widthScale, widthScale, widthScale);
+                    if (LongestLocalAxis == 0) scaleVec.x = lengthScale;
+                    else if (LongestLocalAxis == 1) scaleVec.y = lengthScale;
+                    else scaleVec.z = lengthScale;
+
+                    if (isLeft) scaleVec.x = -scaleVec.x;
+
+                    CustomArmInstance.localScale = scaleVec;
+                    CustomArmInstance.rotation = finalRot;
+
+                    Vector3 worldCenterOffset = finalRot * Vector3.Scale(NativeModelCenterOffset, scaleVec);
+
+                    // Position the arm so the hand is at bladeTip and the forearm stretches back to the shoulder
+                    Vector3 desiredCenterPos = bladeTip - (shaftDir * (targetWorldLen * 0.35f)) + (aimRot * UltimateVisualTuning.ArmPositionOffset);
+                    CustomArmInstance.position = desiredCenterPos - worldCenterOffset;
                 }
-                else if (!UltimateRulesManager.IsWarmup)
+                else if (ProceduralArmCylinder != null && ProceduralHandPalm != null)
                 {
-                    holderId = UltimateNetworkSync.ClientSyncedHolderId;
+                    ProceduralArmCylinder.position = Vector3.Lerp(shaftStart, bladeTip, 0.5f);
+                    ProceduralArmCylinder.rotation = aimRot * Quaternion.Euler(90f, 0f, 0f);
+                    ProceduralArmCylinder.localScale = new Vector3(0.11f, armSpanDistance * 0.45f, 0.11f);
+
+                    ProceduralHandPalm.position = bladeTip;
+                    ProceduralHandPalm.rotation = aimRot;
+                    ProceduralHandPalm.localScale = new Vector3(0.22f, 0.08f, 0.26f);
                 }
             }
+        }
 
-            
-
-            bool isHeld = (holderId != ulong.MaxValue && MonoBehaviourSingleton<PlayerManager>.Instance != null);
-
-            float dt = Mathf.Max(0.0001f, Time.deltaTime);
-            float instantSpeed = Vector3.Distance(Disc.transform.position, _lastFrameWorldPos) / dt;
-            _lastFrameWorldPos = Disc.transform.position;
-            _smoothedWorldSpeed = Mathf.Lerp(_smoothedWorldSpeed, instantSpeed, Mathf.Clamp01(dt * 12f));
-
-            float minY = GetMinimumCenterHeightForRotation(Disc.transform.rotation);
-            bool isAirborne = !isHeld && (Disc.transform.position.y > minY + 0.03f);
-
-            if (!isHeld && (isAirborne || _smoothedWorldSpeed > 0.25f))
+        [HarmonyPatch(typeof(Stick), "OnNetworkPostSpawn")]
+        public static class Stick_ArmAndHandVisuals_Patch
+        {
+            [HarmonyPostfix]
+            public static void Postfix(Stick __instance)
             {
-                if (isHeld)
+                try
                 {
-                    _visualSpinAngle = 0f;
-                    _smoothedWorldSpeed = 0f;
-                    _visualWobble = 0f;
+                    if (__instance.StickMesh != null)
+                    {
+                        foreach (var renderer in __instance.StickMesh.GetComponentsInChildren<Renderer>(true))
+                        {
+                            renderer.enabled = false;
+                        }
+                    }
+
+                    foreach (var col in __instance.GetComponentsInChildren<Collider>(true))
+                    {
+                        col.enabled = false;
+                    }
+
+                    if (__instance.transform.Find("UltimateArmRig") == null)
+                    {
+                        GameObject rigRoot = new GameObject("UltimateArmRig");
+                        rigRoot.transform.SetParent(__instance.transform, false);
+                        rigRoot.transform.localPosition = Vector3.zero;
+                        rigRoot.transform.localRotation = Quaternion.identity;
+                        rigRoot.transform.localScale = Vector3.one;
+
+                        var controller = rigRoot.AddComponent<CustomArmController>();
+                        controller.Stick = __instance;
+
+                        if (UltimateAssetLoader.CustomArmHandPrefab != null)
+                        {
+                            GameObject customArm = UnityEngine.Object.Instantiate(UltimateAssetLoader.CustomArmHandPrefab, rigRoot.transform);
+                            customArm.name = "CustomArmInstance";
+                            foreach (var col in customArm.GetComponentsInChildren<Collider>(true))
+                                UnityEngine.Object.Destroy(col);
+
+                            UltimateAssetLoader.SmoothMeshNormals(customArm);
+                            UltimateAssetLoader.ApplyRuntimeMaterials(customArm, 0.15f, true);
+
+                            controller.CustomArmInstance = customArm.transform;
+                            controller.CalibrateCustomArmBounds();
+                            if (__instance.Player != null && __instance.Player.PlayerBody != null)
+                            {
+                                var skinSync = __instance.Player.PlayerBody.GetComponentInChildren<UltimateSkinAndTeamSync>(true);
+                                if (skinSync != null) skinSync.ApplyCustomization(force: true);
+                            }
+                        }
+                        else
+                        {
+                            GameObject armObj = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
+                            armObj.name = "UltimateForearm";
+                            UnityEngine.Object.Destroy(armObj.GetComponent<Collider>());
+                            armObj.transform.SetParent(rigRoot.transform, true);
+
+                            GameObject handObj = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+                            handObj.name = "UltimateHandPalm";
+                            UnityEngine.Object.Destroy(handObj.GetComponent<Collider>());
+                            handObj.transform.SetParent(rigRoot.transform, false);
+
+                            Shader std = Shader.Find("Universal Render Pipeline/Lit") ?? Shader.Find("Standard") ?? Shader.Find("Sprites/Default");
+                            var armMat = new Material(std) { color = new Color(0.2f, 0.22f, 0.25f) };
+                            var handMat = new Material(std) { color = new Color(0.95f, 0.8f, 0.68f) };
+
+                            armObj.GetComponent<MeshRenderer>().material = armMat;
+                            handObj.GetComponent<MeshRenderer>().material = handMat;
+
+                            controller.ProceduralArmCylinder = armObj.transform;
+                            controller.ProceduralHandPalm = handObj.transform;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    UltimateFrisbeePlugin.ModLogger.Error($"Error setting up Arm/Hand visuals: {ex}");
+                }
+            }
+        }
+
+        // =========================================================================
+        // ZERO-JITTER HELD DISC CLIENT LOCK & SELF-HEALING DISC VISUALS (Puck)
+        // =========================================================================
+        public class ClientDiscFollower : MonoBehaviour
+        {
+            public Puck Disc;
+            public Transform CustomDiscVisual;
+            public PuckElevationIndicator ElevationIndicator;
+            private float _visualSpinAngle = 0f;
+            private Vector3 _lastFrameWorldPos = Vector3.zero;
+            private float _smoothedWorldSpeed = 0f;
+            private float _visualWobble = 0f;
+            private bool _wasHeldLastFrame = false;
+            public static float GetMinimumCenterHeightForRotation(Quaternion rot)
+            {
+                Vector3 discNormal = rot * Vector3.up;
+                float cosTilt = Mathf.Clamp(Mathf.Abs(discNormal.y), 0f, 1f);
+                float sinTilt = Mathf.Sqrt(Mathf.Max(0f, 1f - cosTilt * cosTilt));
+                return (UltimateVisualTuning.DiscWorldRadius * sinTilt) + (UltimateVisualTuning.DiscHalfThickness * cosTilt) + 0.01f;
+            }
+            public void EnsureCustomDiscVisual()
+            {
+                if (Disc == null) return;
+
+                // Keep vanilla PuckElevationIndicator permanently hidden so it never doubles up with our ground shadow/ring
+                if (ElevationIndicator != null && ElevationIndicator.IsVisible)
+                {
+                    ElevationIndicator.IsVisible = false;
+                }
+
+                // If CustomFrisbeePrefab is loaded, ensure it is instantiated on this Puck and vanilla puck mesh is hidden!
+                if (UltimateAssetLoader.CustomFrisbeePrefab != null)
+                {
+                    if (CustomDiscVisual == null)
+                    {
+                        Transform existing = Disc.transform.Find("CustomFrisbeeMesh");
+                        if (existing != null)
+                        {
+                            CustomDiscVisual = existing;
+                        }
+                        else
+                        {
+                            var customDisc = UnityEngine.Object.Instantiate(UltimateAssetLoader.CustomFrisbeePrefab, Disc.transform);
+                            customDisc.name = "CustomFrisbeeMesh";
+                            foreach (var col in customDisc.GetComponentsInChildren<Collider>(true))
+                                UnityEngine.Object.Destroy(col);
+                            UltimateAssetLoader.SmoothMeshNormals(customDisc);
+                            UltimateAssetLoader.ApplyRuntimeMaterials(customDisc, 0.65f);
+                            CustomDiscVisual = customDisc.transform;
+                        }
+                    }
+
+                    // Disable real-time directional shadow casting on ALL disc renderers so only our straight-down shadow renders,
+                    // and hide vanilla puck + PuckElevationIndicator renderers.
+                    foreach (var r in Disc.GetComponentsInChildren<Renderer>(true))
+                    {
+                        if (r.shadowCastingMode != UnityEngine.Rendering.ShadowCastingMode.Off)
+                        {
+                            r.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+                        }
+
+                        if (CustomDiscVisual != null && (r.transform == CustomDiscVisual || r.transform.IsChildOf(CustomDiscVisual)))
+                        {
+                            if (!r.enabled) r.enabled = true;
+                            continue;
+                        }
+
+                        if (r.enabled) r.enabled = false;
+                    }
+
+                    Disc.transform.localScale = Vector3.one;
+                    CustomDiscVisual.localPosition = Vector3.zero;
+                    Quaternion wobbleRot = Quaternion.identity;
+                    if (_visualWobble > 0.02f)
+                    {
+                        float t = Time.time * 42f;
+                        float amp = _visualWobble * 15f;
+                        wobbleRot = Quaternion.Euler(Mathf.Sin(t) * amp, 0f, Mathf.Cos(t * 1.13f) * amp);
+                    }
+                    CustomDiscVisual.localRotation = wobbleRot * Quaternion.Euler(0f, _visualSpinAngle, 0f) * Quaternion.Euler(UltimateVisualTuning.DiscMeshRotationOffset);
+                    CustomDiscVisual.localScale = Vector3.one * UltimateVisualTuning.DiscMeshScale;
                 }
                 else
                 {
-                    if (_wasHeldLastFrame)
+                    // Fallback if no custom prefab: flatten vanilla puck into a disc shape & disable angled sun shadow
+                    foreach (var r in Disc.GetComponentsInChildren<Renderer>(true))
                     {
-                        _visualWobble = syncedWobble;
+                        if (r.GetComponentInParent<PuckElevationIndicator>() != null)
+                        {
+                            if (r.enabled) r.enabled = false;
+                            continue;
+                        }
+                        if (r.shadowCastingMode != UnityEngine.Rendering.ShadowCastingMode.Off)
+                        {
+                            r.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+                        }
                     }
-                    else if (isAirborne)
+                    Disc.transform.localScale = new Vector3(2.2f, 0.35f, 2.2f);
+                }
+            }
+
+            public static void ComputeHandGripTransform(Player holder, sbyte throwStyle, out Vector3 discPos, out Quaternion discRot)
+            {
+                Stick stick = holder.Stick;
+                bool isLeft = holder.Handedness != null && holder.Handedness.Value == PlayerHandedness.Left;
+
+                // Check if this player is being viewed in 3rd-Person with our Full-Body Athlete Rig!
+                bool isFirstPersonLocal = UltimatePlayerIKBridge.IsLocalPlayerInFirstPerson(holder, holder.PlayerBody);
+                UltimatePlayerIKBridge ikBridge = (!isFirstPersonLocal && holder.PlayerBody != null)
+                    ? holder.PlayerBody.GetComponentInChildren<UltimatePlayerIKBridge>(false)
+                    : null;
+
+                if (ikBridge != null && ikBridge.TryGetVisualHandGrip(out Vector3 palmWorldPos, out Quaternion handAimRot))
+                {
+                    // 3RD-PERSON VIEW: Lock the disc directly to the 3D Athlete's actual Hand Bone!
+                    Vector3 thirdPersonOffset = new Vector3(isLeft ? 0.04f : -0.04f, 0.02f, 0.14f);
+                    discPos = palmWorldPos + (handAimRot * thirdPersonOffset);
+                    discRot = handAimRot * Quaternion.Euler(UltimateVisualTuning.HeldDiscPitchOffset);
+                }
+                else
+                {
+                    // 1ST-PERSON VIEW (or fallback): Use the 1st-person floating arm tip
+                    Vector3 bladeTip = UltimateRulesManager.GetHandWorldPosition(stick, out _, out Vector3 shaftDir);
+
+                    Quaternion lookRot = Quaternion.LookRotation(shaftDir, Vector3.up);
+                    float wristRoll = stick.BladeAngle * UltimateVisualTuning.WristRollMultiplier;
+                    Quaternion handGripRot = lookRot * Quaternion.Euler(0f, 0f, wristRoll);
+
+                    Vector3 localOffset = UltimateVisualTuning.HeldDiscHandOffset;
+                    if (isLeft) localOffset.x = -localOffset.x;
+
+                    discPos = bladeTip + (handGripRot * localOffset);
+                    discRot = handGripRot * Quaternion.Euler(UltimateVisualTuning.HeldDiscPitchOffset);
+                }
+
+                float minY = GetMinimumCenterHeightForRotation(discRot);
+                if (discPos.y < minY) discPos.y = minY;
+            }
+
+            private static bool _showTunerGUI = false;
+
+            private void Update()
+            {
+                if (UnityEngine.InputSystem.Keyboard.current != null &&
+                    UnityEngine.InputSystem.Keyboard.current.f8Key.wasPressedThisFrame)
+                {
+                    _showTunerGUI = !_showTunerGUI;
+                }
+
+                if (!_showTunerGUI || UnityEngine.InputSystem.Keyboard.current == null) return;
+
+                var kb = UnityEngine.InputSystem.Keyboard.current;
+                float step = 0.01f * Time.deltaTime * 8f;
+                float rotStep = 25f * Time.deltaTime;
+
+                // Live keyboard nudging while F8 Tuner is open:
+                // Arrow Up/Down = Z (Forward/Back along fingers)
+                // PageUp/PageDown (or I/K) = Y (Up/Down above fingers)
+                // Arrow Left/Right = X (Left/Right toward thumb)
+                // [ and ] = Pitch angle of disc in hand
+                if (kb.upArrowKey.isPressed) UltimateVisualTuning.HeldDiscHandOffset.z += step;
+                if (kb.downArrowKey.isPressed) UltimateVisualTuning.HeldDiscHandOffset.z -= step;
+                if (kb.rightArrowKey.isPressed) UltimateVisualTuning.HeldDiscHandOffset.x += step;
+                if (kb.leftArrowKey.isPressed) UltimateVisualTuning.HeldDiscHandOffset.x -= step;
+                if (kb.pageUpKey.isPressed || kb.iKey.isPressed) UltimateVisualTuning.HeldDiscHandOffset.y += step;
+                if (kb.pageDownKey.isPressed || kb.kKey.isPressed) UltimateVisualTuning.HeldDiscHandOffset.y -= step;
+                if (kb.leftBracketKey.isPressed) UltimateVisualTuning.HeldDiscPitchOffset.x -= rotStep;
+                if (kb.rightBracketKey.isPressed) UltimateVisualTuning.HeldDiscPitchOffset.x += rotStep;
+            }
+
+            private void OnGUI()
+            {
+                if (!_showTunerGUI) return;
+
+                GUI.Box(new Rect(20, 120, 430, 390), "ULTIMATE VISUAL TUNER (F8 to Hide)");
+                int y = 148;
+
+                GUI.Label(new Rect(35, y, 390, 22), "Keys: Arrows = X/Z | I/K (PgUp/Dn) = Y Height | [ / ] = Pitch");
+                y += 26;
+
+                Vector3 off = UltimateVisualTuning.HeldDiscHandOffset;
+                GUI.Label(new Rect(35, y, 165, 20), $"Disc Offset X: {off.x:F3}");
+                off.x = GUI.HorizontalSlider(new Rect(205, y + 4, 215, 20), off.x, -0.35f, 0.35f);
+                y += 24;
+
+                GUI.Label(new Rect(35, y, 165, 20), $"Disc Offset Y: {off.y:F3}");
+                off.y = GUI.HorizontalSlider(new Rect(205, y + 4, 215, 20), off.y, -0.25f, 0.35f);
+                y += 24;
+
+                GUI.Label(new Rect(35, y, 165, 20), $"Disc Offset Z: {off.z:F3}");
+                off.z = GUI.HorizontalSlider(new Rect(205, y + 4, 215, 20), off.z, -0.10f, 0.60f);
+                UltimateVisualTuning.HeldDiscHandOffset = off;
+                y += 24;
+
+                Vector3 pitch = UltimateVisualTuning.HeldDiscPitchOffset;
+                GUI.Label(new Rect(35, y, 165, 20), $"Disc Pitch X: {pitch.x:F1}°");
+                pitch.x = GUI.HorizontalSlider(new Rect(205, y + 4, 215, 20), pitch.x, -60f, 45f);
+                y += 24;
+
+                GUI.Label(new Rect(35, y, 165, 20), $"Disc Roll Z: {pitch.z:F1}°");
+                pitch.z = GUI.HorizontalSlider(new Rect(205, y + 4, 215, 20), pitch.z, -45f, 45f);
+                UltimateVisualTuning.HeldDiscPitchOffset = pitch;
+                y += 24;
+
+                GUI.Label(new Rect(35, y, 165, 20), $"Horiz Reach: {UltimateVisualTuning.ArmHorizontalCompression:F2}");
+                UltimateVisualTuning.ArmHorizontalCompression = GUI.HorizontalSlider(new Rect(205, y + 4, 215, 20), UltimateVisualTuning.ArmHorizontalCompression, 0.35f, 1.0f);
+                y += 24;
+
+                GUI.Label(new Rect(35, y, 165, 20), $"Max Horiz (m): {UltimateVisualTuning.ArmMaxHorizontalReach:F2}");
+                UltimateVisualTuning.ArmMaxHorizontalReach = GUI.HorizontalSlider(new Rect(205, y + 4, 215, 20), UltimateVisualTuning.ArmMaxHorizontalReach, 0.50f, 1.60f);
+                y += 24;
+
+                GUI.Label(new Rect(35, y, 165, 20), $"Vert/High Reach: {UltimateVisualTuning.ArmVerticalMultiplier:F2}");
+                UltimateVisualTuning.ArmVerticalMultiplier = GUI.HorizontalSlider(new Rect(205, y + 4, 215, 20), UltimateVisualTuning.ArmVerticalMultiplier, 0.80f, 2.00f);
+                y += 24;
+
+                GUI.Label(new Rect(35, y, 165, 20), $"Arm Length: {UltimateVisualTuning.ArmLengthMultiplier:F2}");
+                UltimateVisualTuning.ArmLengthMultiplier = GUI.HorizontalSlider(new Rect(205, y + 4, 215, 20), UltimateVisualTuning.ArmLengthMultiplier, 0.30f, 1.20f);
+                y += 24;
+
+                GUI.Label(new Rect(35, y, 165, 20), $"Arm Thickness: {UltimateVisualTuning.ArmThicknessMultiplier:F2}");
+                UltimateVisualTuning.ArmThicknessMultiplier = GUI.HorizontalSlider(new Rect(205, y + 4, 215, 20), UltimateVisualTuning.ArmThicknessMultiplier, 0.5f, 2.5f);
+                y += 28;
+
+                string codeSnippet = $"HReach={UltimateVisualTuning.ArmHorizontalCompression:F2}f | MaxH={UltimateVisualTuning.ArmMaxHorizontalReach:F2}f | VMult={UltimateVisualTuning.ArmVerticalMultiplier:F2}f | ArmLen={UltimateVisualTuning.ArmLengthMultiplier:F2}f";
+                GUI.TextField(new Rect(35, y, 395, 22), codeSnippet);
+            }
+
+            private void LateUpdate()
+            {
+                if (Disc == null) return;
+
+                bool isReplayDisc = Disc.IsReplay != null && Disc.IsReplay.Value;
+
+                ulong discNetId = (Disc.NetworkObject != null) ? Disc.NetworkObjectId : 0UL;
+                ulong holderId = ulong.MaxValue;
+                sbyte syncedStyle = UltimateNetworkSync.ClientSyncedThrowStyle;
+                float syncedWobble = UltimateNetworkSync.ClientSyncedFlightWobble;
+
+                if (!isReplayDisc)
+                {
+                    if (UltimateNetworkSync.ClientDiscStates.TryGetValue(discNetId, out var syncEntry))
                     {
-                        _visualWobble = Mathf.MoveTowards(_visualWobble, 0f, dt * 0.28f);
+                        holderId = syncEntry.HolderClientId;
+                        syncedStyle = syncEntry.ThrowStyle;
+                        syncedWobble = syncEntry.FlightWobble;
+                    }
+                    else if (!UltimateRulesManager.IsWarmup)
+                    {
+                        holderId = UltimateNetworkSync.ClientSyncedHolderId;
+                    }
+                }
+
+                
+
+                bool isHeld = (holderId != ulong.MaxValue && MonoBehaviourSingleton<PlayerManager>.Instance != null);
+
+                float dt = Mathf.Max(0.0001f, Time.deltaTime);
+                float instantSpeed = Vector3.Distance(Disc.transform.position, _lastFrameWorldPos) / dt;
+                _lastFrameWorldPos = Disc.transform.position;
+                _smoothedWorldSpeed = Mathf.Lerp(_smoothedWorldSpeed, instantSpeed, Mathf.Clamp01(dt * 12f));
+
+                float minY = GetMinimumCenterHeightForRotation(Disc.transform.rotation);
+                bool isAirborne = !isHeld && (Disc.transform.position.y > minY + 0.03f);
+
+                if (!isHeld && (isAirborne || _smoothedWorldSpeed > 0.25f))
+                {
+                    if (isHeld)
+                    {
+                        _visualSpinAngle = 0f;
+                        _smoothedWorldSpeed = 0f;
+                        _visualWobble = 0f;
                     }
                     else
                     {
-                        _visualWobble = 0f;
+                        if (_wasHeldLastFrame)
+                        {
+                            _visualWobble = syncedWobble;
+                        }
+                        else if (isAirborne)
+                        {
+                            _visualWobble = Mathf.MoveTowards(_visualWobble, 0f, dt * 0.28f);
+                        }
+                        else
+                        {
+                            _visualWobble = 0f;
+                        }
                     }
+                    _wasHeldLastFrame = isHeld;
+                    sbyte spinSign = syncedStyle == 0 ? (sbyte)1 : syncedStyle;
+                    float speedFactor = isAirborne
+                        ? Mathf.Clamp01(Mathf.Max(0.45f, _smoothedWorldSpeed / 15f))
+                        : Mathf.Clamp01(_smoothedWorldSpeed / 10f);
+
+                    float spinDegPerSec = Mathf.Lerp(540f, 1600f, speedFactor) * spinSign;
+                    _visualSpinAngle = (_visualSpinAngle + spinDegPerSec * Time.deltaTime) % 360f;
                 }
-                _wasHeldLastFrame = isHeld;
-                sbyte spinSign = syncedStyle == 0 ? (sbyte)1 : syncedStyle;
-                float speedFactor = isAirborne
-                    ? Mathf.Clamp01(Mathf.Max(0.45f, _smoothedWorldSpeed / 15f))
-                    : Mathf.Clamp01(_smoothedWorldSpeed / 10f);
-
-                float spinDegPerSec = Mathf.Lerp(540f, 1600f, speedFactor) * spinSign;
-                _visualSpinAngle = (_visualSpinAngle + spinDegPerSec * Time.deltaTime) % 360f;
-            }
-            else if (isHeld)
-            {
-                _visualSpinAngle = 0f;
-                _smoothedWorldSpeed = 0f;
-            }
-
-            EnsureCustomDiscVisual();
-
-            if (!isHeld)
-            {
-                if (Disc.transform.position.y < minY)
+                else if (isHeld)
                 {
-                    Vector3 p = Disc.transform.position;
-                    p.y = minY;
-                    Disc.transform.position = p;
+                    _visualSpinAngle = 0f;
+                    _smoothedWorldSpeed = 0f;
                 }
-                UpdateGroundShadow(false); 
-                return;
-            }
 
-            Player holder = MonoBehaviourSingleton<PlayerManager>.Instance.GetPlayerByClientId(holderId);
-            if (holder == null || !holder.IsCharacterSpawned || holder.Stick == null || holder.PlayerBody == null)
-            {
-                UpdateGroundShadow(false);
-                return;
-            }
+                EnsureCustomDiscVisual();
 
-            if (ElevationIndicator != null && ElevationIndicator.IsVisible)
-            {
-                ElevationIndicator.IsVisible = false;
-            }
+                if (!isHeld)
+                {
+                    if (Disc.transform.position.y < minY)
+                    {
+                        Vector3 p = Disc.transform.position;
+                        p.y = minY;
+                        Disc.transform.position = p;
+                    }
+                    UpdateGroundShadow(false); 
+                    return;
+                }
 
-            ComputeHandGripTransform(holder, syncedStyle, out Vector3 gripPos, out Quaternion discRot);
+                Player holder = MonoBehaviourSingleton<PlayerManager>.Instance.GetPlayerByClientId(holderId);
+                if (holder == null || !holder.IsCharacterSpawned || holder.Stick == null || holder.PlayerBody == null)
+                {
+                    UpdateGroundShadow(false);
+                    return;
+                }
 
-            Disc.transform.SetPositionAndRotation(gripPos, discRot);
-            if (NetworkRoles.IsServer && Disc.Rigidbody != null)
-            {
-                Disc.Rigidbody.position = gripPos;
-                Disc.Rigidbody.rotation = discRot;
+                if (ElevationIndicator != null && ElevationIndicator.IsVisible)
+                {
+                    ElevationIndicator.IsVisible = false;
+                }
+
+                ComputeHandGripTransform(holder, syncedStyle, out Vector3 gripPos, out Quaternion discRot);
+
+                Disc.transform.SetPositionAndRotation(gripPos, discRot);
+                if (NetworkRoles.IsServer && Disc.Rigidbody != null)
+                {
+                    Disc.Rigidbody.position = gripPos;
+                    Disc.Rigidbody.rotation = discRot;
+                }
+                UpdateGroundShadow(true);
             }
-            UpdateGroundShadow(true);
-        }
-        // --- STRAIGHT-DOWN TRACKING SHADOW ---
+            
+            // --- NATURAL STRAIGHT-DOWN CIRCULAR SHADOW ---
         private static Texture2D _sharedShadowTex;
+        private static Mesh _sharedShadowMesh;
+
         private GameObject _groundShadowObj;
         private MeshRenderer _groundShadowRenderer;
         private Material _groundShadowMat;
@@ -605,45 +630,135 @@ namespace PuckUltimateFrisbeeMod
                     float dy = (y - half) / half;
                     float dist = Mathf.Sqrt(dx * dx + dy * dy);
 
-                    // Dark core matching the frisbee silhouette with a soft penumbra edge
-                    float alpha = 1f - Mathf.SmoothStep(0.55f, 1.0f, dist);
-                    _sharedShadowTex.SetPixel(x, y, new Color(0f, 0f, 0f, alpha));
+                    // Soft natural penumbra: solid core fading smoothly to 0 before the mesh edge
+                    float alpha = 1f - Mathf.SmoothStep(0.38f, 0.96f, dist);
+                    _sharedShadowTex.SetPixel(x, y, new Color(1f, 1f, 1f, alpha));
                 }
             }
             _sharedShadowTex.Apply();
             return _sharedShadowTex;
         }
 
+        // Procedural 36-sided flat circular disc mesh (diameter = 1.0, facing +Y) with radial vertex-alpha feathering.
+        // Guarantees a smooth, natural circular shadow even if a shader ignores textures or vertex colors.
+        private static Mesh GetOrCreateSoftShadowMesh()
+        {
+            if (_sharedShadowMesh != null) return _sharedShadowMesh;
+
+            const int segments = 36;
+            const float innerRadius = 0.28f; // Solid umbra core (56% of diameter)
+            const float outerRadius = 0.50f; // Outer penumbra edge (100% of diameter)
+
+            int vertCount = 1 + segments * 2;
+            Vector3[] verts = new Vector3[vertCount];
+            Vector3[] normals = new Vector3[vertCount];
+            Vector2[] uvs = new Vector2[vertCount];
+            Color[] colors = new Color[vertCount];
+
+            // Center vertex
+            verts[0] = Vector3.zero;
+            normals[0] = Vector3.up;
+            uvs[0] = new Vector2(0.5f, 0.5f);
+            colors[0] = new Color(1f, 1f, 1f, 1f);
+
+            for (int i = 0; i < segments; i++)
+            {
+                float angle = (i / (float)segments) * Mathf.PI * 2f;
+                float cos = Mathf.Cos(angle);
+                float sin = Mathf.Sin(angle);
+
+                int innerIdx = 1 + i;
+                verts[innerIdx] = new Vector3(cos * innerRadius, 0f, sin * innerRadius);
+                normals[innerIdx] = Vector3.up;
+                uvs[innerIdx] = new Vector2(0.5f + cos * (innerRadius / outerRadius) * 0.5f, 0.5f + sin * (innerRadius / outerRadius) * 0.5f);
+                colors[innerIdx] = new Color(1f, 1f, 1f, 0.88f);
+
+                int outerIdx = 1 + segments + i;
+                verts[outerIdx] = new Vector3(cos * outerRadius, 0f, sin * outerRadius);
+                normals[outerIdx] = Vector3.up;
+                uvs[outerIdx] = new Vector2(0.5f + cos * 0.5f, 0.5f + sin * 0.5f);
+                colors[outerIdx] = new Color(1f, 1f, 1f, 0f);
+            }
+
+            // Inner fan (segments * 3) + outer feathered skirt (segments * 6)
+            int[] tris = new int[segments * 9];
+            int t = 0;
+            for (int i = 0; i < segments; i++)
+            {
+                int next = (i + 1) % segments;
+                int inCur = 1 + i;
+                int inNext = 1 + next;
+                int outCur = 1 + segments + i;
+                int outNext = 1 + segments + next;
+
+                // Winding faces +Y (visible from above)
+                tris[t++] = 0;
+                tris[t++] = inNext;
+                tris[t++] = inCur;
+
+                tris[t++] = inCur;
+                tris[t++] = outNext;
+                tris[t++] = outCur;
+
+                tris[t++] = inCur;
+                tris[t++] = inNext;
+                tris[t++] = outNext;
+            }
+
+            _sharedShadowMesh = new Mesh();
+            _sharedShadowMesh.name = "UltimateSoftShadowDiscMesh";
+            _sharedShadowMesh.vertices = verts;
+            _sharedShadowMesh.normals = normals;
+            _sharedShadowMesh.uv = uvs;
+            _sharedShadowMesh.colors = colors;
+            _sharedShadowMesh.triangles = tris;
+            _sharedShadowMesh.RecalculateBounds();
+            return _sharedShadowMesh;
+        }
+
         private void EnsureGroundShadow()
         {
             if (UltimateFrisbeePlugin.IsHeadlessServer || _groundShadowObj != null) return;
 
-            _groundShadowObj = GameObject.CreatePrimitive(PrimitiveType.Quad);
-            _groundShadowObj.name = "UltimateDiscGroundShadow";
-            UnityEngine.Object.Destroy(_groundShadowObj.GetComponent<Collider>());
+            _groundShadowObj = new GameObject("UltimateDiscGroundShadow");
 
-            _groundShadowRenderer = _groundShadowObj.GetComponent<MeshRenderer>();
+            MeshFilter mf = _groundShadowObj.AddComponent<MeshFilter>();
+            mf.sharedMesh = GetOrCreateSoftShadowMesh();
+
+            _groundShadowRenderer = _groundShadowObj.AddComponent<MeshRenderer>();
             _groundShadowRenderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
             _groundShadowRenderer.receiveShadows = false;
 
-            // Sprites/Default is guaranteed alpha-blended & unlit on URP/DX11/DX12/Metal/Vulkan
             Shader shadowShader = Shader.Find("Sprites/Default")
-                            ?? Shader.Find("Universal Render Pipeline/Particles/Unlit")
-                            ?? Shader.Find("Particles/Standard Unlit");
+                               ?? Shader.Find("Universal Render Pipeline/Unlit")
+                               ?? Shader.Find("Universal Render Pipeline/Particles/Unlit")
+                               ?? Shader.Find("Particles/Standard Unlit");
 
             if (shadowShader != null)
             {
+                Texture2D shadowTex = GetOrCreateShadowTexture();
                 _groundShadowMat = new Material(shadowShader);
-                _groundShadowMat.mainTexture = GetOrCreateShadowTexture();
-                _groundShadowMat.color = new Color(0f, 0f, 0f, 0.65f);
 
-                // Safety setup in case URP Particles/Unlit fallback was used
+                // Bind BOTH _BaseMap (URP) and _MainTex (Built-in/Sprites) so the circular gradient always applies
+                _groundShadowMat.mainTexture = shadowTex;
+                if (_groundShadowMat.HasProperty("_BaseMap")) _groundShadowMat.SetTexture("_BaseMap", shadowTex);
+                if (_groundShadowMat.HasProperty("_MainTex")) _groundShadowMat.SetTexture("_MainTex", shadowTex);
+
+                Color initCol = new Color(0f, 0f, 0f, 0.65f);
+                _groundShadowMat.color = initCol;
+                if (_groundShadowMat.HasProperty("_BaseColor")) _groundShadowMat.SetColor("_BaseColor", initCol);
+                if (_groundShadowMat.HasProperty("_Color")) _groundShadowMat.SetColor("_Color", initCol);
+
+                // Full URP transparent pipeline setup
                 if (_groundShadowMat.HasProperty("_Surface")) _groundShadowMat.SetFloat("_Surface", 1f);
                 if (_groundShadowMat.HasProperty("_Blend")) _groundShadowMat.SetFloat("_Blend", 0f);
+                if (_groundShadowMat.HasProperty("_AlphaClip")) _groundShadowMat.SetFloat("_AlphaClip", 0f);
                 if (_groundShadowMat.HasProperty("_SrcBlend")) _groundShadowMat.SetFloat("_SrcBlend", (float)UnityEngine.Rendering.BlendMode.SrcAlpha);
                 if (_groundShadowMat.HasProperty("_DstBlend")) _groundShadowMat.SetFloat("_DstBlend", (float)UnityEngine.Rendering.BlendMode.OneMinusSrcAlpha);
                 if (_groundShadowMat.HasProperty("_ZWrite")) _groundShadowMat.SetFloat("_ZWrite", 0f);
-                _groundShadowMat.renderQueue = 3000;
+                _groundShadowMat.EnableKeyword("_SURFACE_TYPE_TRANSPARENT");
+                _groundShadowMat.SetOverrideTag("RenderType", "Transparent");
+                _groundShadowMat.renderQueue = (int)UnityEngine.Rendering.RenderQueue.Transparent;
 
                 _groundShadowRenderer.material = _groundShadowMat;
             }
@@ -666,12 +781,10 @@ namespace PuckUltimateFrisbeeMod
             Vector3 discPos = Disc.transform.position;
             float height = Mathf.Max(0f, discPos.y - groundY);
 
-            // Place 1.6cm above the grass (above the +1.2cm painted lines so it never z-fights)
-            // while staying cleanly underneath resting discs
-            float shadowY = groundY + 0.016f;
-            _groundShadowObj.transform.position = new Vector3(discPos.x, shadowY, discPos.z);
+            // Sit 1.6cm above the grass (above painted lines, below resting discs)
+            _groundShadowObj.transform.position = new Vector3(discPos.x, groundY + 0.016f, discPos.z);
 
-            // Slight elliptical foreshortening when the disc is tilted/bladed, clamped so it's always readable
+            // Natural elliptical foreshortening when the disc is tilted/bladed
             Vector3 discUp = Disc.transform.up;
             float flatness = Mathf.Clamp01(Mathf.Abs(discUp.y));
             Vector3 horizTilt = new Vector3(discUp.x, 0f, discUp.z);
@@ -679,22 +792,23 @@ namespace PuckUltimateFrisbeeMod
                 ? Mathf.Atan2(horizTilt.x, horizTilt.z) * Mathf.Rad2Deg
                 : Disc.transform.eulerAngles.y;
 
-            // Rotate Quad +90 deg on X so its front face (-Z) points straight up (+Y)
-            _groundShadowObj.transform.rotation = Quaternion.Euler(90f, yaw, 0f);
+            // Mesh already lies flat in XZ facing +Y
+            _groundShadowObj.transform.rotation = Quaternion.Euler(0f, yaw, 0f);
 
-            // Scale widens gently as the disc gets higher; opacity keeps a readable floor (0.30) on high hucks
+            // Widens and softens gently with altitude while staying clearly readable on high throws
             float heightT = Mathf.Clamp01(height / 16f);
-            float majorDiameter = Mathf.Lerp(0.62f, 1.35f, heightT);
-            float minorDiameter = majorDiameter * Mathf.Lerp(0.55f, 1.0f, flatness);
-            _groundShadowObj.transform.localScale = new Vector3(majorDiameter, minorDiameter, 1f);
+            float majorDiameter = Mathf.Lerp(0.58f, 1.32f, heightT);
+            float minorDiameter = majorDiameter * Mathf.Lerp(0.52f, 1.0f, flatness);
+            _groundShadowObj.transform.localScale = new Vector3(majorDiameter, 1f, minorDiameter);
 
             if (_groundShadowMat != null)
             {
-                float alpha = Mathf.Lerp(0.68f, 0.30f, heightT);
-                if (isHeld) alpha *= 0.65f; // Slightly softer while held in hand
+                float alpha = Mathf.Lerp(0.76f, 0.36f, heightT);
+                if (isHeld) alpha *= 0.60f;
                 Color col = new Color(0f, 0f, 0f, alpha);
                 _groundShadowMat.color = col;
                 if (_groundShadowMat.HasProperty("_BaseColor")) _groundShadowMat.SetColor("_BaseColor", col);
+                if (_groundShadowMat.HasProperty("_Color")) _groundShadowMat.SetColor("_Color", col);
             }
         }
 
@@ -708,107 +822,107 @@ namespace PuckUltimateFrisbeeMod
             if (_groundShadowObj != null) UnityEngine.Object.Destroy(_groundShadowObj);
             if (_groundShadowMat != null) UnityEngine.Object.Destroy(_groundShadowMat);
         }
-    }
 
-    [HarmonyPatch(typeof(Puck), "OnNetworkPostSpawn")]
-    public static class Puck_DiscSetup_Patch
-    {
-        private static readonly FieldInfo _indicatorField = AccessTools.Field(typeof(Puck), "verticalityIndicator");
-        private static readonly FieldInfo _maxDistField = AccessTools.Field(typeof(PuckElevationIndicator), "maximumDistance");
-
-        [HarmonyPostfix]
-        public static void Postfix(Puck __instance)
+        [HarmonyPatch(typeof(Puck), "OnNetworkPostSpawn")]
+        public static class Puck_DiscSetup_Patch
         {
-            UltimateNetworkSync.EnsureRegistered();
+            private static readonly FieldInfo _indicatorField = AccessTools.Field(typeof(Puck), "verticalityIndicator");
+            private static readonly FieldInfo _maxDistField = AccessTools.Field(typeof(PuckElevationIndicator), "maximumDistance");
 
-            if (__instance.StickCollider != null)
+            [HarmonyPostfix]
+            public static void Postfix(Puck __instance)
             {
-                __instance.StickCollider.enabled = false;
-            }
+                UltimateNetworkSync.EnsureRegistered();
 
-            if (__instance.IceCollider != null && MonoBehaviourSingleton<PlayerManager>.Instance != null)
-            {
-                foreach (var p in MonoBehaviourSingleton<PlayerManager>.Instance.GetPlayers(true))
+                if (__instance.StickCollider != null)
                 {
-                    if (p.PlayerBody != null)
+                    __instance.StickCollider.enabled = false;
+                }
+
+                if (__instance.IceCollider != null && MonoBehaviourSingleton<PlayerManager>.Instance != null)
+                {
+                    foreach (var p in MonoBehaviourSingleton<PlayerManager>.Instance.GetPlayers(true))
                     {
-                        foreach (var bodyCol in p.PlayerBody.GetComponentsInChildren<Collider>(true))
+                        if (p.PlayerBody != null)
                         {
-                            Physics.IgnoreCollision(__instance.IceCollider, bodyCol, true);
-                            // Let the Frisbee fly freely through/over the sideline fences for Outside-In (OI) curves!
-                            Level_GrassStadiumSetup_Patch.IgnoreFenceCollisionsForDisc(__instance);
+                            foreach (var bodyCol in p.PlayerBody.GetComponentsInChildren<Collider>(true))
+                            {
+                                Physics.IgnoreCollision(__instance.IceCollider, bodyCol, true);
+                                // Let the Frisbee fly freely through/over the sideline fences for Outside-In (OI) curves!
+                                Level_GrassStadiumSetup_Patch.IgnoreFenceCollisionsForDisc(__instance);
+                            }
                         }
                     }
                 }
-            }
 
-            var indicator = _indicatorField?.GetValue(__instance) as PuckElevationIndicator;
-            if (indicator != null)
-            {
-                _maxDistField?.SetValue(indicator, 45f);
-            }
-
-            var follower = __instance.GetComponent<ClientDiscFollower>();
-            if (follower == null)
-            {
-                follower = __instance.gameObject.AddComponent<ClientDiscFollower>();
-            }
-            follower.Disc = __instance;
-            follower.ElevationIndicator = indicator;
-            follower.EnsureCustomDiscVisual();
-        }
-    }
-
-    [HarmonyPatch(typeof(Puck), "OnNetworkDespawn")]
-    public static class Puck_OnNetworkDespawn_Cleanup_Patch
-    {
-        [HarmonyPrefix]
-        public static void Prefix(Puck __instance)
-        {
-            if (__instance == null) return;
-
-            // Never let a replay puck despawn wipe live possession!
-            if (__instance.IsReplay != null && __instance.IsReplay.Value) return;
-
-            ulong discNetId = (__instance.NetworkObject != null) ? __instance.NetworkObjectId : 0UL;
-            UltimateNetworkSync.OnDiscDespawned(discNetId);
-
-            Player despawnedHolder = null;
-            if (UltimateRulesManager.DiscStates.TryGetValue(__instance, out var ds))
-            {
-                despawnedHolder = ds.Holder;
-                UltimateRulesManager.DiscStates.Remove(__instance);
-            }
-
-            if (NetworkRoles.IsServer)
-            {
-                if (despawnedHolder == null && !UltimateRulesManager.IsWarmup && UltimateRulesManager.Holder != null)
+                var indicator = _indicatorField?.GetValue(__instance) as PuckElevationIndicator;
+                if (indicator != null)
                 {
-                    despawnedHolder = UltimateRulesManager.Holder;
+                    indicator.IsVisible = false;
                 }
 
-                if (despawnedHolder != null)
+                var follower = __instance.GetComponent<ClientDiscFollower>();
+                if (follower == null)
                 {
-                    if (despawnedHolder.PlayerBody != null)
+                    follower = __instance.gameObject.AddComponent<ClientDiscFollower>();
+                }
+                follower.Disc = __instance;
+                follower.ElevationIndicator = indicator;
+                follower.EnsureCustomDiscVisual();
+            }
+        }
+
+        [HarmonyPatch(typeof(Puck), "OnNetworkDespawn")]
+        public static class Puck_OnNetworkDespawn_Cleanup_Patch
+        {
+            [HarmonyPrefix]
+            public static void Prefix(Puck __instance)
+            {
+                if (__instance == null) return;
+
+                // Never let a replay puck despawn wipe live possession!
+                if (__instance.IsReplay != null && __instance.IsReplay.Value) return;
+
+                ulong discNetId = (__instance.NetworkObject != null) ? __instance.NetworkObjectId : 0UL;
+                UltimateNetworkSync.OnDiscDespawned(discNetId);
+
+                Player despawnedHolder = null;
+                if (UltimateRulesManager.DiscStates.TryGetValue(__instance, out var ds))
+                {
+                    despawnedHolder = ds.Holder;
+                    UltimateRulesManager.DiscStates.Remove(__instance);
+                }
+
+                if (NetworkRoles.IsServer)
+                {
+                    if (despawnedHolder == null && !UltimateRulesManager.IsWarmup && UltimateRulesManager.Holder != null)
                     {
-                        despawnedHolder.PlayerBody.Server_Unfreeze();
+                        despawnedHolder = UltimateRulesManager.Holder;
                     }
 
-                    UltimateRulesManager.ClearPivotAnchor(despawnedHolder.OwnerClientId);
-
-                    if (UltimateRulesManager.WindupTrackers.TryGetValue(despawnedHolder.OwnerClientId, out var tracker))
+                    if (despawnedHolder != null)
                     {
-                        tracker.Reset();
-                    }
+                        if (despawnedHolder.PlayerBody != null)
+                        {
+                            despawnedHolder.PlayerBody.Server_Unfreeze();
+                        }
 
-                    if (UltimateRulesManager.Holder == despawnedHolder)
-                    {
-                        UltimateRulesManager.Holder = null;
-                        UltimateRulesManager.IsHolderPivotLocked = false;
-                    }
+                        UltimateRulesManager.ClearPivotAnchor(despawnedHolder.OwnerClientId);
 
-                    // Notify all clients so they immediately exit the held-disc state
-                    UltimateNetworkSync.ServerBroadcastHolderState(null, 0, __instance);
+                        if (UltimateRulesManager.WindupTrackers.TryGetValue(despawnedHolder.OwnerClientId, out var tracker))
+                        {
+                            tracker.Reset();
+                        }
+
+                        if (UltimateRulesManager.Holder == despawnedHolder)
+                        {
+                            UltimateRulesManager.Holder = null;
+                            UltimateRulesManager.IsHolderPivotLocked = false;
+                        }
+
+                        // Notify all clients so they immediately exit the held-disc state
+                        UltimateNetworkSync.ServerBroadcastHolderState(null, 0, __instance);
+                    }
                 }
             }
         }
