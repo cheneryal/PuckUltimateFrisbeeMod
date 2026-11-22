@@ -30,6 +30,9 @@ namespace PuckUltimateFrisbeeMod
         public static float BrickMarkZ = 14.0f;
         public static float MarkerRadius = 4.5f;
         public static float DoubleTeamRadius = 3.0f;
+        public static float DiscSpaceRadius = 1.65f;      // Min horizontal center-to-center distance (~1 disc space between torsos)
+        public static float DiscSpacePushSpeed = 7.5f;    // Smooth radial separation speed so catches/pivots don't teleport defenders
+        public static float MarkBlockHandRadius = 0.50f;  // Slightly tighter handblock radius on point-blank mark blocks
 
         // Momentum Carry-Over ("2-3 Step Grace Period") after catching on the run
         public static float CatchMomentumGraceDuration = 0.65f;
@@ -86,6 +89,9 @@ namespace PuckUltimateFrisbeeMod
         public static int LastPullHoldAnnounced = 0;
         public static float PreStallDuration = 12.0f;
         public static float PullPreStallDuration = 15.0f;
+        public static bool IsDiscForceGrounded = false;
+        public static Vector3 ForcedGroundSpot = Vector3.zero;
+        public static float GroundPickupUnlockTime = 0f;
 
         public static bool TryGetPivotAnchor(ulong clientId, out Vector3 anchor)
         {
@@ -136,6 +142,9 @@ namespace PuckUltimateFrisbeeMod
             public Vector3 CatchInitialSpot = Vector3.zero;
             public Vector3 PivotAnchorPos = Vector3.zero;
             public bool CaughtInCentralZone = false;
+            public bool IsDiscForceGrounded = false;
+            public Vector3 ForcedGroundSpot = Vector3.zero;
+            public float GroundPickupUnlockTime = 0f;
         }
 
         public static readonly Dictionary<Puck, DiscFlightState> DiscStates = new Dictionary<Puck, DiscFlightState>();
@@ -644,6 +653,9 @@ namespace PuckUltimateFrisbeeMod
             DiscStationaryStartTime = 0f;
             LastPreStallAnnounced = 0;
             LastPullHoldAnnounced = 0;
+            IsDiscForceGrounded = false;
+            ForcedGroundSpot = Vector3.zero;
+            GroundPickupUnlockTime = 0f;
             UltimateNetworkSync.ServerBroadcastHolderState(null, 0);
 
             foreach (var kvp in DiscStates)
@@ -827,6 +839,9 @@ namespace PuckUltimateFrisbeeMod
             UltimateRulesManager.CatchInitialSpot = ds.CatchInitialSpot;
             UltimateRulesManager.PivotAnchorPos = ds.PivotAnchorPos;
             UltimateRulesManager.CaughtInCentralZone = ds.CaughtInCentralZone;
+            UltimateRulesManager.IsDiscForceGrounded = ds.IsDiscForceGrounded;
+            UltimateRulesManager.ForcedGroundSpot = ds.ForcedGroundSpot;
+            UltimateRulesManager.GroundPickupUnlockTime = ds.GroundPickupUnlockTime;
         }
 
         private static void SaveDiscState(UltimateRulesManager.DiscFlightState ds)
@@ -853,6 +868,77 @@ namespace PuckUltimateFrisbeeMod
             ds.CatchInitialSpot = UltimateRulesManager.CatchInitialSpot;
             ds.PivotAnchorPos = UltimateRulesManager.PivotAnchorPos;
             ds.CaughtInCentralZone = UltimateRulesManager.CaughtInCentralZone;
+            ds.IsDiscForceGrounded = UltimateRulesManager.IsDiscForceGrounded;
+            ds.ForcedGroundSpot = UltimateRulesManager.ForcedGroundSpot;
+            ds.GroundPickupUnlockTime = UltimateRulesManager.GroundPickupUnlockTime;
+        }
+
+        private static void EnforceDiscSpaceBuffer(Player holder, IEnumerable<Player> allPlayers)
+        {
+            if (holder == null || holder.PlayerBody == null || allPlayers == null) return;
+            if (!UltimateRulesManager.IsHolderPivotLocked) return;
+
+            float minDist = UltimateRulesManager.DiscSpaceRadius;
+            if (minDist <= 0.01f) return;
+
+            Vector3 holderPos = holder.PlayerBody.transform.position;
+
+            foreach (var def in allPlayers)
+            {
+                if (def == null || def == holder || !def.IsCharacterSpawned || def.PlayerBody == null)
+                    continue;
+
+                if (!UltimateRulesManager.AreOpponents(holder, def))
+                    continue;
+
+                Vector3 defPos = def.PlayerBody.transform.position;
+                Vector3 delta = defPos - holderPos;
+                delta.y = 0f;
+
+                float horizDist = delta.magnitude;
+                if (horizDist >= minDist)
+                    continue;
+
+                Vector3 pushDir;
+                if (horizDist > 0.001f)
+                {
+                    pushDir = delta / horizDist;
+                }
+                else
+                {
+                    pushDir = -def.PlayerBody.transform.forward;
+                    pushDir.y = 0f;
+                    if (pushDir.sqrMagnitude < 0.001f) pushDir = holder.PlayerBody.transform.forward;
+                    pushDir.y = 0f;
+                    pushDir = pushDir.sqrMagnitude > 0.001f ? pushDir.normalized : Vector3.forward;
+                }
+
+                // Smoothly slide marker out to the disc-space arc (with a hard floor so torsos never clip)
+                float targetDist = Mathf.Max(
+                    Mathf.MoveTowards(horizDist, minDist, UltimateRulesManager.DiscSpacePushSpeed * Time.fixedDeltaTime),
+                    minDist - 0.35f
+                );
+
+                Vector3 legalPos = new Vector3(
+                    holderPos.x + pushDir.x * targetDist,
+                    defPos.y,
+                    holderPos.z + pushDir.z * targetDist
+                );
+
+                def.PlayerBody.transform.position = legalPos;
+                if (def.PlayerBody.Rigidbody != null)
+                {
+                    def.PlayerBody.Rigidbody.position = legalPos;
+
+                    // Cancel only inward radial velocity so the marker can still strafe freely along the arc
+                    Vector3 v = def.PlayerBody.Rigidbody.linearVelocity;
+                    float inwardSpeed = Vector3.Dot(new Vector3(v.x, 0f, v.z), -pushDir);
+                    if (inwardSpeed > 0f)
+                    {
+                        def.PlayerBody.Rigidbody.linearVelocity = v + pushDir * inwardSpeed;
+                    }
+                }
+            }
         }
 
         private static float _lastWindTickTime = -1f;
@@ -1111,6 +1197,68 @@ namespace PuckUltimateFrisbeeMod
                         holder.PlayerBody.IsSprinting.Value = false;
                     }
 
+                    // --- MARKER-BASED 10-SECOND STALL COUNT & DOUBLE-TEAM CHECK (runs BEFORE throw release) ---
+                    if (!isWarmup && !UltimateRulesManager.IsPullPlay)
+                    {
+                        if (UpdateMarkerAndStallCount(__instance, holder, tracker, aimForward, rb))
+                        {
+                            return;
+                        }
+                    }
+                    else if (!isWarmup && UltimateRulesManager.IsPullPlay && holdTime > 0.5f)
+                    {
+                        const float maxPullHoldTime = 15.0f;
+                        int pullRemaining = Mathf.CeilToInt(maxPullHoldTime - holdTime);
+
+                        if (pullRemaining <= 5 && pullRemaining >= 1 && pullRemaining != UltimateRulesManager.LastPullHoldAnnounced)
+                        {
+                            if (pullRemaining == 5 || pullRemaining <= 3)
+                            {
+                                UltimateRulesManager.LastPullHoldAnnounced = pullRemaining;
+                                UltimateRulesManager.BroadcastAnnouncement($"PULL CLOCK: {pullRemaining}s to throw the Pull!", "#e67e22");
+                            }
+                        }
+
+                        if (holdTime >= maxPullHoldTime)
+                        {
+                            UltimateRulesManager.LastPullHoldAnnounced = 0;
+                            tracker.CancelArm();
+                            holder.PlayerBody.Server_Unfreeze();
+                            UltimateRulesManager.ClearPivotAnchor(holder.OwnerClientId);
+
+                            PlayerTeam pullerTeam = UltimateRulesManager.GetTeam(holder);
+                            PlayerTeam? receivingTeam = Utils.GetOpposingTeam(pullerTeam);
+
+                            UltimateRulesManager.Holder = null;
+                            UltimateRulesManager.IsHolderPivotLocked = false;
+                            UltimateRulesManager.IsPullPlay = false;
+                            UltimateRulesManager.IsCurrentThrowPull = false;
+                            UltimateRulesManager.IsDiscInFlight = false;
+                            UltimateRulesManager.IsDiscTumblingOnGround = false;
+                            UltimateRulesManager.WasTippedInFlight = false;
+                            UltimateRulesManager.WasDefensiveBlock = false;
+                            UltimateRulesManager.LastDeflector = null;
+                            UltimateRulesManager.ActiveMarker = null;
+                            UltimateRulesManager.SecondLastThrower = null;
+                            UltimateRulesManager.LastTurnoverTeam = pullerTeam;
+                            UltimateRulesManager.OffensiveTeam = receivingTeam ?? PlayerTeam.None;
+                            UltimateRulesManager.ReleaseTime = Time.time;
+                            UltimateRulesManager.GroundPickupUnlockTime = Time.time + 0.45f;
+                            UltimateNetworkSync.ServerBroadcastHolderState(null, 0, __instance);
+
+                            float attackingBrickZ = (receivingTeam == PlayerTeam.Blue)
+                                ? -UltimateRulesManager.BrickMarkZ
+                                : UltimateRulesManager.BrickMarkZ;
+                            Vector3 penaltySpot = new Vector3(0f, UltimateVisualTuning.DiscHalfThickness + 0.01f, attackingBrickZ);
+
+                            FlattenAndFreezeDiscOnGround(__instance, rb, penaltySpot, resetPreStallTimer: true);
+                            UltimateRulesManager.BroadcastAnnouncement(
+                                $"DELAY OF GAME on {pullerTeam} (Failed to Pull)! {UltimateRulesManager.OffensiveTeam} awarded disc at Attacking Brick Mark!",
+                                "#e74c3c");
+                            return;
+                        }
+                    }
+
                     // Guard against accidental throw if player caught the disc while holding LMB to track it
                     if (tracker.RequireFreshLmbPress)
                     {
@@ -1157,58 +1305,12 @@ namespace PuckUltimateFrisbeeMod
                         }
                     }
 
-                    // --- MARKER-BASED 10-SECOND STALL COUNT & DOUBLE-TEAM CHECK ---
-                    if (!isWarmup && !UltimateRulesManager.IsPullPlay)
-                    {
-                        UpdateMarkerAndStallCount(__instance, holder, tracker, aimForward, spinByte, rb);
-                    }
-                    else if (!isWarmup && UltimateRulesManager.IsPullPlay && holdTime > 0.5f)
-                    {
-                        const float maxPullHoldTime = 15.0f;
-                        int pullRemaining = Mathf.CeilToInt(maxPullHoldTime - holdTime);
-
-                        if (pullRemaining <= 5 && pullRemaining >= 1 && pullRemaining != UltimateRulesManager.LastPullHoldAnnounced)
-                        {
-                            if (pullRemaining == 5 || pullRemaining <= 3)
-                            {
-                                UltimateRulesManager.LastPullHoldAnnounced = pullRemaining;
-                                UltimateRulesManager.BroadcastAnnouncement($"PULL CLOCK: {pullRemaining}s to throw the Pull!", "#e67e22");
-                            }
-                        }
-
-                        if (holdTime >= maxPullHoldTime)
-                        {
-                            UltimateRulesManager.LastPullHoldAnnounced = 0;
-                            tracker.Reset();
-                            holder.PlayerBody.Server_Unfreeze();
-                            UltimateRulesManager.ClearPivotAnchor(holder.OwnerClientId);
-
-                            PlayerTeam pullerTeam = UltimateRulesManager.GetTeam(holder);
-                            PlayerTeam? receivingTeam = Utils.GetOpposingTeam(pullerTeam);
-
-                            UltimateRulesManager.Holder = null;
-                            UltimateRulesManager.IsHolderPivotLocked = false;
-                            UltimateRulesManager.IsPullPlay = false;
-                            UltimateRulesManager.IsCurrentThrowPull = false;
-                            UltimateRulesManager.LastTurnoverTeam = pullerTeam;
-                            UltimateRulesManager.OffensiveTeam = receivingTeam ?? PlayerTeam.None;
-                            UltimateRulesManager.ReleaseTime = Time.time;
-                            UltimateNetworkSync.ServerBroadcastHolderState(null, spinByte, __instance);
-
-                            float attackingBrickZ = (receivingTeam == PlayerTeam.Blue)
-                                ? -UltimateRulesManager.BrickMarkZ
-                                : UltimateRulesManager.BrickMarkZ;
-                            Vector3 penaltySpot = new Vector3(0f, UltimateVisualTuning.DiscHalfThickness + 0.01f, attackingBrickZ);
-
-                            FlattenAndFreezeDiscOnGround(__instance, rb, penaltySpot);
-                            UltimateRulesManager.BroadcastAnnouncement(
-                                $"DELAY OF GAME on {pullerTeam} (Held Pull > 15s)! {UltimateRulesManager.OffensiveTeam} awarded disc at Attacking Brick Mark!",
-                                "#e74c3c");
-                            return;
-                        }
-                    }
-
                     return;
+                }
+
+                if (UltimateRulesManager.IsDiscForceGrounded)
+                {
+                    FlattenAndFreezeDiscOnGround(__instance, rb, UltimateRulesManager.ForcedGroundSpot);
                 }
 
                 // -----------------------------------------------------------------
@@ -1309,6 +1411,9 @@ namespace PuckUltimateFrisbeeMod
                         // 1. GROUND PICKUP (requires intentionally placing your hand on the disc)
                         if (!isAirborne)
                         {
+                            if (Time.time < UltimateRulesManager.GroundPickupUnlockTime)
+                                continue;
+
                             if (player == UltimateRulesManager.LastThrower && timeSinceRelease < 0.35f)
                                 continue;
 
@@ -1437,7 +1542,9 @@ namespace PuckUltimateFrisbeeMod
                         if (player == UltimateRulesManager.LastDeflector && (Time.time - UltimateRulesManager.LastDeflectionTime < 0.45f))
                             continue;
 
-                        float outerTipRadius = Mathf.Lerp(0.64f, 0.72f, bladeFactor) + (isDiving ? 0.25f : 0f);
+                        float outerTipRadius = isPointBlankMarkBlock
+                            ? (UltimateRulesManager.MarkBlockHandRadius + bladeFactor * 0.06f + (isDiving ? 0.22f : 0f))
+                            : (Mathf.Lerp(0.64f, 0.72f, bladeFactor) + (isDiving ? 0.25f : 0f));
                         if (sweptHandDist <= outerTipRadius)
                         {
                             bool betterHandTip = !bestDeflectIsHand ||
@@ -1620,12 +1727,15 @@ namespace PuckUltimateFrisbeeMod
                         return;
                     }
                 }
-                else if (!UltimateRulesManager.IsDiscInFlight && rimTouchingGround && rb.linearVelocity.sqrMagnitude < 0.05f)
+                else if (UltimateRulesManager.IsDiscForceGrounded ||
+                         (!UltimateRulesManager.IsDiscInFlight && rimTouchingGround && rb.linearVelocity.sqrMagnitude < 0.05f))
                 {
                     bool waitingForPullPickup = UltimateRulesManager.IsPullPlay && UltimateRulesManager.Holder == null;
-                    Vector3 restSpot = waitingForPullPickup
-                        ? new Vector3(discPos.x, UltimateVisualTuning.DiscHalfThickness + 0.01f, discPos.z)
-                        : (isWarmup ? GetWarmupSidelineReturnSpot(discPos) : GetLegalFieldSpotAfterTurnover(discPos));
+                    Vector3 restSpot = UltimateRulesManager.IsDiscForceGrounded
+                        ? UltimateRulesManager.ForcedGroundSpot
+                        : (waitingForPullPickup
+                            ? new Vector3(discPos.x, UltimateVisualTuning.DiscHalfThickness + 0.01f, discPos.z)
+                            : (isWarmup ? GetWarmupSidelineReturnSpot(discPos) : GetLegalFieldSpotAfterTurnover(discPos)));
 
                     FlattenAndFreezeDiscOnGround(__instance, rb, restSpot);
 
@@ -1672,18 +1782,17 @@ namespace PuckUltimateFrisbeeMod
             return a + ab * t;
         }
 
-        private static void UpdateMarkerAndStallCount(
+        private static bool UpdateMarkerAndStallCount(
             Puck disc,
             Player holder,
             UltimateRulesManager.ThrowMotionTracker tracker,
             Vector3 aimForward,
-            sbyte spinByte,
             Rigidbody rb)
         {
-            if (MonoBehaviourSingleton<PlayerManager>.Instance == null) return;
+            if (MonoBehaviourSingleton<PlayerManager>.Instance == null) return false;
 
             PlayerTeam holderTeam = UltimateRulesManager.GetTeam(holder);
-            if (holderTeam != PlayerTeam.Blue && holderTeam != PlayerTeam.Red) return;
+            if (holderTeam != PlayerTeam.Blue && holderTeam != PlayerTeam.Red) return false;
 
             var allPlayers = MonoBehaviourSingleton<PlayerManager>.Instance.GetPlayers(false);
 
@@ -1764,6 +1873,9 @@ namespace PuckUltimateFrisbeeMod
                 }
             }
 
+            // Always enforce Disc Space around a pivoted thrower (even if a double-team is occurring)
+            EnforceDiscSpaceBuffer(holder, allPlayers);
+
             if (illegalDoubleTeamers > 0)
             {
                 UltimateRulesManager.StallCount = Mathf.Max(0f, UltimateRulesManager.StallCount - Time.fixedDeltaTime * 1.5f);
@@ -1774,7 +1886,7 @@ namespace PuckUltimateFrisbeeMod
                     UltimateRulesManager.LastDoubleTeamWarningTime = Time.time;
                     UltimateRulesManager.BroadcastAnnouncement("DOUBLE TEAM! Only 1 marker allowed within 3m - Stall paused & rewound!", "#f1c40f");
                 }
-                return;
+                return false;
             }
 
             if (closestDefender != null)
@@ -1785,7 +1897,7 @@ namespace PuckUltimateFrisbeeMod
             else
             {
                 UltimateRulesManager.ActiveMarker = null;
-                return;
+                return false;
             }
 
             int stallSec = Mathf.FloorToInt(UltimateRulesManager.StallCount);
@@ -1802,22 +1914,59 @@ namespace PuckUltimateFrisbeeMod
             {
                 PlayerTeam? opp = Utils.GetOpposingTeam(holderTeam);
                 UltimateRulesManager.BroadcastAnnouncement($"STALL 10! TURNOVER -> {opp} Disc!", "#e74c3c");
-                tracker.Reset();
+
+                tracker.CancelArm();
                 holder.PlayerBody.Server_Unfreeze();
                 UltimateRulesManager.ClearPivotAnchor(holder.OwnerClientId);
-                UltimateRulesManager.LastTurnoverTeam = holderTeam;
-                UltimateRulesManager.OffensiveTeam = opp ?? PlayerTeam.None;
+
                 UltimateRulesManager.Holder = null;
                 UltimateRulesManager.IsHolderPivotLocked = false;
+                UltimateRulesManager.IsDiscInFlight = false;
+                UltimateRulesManager.IsDiscTumblingOnGround = false;
+                UltimateRulesManager.IsCurrentThrowPull = false;
+                UltimateRulesManager.IsPullPlay = false;
+                UltimateRulesManager.ActiveFlightWobble = 0f;
+                UltimateRulesManager.WasTippedInFlight = false;
+                UltimateRulesManager.WasDefensiveBlock = false;
+                UltimateRulesManager.LastDeflector = null;
+                UltimateRulesManager.LastDeflectionTime = 0f;
+                UltimateRulesManager.WentOutOfBoundsInFlight = false;
+                UltimateRulesManager.ActiveMarker = null;
+                UltimateRulesManager.SecondLastThrower = null;
+
+                UltimateRulesManager.LastTurnoverTeam = holderTeam;
+                UltimateRulesManager.OffensiveTeam = opp ?? PlayerTeam.None;
                 UltimateRulesManager.LastThrower = holder;
                 UltimateRulesManager.ReleaseTime = Time.time;
                 UltimateRulesManager.StallCount = 0f;
                 UltimateRulesManager.LastStallAnnounced = 0;
-                UltimateNetworkSync.ServerBroadcastHolderState(null, spinByte, disc);
 
-                Vector3 dropPos = GetLegalFieldSpotAfterTurnover(holderPos + aimForward * 0.8f);
-                FlattenAndFreezeDiscOnGround(disc, rb, dropPos);
+                // Brief pickup lockout so neither player insta-grabs or bounces it on the stall tick
+                UltimateRulesManager.GroundPickupUnlockTime = Time.time + 0.45f;
+
+                // Drop flat on the turf cleanly between thrower and marker (not inside either player's hand)
+                Vector3 dropOffset = aimForward * 0.55f;
+                if (closestDefender != null && closestDefender.PlayerBody != null)
+                {
+                    Vector3 toMarker = closestDefender.PlayerBody.transform.position - holderPos;
+                    toMarker.y = 0f;
+                    float distToMarker = toMarker.magnitude;
+                    if (distToMarker > 0.05f)
+                    {
+                        dropOffset = (toMarker / distToMarker) * Mathf.Clamp(distToMarker * 0.45f, 0.35f, 0.65f);
+                    }
+                }
+
+                Vector3 dropPos = GetLegalFieldSpotAfterTurnover(holderPos + dropOffset);
+
+                // Broadcast spin = 0 so clients release grip immediately with a dead flat disc
+                UltimateNetworkSync.ServerBroadcastHolderState(null, 0, disc);
+                FlattenAndFreezeDiscOnGround(disc, rb, dropPos, resetPreStallTimer: true);
+                UltimateAudioManager.ServerBroadcastSound(UltimateSoundType.GroundHit, dropPos, 0.75f, 0.95f);
+                return true;
             }
+
+            return false;
         }
 
         private static void EstablishPivotAfterMomentumStop(Player holder, bool isWarmup)
@@ -1982,6 +2131,9 @@ namespace PuckUltimateFrisbeeMod
 
         private static void AnnounceTurnover(bool isOutOfBounds, Vector3 outOfBoundsCrossingSpot)
         {
+            UltimateRulesManager.DiscStationaryStartTime = Time.time;
+            UltimateRulesManager.LastPreStallAnnounced = 0;
+
             if (UltimateRulesManager.IsPullPlay || UltimateRulesManager.IsCurrentThrowPull)
             {
                 UltimateRulesManager.IsPullPlay = false;
@@ -2192,12 +2344,17 @@ namespace PuckUltimateFrisbeeMod
             return new Vector3(legalX, UltimateVisualTuning.DiscHalfThickness + 0.01f, legalZ);
         }
 
-        private static void FlattenAndFreezeDiscOnGround(Puck disc, Rigidbody rb, Vector3 groundSpot)
+        private static void FlattenAndFreezeDiscOnGround(Puck disc, Rigidbody rb, Vector3 groundSpot, bool resetPreStallTimer = false)
         {
             groundSpot.y = Mathf.Max(groundSpot.y, UltimateVisualTuning.DiscHalfThickness + 0.01f);
 
+            UltimateRulesManager.IsDiscForceGrounded = true;
+            UltimateRulesManager.ForcedGroundSpot = groundSpot;
+            UltimateRulesManager.IsDiscInFlight = false;
+            UltimateRulesManager.IsDiscTumblingOnGround = false;
+
             bool alreadyFrozenAtSpot =
-                !rb.isKinematic &&
+                rb.isKinematic &&
                 rb.constraints == RigidbodyConstraints.FreezeAll &&
                 (disc.transform.position - groundSpot).sqrMagnitude < 0.0004f &&
                 Vector3.Dot(disc.transform.up, Vector3.up) > 0.999f;
@@ -2205,16 +2362,19 @@ namespace PuckUltimateFrisbeeMod
             if (!alreadyFrozenAtSpot)
             {
                 Quaternion flatRot = Quaternion.Euler(0f, disc.transform.eulerAngles.y, 0f);
-                rb.isKinematic = false;
-                rb.linearVelocity = Vector3.zero;
-                rb.angularVelocity = Vector3.zero;
+                if (!rb.isKinematic)
+                {
+                    rb.linearVelocity = Vector3.zero;
+                    rb.angularVelocity = Vector3.zero;
+                }
+                rb.isKinematic = true;
                 rb.position = groundSpot;
                 rb.rotation = flatRot;
                 disc.transform.SetPositionAndRotation(groundSpot, flatRot);
                 disc.Server_Freeze(RigidbodyConstraints.FreezeAll);
             }
 
-            if (UltimateRulesManager.DiscStationaryStartTime <= 0f)
+            if (resetPreStallTimer || UltimateRulesManager.DiscStationaryStartTime <= 0f)
             {
                 UltimateRulesManager.DiscStationaryStartTime = Time.time;
                 UltimateRulesManager.LastPreStallAnnounced = 0;
@@ -2334,6 +2494,8 @@ namespace PuckUltimateFrisbeeMod
             UltimateRulesManager.LastStallAnnounced = 0;
             UltimateRulesManager.DiscStationaryStartTime = 0f;
             UltimateRulesManager.LastPreStallAnnounced = 0;
+            UltimateRulesManager.IsDiscForceGrounded = false;
+            UltimateRulesManager.GroundPickupUnlockTime = 0f;
 
             sbyte spinByte = (sbyte)(spinSign >= 0f ? 1 : -1);
 
@@ -2508,14 +2670,15 @@ namespace PuckUltimateFrisbeeMod
                     UltimateRulesManager.LastTurnoverTeam = UltimateRulesManager.PullingTeam;
                     Vector3 pullSpot = GetOutOfBoundsPullSpot(crossingSpot, catcherTeam);
                     UltimateRulesManager.BroadcastAnnouncement($"PULL CAUGHT OUT OF BOUNDS! Centered at (X=0, Z={pullSpot.z:F0}m)!", "#ffe97f");
-                    FlattenAndFreezeDiscOnGround(disc, disc.Rigidbody, pullSpot);
+                    FlattenAndFreezeDiscOnGround(disc, disc.Rigidbody, pullSpot, resetPreStallTimer: true);
                 }
                 else
                 {
                     UltimateRulesManager.LastTurnoverTeam = previousThrower != null ? prevThrowerTeam : catcherTeam;
                     UltimateRulesManager.OffensiveTeam = Utils.GetOpposingTeam(UltimateRulesManager.LastTurnoverTeam) ?? PlayerTeam.None;
                     UltimateRulesManager.BroadcastAnnouncement($"CAUGHT OUT OF BOUNDS by #{catcher.Number.Value} {catcher.Username.Value}! {UltimateRulesManager.OffensiveTeam} Disc!", "#e74c3c");
-                    FlattenAndFreezeDiscOnGround(disc, disc.Rigidbody, GetLegalFieldSpotAfterTurnover(crossingSpot));
+                    UltimateRulesManager.GroundPickupUnlockTime = Time.time + 0.40f;
+                    FlattenAndFreezeDiscOnGround(disc, disc.Rigidbody, GetLegalFieldSpotAfterTurnover(crossingSpot), resetPreStallTimer: true);
                 }
                 return;
             }
@@ -2535,6 +2698,10 @@ namespace PuckUltimateFrisbeeMod
             UltimateRulesManager.LastDeflector = null;
             UltimateRulesManager.LastTurnoverTeam = PlayerTeam.None;
             UltimateRulesManager.LastPullHoldAnnounced = 0;
+            UltimateRulesManager.DiscStationaryStartTime = 0f;
+            UltimateRulesManager.LastPreStallAnnounced = 0;
+            UltimateRulesManager.IsDiscForceGrounded = false;
+            UltimateRulesManager.GroundPickupUnlockTime = 0f;
 
             if (!UltimateRulesManager.WindupTrackers.TryGetValue(catcher.OwnerClientId, out var tracker))
             {
@@ -2891,6 +3058,18 @@ namespace PuckUltimateFrisbeeMod
             {
                 UltimateRulesManager.ThrowMotionTracker.WhipEffortScale = Mathf.Clamp(effortVal, 0.5f, 2.0f);
                 UltimateRulesManager.BroadcastAnnouncement($"Throw WhipEffortScale set to {UltimateRulesManager.ThrowMotionTracker.WhipEffortScale:F2}");
+                return false;
+            }
+            if (command == "/discspace" && args.Length == 1 && float.TryParse(args[0], out float discSpaceVal))
+            {
+                UltimateRulesManager.DiscSpaceRadius = Mathf.Clamp(discSpaceVal, 0f, 3.0f);
+                UltimateRulesManager.BroadcastAnnouncement($"DiscSpaceRadius set to {UltimateRulesManager.DiscSpaceRadius:F2}m");
+                return false;
+            }
+            if (command == "/markblock" && args.Length == 1 && float.TryParse(args[0], out float markBlockVal))
+            {
+                UltimateRulesManager.MarkBlockHandRadius = Mathf.Clamp(markBlockVal, 0.25f, 0.85f);
+                UltimateRulesManager.BroadcastAnnouncement($"MarkBlockHandRadius set to {UltimateRulesManager.MarkBlockHandRadius:F2}m");
                 return false;
             }
             return true;
