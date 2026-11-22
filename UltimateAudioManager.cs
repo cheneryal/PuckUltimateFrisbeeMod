@@ -27,6 +27,9 @@ namespace PuckUltimateFrisbeeMod
         ThrowPower = 9,     // throw_3.wav: powerful whoosh (huck / pull)
         ThrowFloat = 10,    // throw_4.wav: slow drawn-out low frequency whoosh (floaty lob)
         ThrowWobble = 11,   // throw_5.wav: fluttering effect of a wobbly disc thrown
+        HighFive = 12,      // highfive.wav / highfive_1..6.wav: crisp two-hand high five clap
+        PlayerPat = 13,     // pat.wav / pat_1..6.wav: friendly shoulder/back/head pat
+        ButtPat = 14,       // buttpat.wav / buttpat_1..6.wav: cheeky athletic butt slap
         BlockTip = Block    // Backward-compatible alias
     }
 
@@ -62,6 +65,9 @@ namespace PuckUltimateFrisbeeMod
                 LoadCustomWavVariants(pluginFolder, "pickup", UltimateSoundType.Pickup);
                 LoadCustomWavVariants(pluginFolder, "ground", UltimateSoundType.GroundHit);
                 LoadCustomWavVariants(pluginFolder, "step", UltimateSoundType.Footstep);
+                LoadCustomWavVariants(pluginFolder, "highfive", UltimateSoundType.HighFive);
+                LoadCustomWavVariants(pluginFolder, "pat", UltimateSoundType.PlayerPat);
+                LoadCustomWavVariants(pluginFolder, "buttpat", UltimateSoundType.ButtPat);
             }
         }
 
@@ -290,6 +296,65 @@ namespace PuckUltimateFrisbeeMod
                     float env = Mathf.Exp(-t * 65f);
                     float softSnap = Mathf.Sin(t * 2f * Mathf.PI * 210f) * env * 0.25f;
                     return Mathf.Clamp(softSnap, -1f, 1f);
+                }));
+
+                // --- H. TWO-HAND HIGH FIVE (Crisp cupped-palm clap + double micro-transient) ---
+                System.Random hfRng = new System.Random(1000 + v * 37);
+                float hfLp = 0f, hfHp = 0f;
+                _soundPools[UltimateSoundType.HighFive].Add(CreateProceduralClip($"Ult_HighFive_v{v}", 0.16f, (t, dur) =>
+                {
+                    float white = (float)(hfRng.NextDouble() * 2.0 - 1.0);
+                    // Band-pass filter around crisp palm-clap frequencies (~1.1kHz - 3.2kHz)
+                    hfLp += 0.36f * (white - hfLp);
+                    hfHp += 0.10f * (hfLp - hfHp);
+                    float clapNoise = (hfLp - hfHp) * 3.8f;
+
+                    // Main palm smack + tiny 5ms finger follow-through transient
+                    float envMain = Mathf.Exp(-t * 36f);
+                    float t2 = Mathf.Max(0f, t - 0.005f);
+                    float envFingers = (t >= 0.005f) ? Mathf.Exp(-t2 * 52f) * 0.55f : 0f;
+
+                    // Hollow cupped-hand air "pop"
+                    float cupFreq = Mathf.Lerp(460f, 195f, Mathf.Clamp01(t / 0.028f)) * (1f + varOffset);
+                    float cupPop = Mathf.Sin(t * 2f * Mathf.PI * cupFreq) * Mathf.Exp(-t * 70f) * 0.48f;
+
+                    return Mathf.Clamp((clapNoise * (envMain + envFingers) * 0.85f + cupPop) * 1.15f, -1f, 1f);
+                }));
+
+                // --- I. FRIENDLY PLAYER PAT (Warm, muffled shoulder/back/head pat) ---
+                System.Random patRng = new System.Random(2000 + v * 53);
+                float patLp1 = 0f, patLp2 = 0f;
+                _soundPools[UltimateSoundType.PlayerPat].Add(CreateProceduralClip($"Ult_PlayerPat_v{v}", 0.11f, (t, dur) =>
+                {
+                    float white = (float)(patRng.NextDouble() * 2.0 - 1.0);
+                    // Soft muffled jersey/fabric rustle
+                    patLp1 += 0.12f * (white - patLp1);
+                    patLp2 += 0.12f * (patLp1 - patLp2);
+                    float fabricTap = patLp2 * 3.2f * Mathf.Exp(-t * 62f);
+
+                    // Gentle warm chest/shoulder thump
+                    float thumpFreq = Mathf.Lerp(125f, 62f, Mathf.Clamp01(t / 0.032f)) * (1f + varOffset);
+                    float thump = Mathf.Sin(t * 2f * Mathf.PI * thumpFreq) * Mathf.Exp(-t * 48f) * 0.72f;
+
+                    return Mathf.Clamp((fabricTap * 0.55f + thump) * 1.05f, -1f, 1f);
+                }));
+
+                // --- J. BUTT PAT (Punchy, cheeky athletic smack + meaty low-mid thump) ---
+                System.Random bpRng = new System.Random(3000 + v * 71);
+                float bpLp = 0f, bpHp = 0f;
+                _soundPools[UltimateSoundType.ButtPat].Add(CreateProceduralClip($"Ult_ButtPat_v{v}", 0.14f, (t, dur) =>
+                {
+                    float white = (float)(bpRng.NextDouble() * 2.0 - 1.0);
+                    // Snappy skin/shorts slap transient (~1.4kHz - 4.0kHz)
+                    bpLp += 0.46f * (white - bpLp);
+                    bpHp += 0.14f * (bpLp - bpHp);
+                    float slapSnap = (bpLp - bpHp) * 4.4f * Mathf.Exp(-t * 54f);
+
+                    // Juicy athletic low-mid thump
+                    float bodyFreq = Mathf.Lerp(175f, 76f, Mathf.Clamp01(t / 0.035f)) * (1f + varOffset);
+                    float bodyThump = Mathf.Sin(t * 2f * Mathf.PI * bodyFreq) * Mathf.Exp(-t * 40f) * 0.78f;
+
+                    return Mathf.Clamp((slapSnap * 0.78f + bodyThump * 0.90f) * 1.15f, -1f, 1f);
                 }));
             }
         }
@@ -626,6 +691,366 @@ namespace PuckUltimateFrisbeeMod
         public static void ForceZeroStickVolumeClient(SynchronizedAudio __instance, ref byte newVolume)
         {
             if (ShouldMuteAudio(__instance)) newVolume = 0;
+        }
+    }
+    // =========================================================================
+    // SERVER-AUTHORITATIVE HIGH-FIVE, PLAYER PAT & BUTT PAT DETECTOR (C# 7.3)
+    // =========================================================================
+    public class UltimateSocialGestureManager : MonoBehaviour
+    {
+        private static UltimateSocialGestureManager _instance;
+
+        private struct PairKey : IEquatable<PairKey>
+        {
+            public readonly ulong A;
+            public readonly ulong B;
+
+            public PairKey(ulong a, ulong b)
+            {
+                A = a;
+                B = b;
+            }
+
+            public bool Equals(PairKey other) => A == other.A && B == other.B;
+            public override bool Equals(object obj) => obj is PairKey other && Equals(other);
+            public override int GetHashCode() => unchecked((A.GetHashCode() * 397) ^ B.GetHashCode());
+        }
+
+        private class CachedBodyBones
+        {
+            public Transform Hips;
+            public Transform Head;
+            public bool Searched;
+        }
+
+        private readonly Dictionary<ulong, Vector3> _prevHandPos = new Dictionary<ulong, Vector3>();
+        private readonly Dictionary<ulong, Vector3> _prevBodyPos = new Dictionary<ulong, Vector3>();
+        private readonly Dictionary<PairKey, float> _pairCooldowns = new Dictionary<PairKey, float>();
+        private readonly Dictionary<PlayerBody, CachedBodyBones> _boneCache = new Dictionary<PlayerBody, CachedBodyBones>();
+
+        // Tunable detection radii & velocity thresholds
+        private const float HighFiveDistance = 0.40f;
+        private const float HighFiveMinHandHeightAboveFeet = 1.15f;
+        private const float HighFiveMinClosingSpeed = 0.70f;
+        private const float HighFiveMinSingleHandSpeed = 1.15f;
+        private const float HighFiveCooldown = 0.65f;
+
+        private const float PatCooldown = 0.42f;
+        private const float ButtPatMinRelSpeed = 1.00f;
+        private const float BodyPatMinRelSpeed = 1.20f;
+
+        public static void EnsureRunner()
+        {
+            if (_instance != null) return;
+
+            GameObject obj = new GameObject("UltimateSocialGestureManager");
+            UnityEngine.Object.DontDestroyOnLoad(obj);
+            _instance = obj.AddComponent<UltimateSocialGestureManager>();
+        }
+
+        public static void Dispose()
+        {
+            if (_instance != null)
+            {
+                UnityEngine.Object.Destroy(_instance.gameObject);
+                _instance = null;
+            }
+        }
+
+        private void FixedUpdate()
+        {
+            if (!NetworkRoles.IsServer) return;
+            if (MonoBehaviourSingleton<PlayerManager>.Instance == null) return;
+
+            var players = MonoBehaviourSingleton<PlayerManager>.Instance.GetPlayers(true);
+            if (players == null || players.Count < 2)
+            {
+                return;
+            }
+
+            float dt = Mathf.Max(0.0001f, Time.fixedDeltaTime);
+            float now = Time.time;
+
+            int count = players.Count;
+            Vector3[] handPositions = new Vector3[count];
+            Vector3[] handVelocities = new Vector3[count];
+            Vector3[] bodyPositions = new Vector3[count];
+            Vector3[] bodyVelocities = new Vector3[count];
+            bool[] valid = new bool[count];
+            bool[] holdingDisc = new bool[count];
+
+            // 1. Sample every spawned player's hand & body kinematics
+            for (int i = 0; i < count; i++)
+            {
+                Player p = players[i];
+                if (p == null || !p.IsCharacterSpawned || p.PlayerBody == null || p.Stick == null)
+                    continue;
+
+                ulong id = p.OwnerClientId;
+                Vector3 handPos = UltimateRulesManager.GetHandWorldPosition(p.Stick, out _, out _);
+                Vector3 bodyPos = p.PlayerBody.transform.position;
+
+                Vector3 handVel = Vector3.zero;
+                if (_prevHandPos.TryGetValue(id, out Vector3 prevH))
+                {
+                    Vector3 delta = handPos - prevH;
+                    // Ignore teleport/respawn spikes
+                    if (delta.sqrMagnitude < 4.0f)
+                    {
+                        handVel = delta / dt;
+                    }
+                }
+                _prevHandPos[id] = handPos;
+
+                Vector3 bodyVel = Vector3.zero;
+                if (_prevBodyPos.TryGetValue(id, out Vector3 prevB))
+                {
+                    Vector3 delta = bodyPos - prevB;
+                    if (delta.sqrMagnitude < 4.0f)
+                    {
+                        bodyVel = delta / dt;
+                    }
+                }
+                _prevBodyPos[id] = bodyPos;
+
+                handPositions[i] = handPos;
+                handVelocities[i] = handVel;
+                bodyPositions[i] = bodyPos;
+                bodyVelocities[i] = bodyVel;
+                valid[i] = true;
+                holdingDisc[i] = UltimateNetworkSync.IsPlayerHoldingAnyDisc(id);
+            }
+
+            // 2. Check all player pairs
+            for (int i = 0; i < count; i++)
+            {
+                if (!valid[i]) continue;
+                Player pA = players[i];
+                ulong idA = pA.OwnerClientId;
+
+                for (int j = i + 1; j < count; j++)
+                {
+                    if (!valid[j]) continue;
+                    Player pB = players[j];
+                    ulong idB = pB.OwnerClientId;
+
+                    // Quick broad-phase distance cull (hands can't interact if players are > 3.6m apart)
+                    if ((bodyPositions[i] - bodyPositions[j]).sqrMagnitude > 13.0f)
+                        continue;
+
+                    // --- A. TWO-HAND HIGH FIVE ---
+                    if (!holdingDisc[i] && !holdingDisc[j] &&
+                        TryTriggerHighFive(
+                            idA, handPositions[i], handVelocities[i], bodyPositions[i],
+                            idB, handPositions[j], handVelocities[j], bodyPositions[j],
+                            now))
+                    {
+                        continue;
+                    }
+
+                    // --- B. DIRECTIONAL BUTT PAT / PLAYER PAT (A -> B) ---
+                    if (!holdingDisc[i])
+                    {
+                        TryTriggerBodyOrButtPat(
+                            idA, handPositions[i], handVelocities[i],
+                            pB, bodyPositions[j], bodyVelocities[j],
+                            now);
+                    }
+
+                    // --- C. DIRECTIONAL BUTT PAT / PLAYER PAT (B -> A) ---
+                    if (!holdingDisc[j])
+                    {
+                        TryTriggerBodyOrButtPat(
+                            idB, handPositions[j], handVelocities[j],
+                            pA, bodyPositions[i], bodyVelocities[i],
+                            now);
+                    }
+                }
+            }
+        }
+
+        private bool IsOnCooldown(ulong a, ulong b, float now)
+        {
+            return _pairCooldowns.TryGetValue(new PairKey(a, b), out float readyAt) && now < readyAt;
+        }
+
+        private void SetCooldown(ulong a, ulong b, float readyAt)
+        {
+            _pairCooldowns[new PairKey(a, b)] = readyAt;
+        }
+
+        private bool TryTriggerHighFive(
+            ulong idA, Vector3 handA, Vector3 velA, Vector3 bodyA,
+            ulong idB, Vector3 handB, Vector3 velB, Vector3 bodyB,
+            float now)
+        {
+            if (IsOnCooldown(idA, idB, now) || IsOnCooldown(idB, idA, now))
+                return false;
+
+            Vector3 diff = handB - handA;
+            float dist = diff.magnitude;
+            if (dist > HighFiveDistance)
+                return false;
+
+            // Both hands must be raised above chest/shoulder height (avoids accidental slaps while running past)
+            if ((handA.y - bodyA.y) < HighFiveMinHandHeightAboveFeet ||
+                (handB.y - bodyB.y) < HighFiveMinHandHeightAboveFeet)
+                return false;
+
+            Vector3 dirAtoB = dist > 0.001f ? (diff / dist) : Vector3.forward;
+            float closingSpeed = Vector3.Dot(velA - velB, dirAtoB);
+            float maxHandSpeed = Mathf.Max(velA.magnitude, velB.magnitude);
+
+            if (closingSpeed < HighFiveMinClosingSpeed && maxHandSpeed < HighFiveMinSingleHandSpeed)
+                return false;
+
+            float impact = Mathf.Clamp01(Mathf.Max(closingSpeed, maxHandSpeed * 0.65f) / 4.5f);
+            float volume = Mathf.Lerp(0.58f, 1.00f, impact);
+            float pitch = Mathf.Lerp(0.95f, 1.12f, impact);
+
+            Vector3 midpoint = (handA + handB) * 0.5f;
+            UltimateAudioManager.ServerBroadcastSound(UltimateSoundType.HighFive, midpoint, volume, pitch);
+
+            // Put both directions on cooldown so the same clap doesn't also fire a shoulder pat
+            SetCooldown(idA, idB, now + HighFiveCooldown);
+            SetCooldown(idB, idA, now + HighFiveCooldown);
+            return true;
+        }
+
+        private void TryTriggerBodyOrButtPat(
+            ulong strikerId, Vector3 strikerHandPos, Vector3 strikerHandVel,
+            Player target, Vector3 targetBodyPos, Vector3 targetBodyVel,
+            float now)
+        {
+            ulong targetId = target.OwnerClientId;
+            if (IsOnCooldown(strikerId, targetId, now))
+                return;
+
+            PlayerBody targetBody = target.PlayerBody;
+            GetTargetAnatomicalAnchors(targetBody, targetBodyPos, out Vector3 hipsPos, out Vector3 headPos);
+
+            // Target horizontal facing frame
+            Vector3 targetForward = Vector3.ProjectOnPlane(targetBody.transform.forward, Vector3.up);
+            if (targetForward.sqrMagnitude < 0.001f) targetForward = Vector3.forward;
+            targetForward.Normalize();
+            Vector3 targetRight = Vector3.Cross(Vector3.up, targetForward).normalized;
+
+            Vector3 relHandVel = strikerHandVel - targetBodyVel;
+            float relSpeed = relHandVel.magnitude;
+
+            // --- 1. CHECK BUTT PAT ZONE (Behind hips, glute height) ---
+            Vector3 fromHips = strikerHandPos - hipsPos;
+            float localZ = Vector3.Dot(fromHips, targetForward); // Negative = behind player
+            float localX = Vector3.Dot(fromHips, targetRight);
+            float localY = fromHips.y;
+
+            bool inButtZone = (localZ >= -0.50f && localZ <= -0.04f) &&
+                              (Mathf.Abs(localX) <= 0.34f) &&
+                              (localY >= -0.32f && localY <= 0.16f);
+
+            if (inButtZone && relSpeed >= ButtPatMinRelSpeed)
+            {
+                Vector3 toHips = (hipsPos - strikerHandPos);
+                float inwardDot = toHips.sqrMagnitude > 0.0001f
+                    ? Vector3.Dot(relHandVel / relSpeed, toHips.normalized)
+                    : 1f;
+
+                if (inwardDot >= 0.18f)
+                {
+                    float strength = Mathf.Clamp01((relSpeed - ButtPatMinRelSpeed) / 3.8f);
+                    float vol = Mathf.Lerp(0.62f, 1.00f, strength);
+                    float pitch = Mathf.Lerp(0.94f, 1.12f, strength);
+
+                    UltimateAudioManager.ServerBroadcastSound(UltimateSoundType.ButtPat, strikerHandPos, vol, pitch);
+                    SetCooldown(strikerId, targetId, now + PatCooldown);
+                    return;
+                }
+            }
+
+            // --- 2. CHECK FRIENDLY PLAYER PAT ZONE (Upper back, shoulders, chest, or head) ---
+            float minPatY = hipsPos.y + 0.18f;
+            float maxPatY = headPos.y + 0.24f;
+            if (strikerHandPos.y < minPatY || strikerHandPos.y > maxPatY)
+                return;
+
+            Vector2 horizOffset = new Vector2(strikerHandPos.x - hipsPos.x, strikerHandPos.z - hipsPos.z);
+            if (horizOffset.magnitude > 0.46f)
+                return;
+
+            if (relSpeed < BodyPatMinRelSpeed)
+                return;
+
+            Vector3 torsoCenter = new Vector3(hipsPos.x, Mathf.Clamp(strikerHandPos.y, minPatY, headPos.y), hipsPos.z);
+            Vector3 toTorso = torsoCenter - strikerHandPos;
+            float torsoDot = toTorso.sqrMagnitude > 0.0001f
+                ? Vector3.Dot(relHandVel / relSpeed, toTorso.normalized)
+                : 1f;
+
+            if (torsoDot < 0.22f)
+                return;
+
+            bool isHeadPat = strikerHandPos.y >= (headPos.y - 0.14f);
+            float patStrength = Mathf.Clamp01((relSpeed - BodyPatMinRelSpeed) / 3.5f);
+            float patVol = Mathf.Lerp(0.45f, 0.85f, patStrength);
+            float patPitch = (isHeadPat ? 1.10f : 0.94f) + patStrength * 0.08f;
+
+            UltimateAudioManager.ServerBroadcastSound(UltimateSoundType.PlayerPat, strikerHandPos, patVol, patPitch);
+            SetCooldown(strikerId, targetId, now + PatCooldown);
+        }
+
+        private void GetTargetAnatomicalAnchors(PlayerBody body, Vector3 bodyPos, out Vector3 hipsPos, out Vector3 headPos)
+        {
+            if (!_boneCache.TryGetValue(body, out CachedBodyBones cached))
+            {
+                cached = new CachedBodyBones();
+                _boneCache[body] = cached;
+            }
+
+            if (!cached.Searched)
+            {
+                cached.Hips = FindChildByName(body.transform, "mixamorig:Hips");
+                cached.Head = FindChildByName(body.transform, "mixamorig:Head");
+                cached.Searched = true;
+            }
+
+            bool isCrouching = body.IsSliding != null && body.IsSliding.Value;
+
+            if (cached.Hips != null)
+                hipsPos = cached.Hips.position;
+            else
+                hipsPos = bodyPos + Vector3.up * (isCrouching ? 0.68f : 1.00f);
+
+            if (cached.Head != null)
+                headPos = cached.Head.position;
+            else
+                headPos = bodyPos + Vector3.up * (isCrouching ? 1.35f : 1.88f);
+        }
+
+        private static Transform FindChildByName(Transform parent, string targetName)
+        {
+            if (parent == null) return null;
+            for (int i = 0; i < parent.childCount; i++)
+            {
+                Transform child = parent.GetChild(i);
+                if (child.name == targetName) return child;
+                Transform found = FindChildByName(child, targetName);
+                if (found != null) return found;
+            }
+            return null;
+        }
+    }
+
+    // Auto-starts the server social gesture detector on both Listen & Dedicated Headless Servers
+    [HarmonyPatch(typeof(Stick), "OnNetworkPostSpawn")]
+    public static class Stick_SocialGesturesBootstrap_Patch
+    {
+        [HarmonyPostfix]
+        public static void Postfix()
+        {
+            if (NetworkRoles.IsServer)
+            {
+                UltimateSocialGestureManager.EnsureRunner();
+            }
         }
     }
 }

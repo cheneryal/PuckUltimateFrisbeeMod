@@ -87,6 +87,7 @@ namespace PuckUltimateFrisbeeMod
                 UltimateKeybindManager.Dispose();
                 UltimateAppearanceManager.Dispose();
                 UltimateAudioManager.UnregisterNetwork();
+                UltimateSocialGestureManager.Dispose();
                 // Do NOT unload the AssetBundle here; unloading destroys runtime shaders on reconnect!
                 _harmony?.UnpatchSelf();
                 ModLogger.Info("Ultimate Frisbee Mod Disabled!");
