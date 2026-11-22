@@ -1937,10 +1937,9 @@ namespace PuckUltimateFrisbeeMod
                 }
                 UltimateRulesManager.BroadcastAnnouncement($"PULL! {UltimateRulesManager.PullingTeam}: Pick up the disc behind your line and Pull!", "#2ecc71");
             }
-            else
+            else if (UltimateRulesManager.GoalCelebrationHolder == null)
             {
-                // Non-live phases (Goal celebration, Replay, PeriodOver, GameOver):
-                // ensure no player stays stuck holding/pivot-locked
+                // Non-live phase without an active goal celebration (e.g., PeriodOver / GameOver)
                 UltimateRulesManager.ResetPlayState();
             }
         }
