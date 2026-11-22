@@ -1,5 +1,6 @@
 using System;
 using System.Collections;
+using System.Collections.Generic;
 using System.Reflection;
 using System.Net.Security;
 using System.IO;
@@ -17,12 +18,27 @@ namespace PuckUltimateFrisbeeMod
     {
         public static bool IsMatchServer { get; private set; } = false;
 
+        private class CachedPlayerStat
+        {
+            public string SteamId;
+            public string Name;
+            public string Team;
+            public int Goals;
+            public int Assists;
+        }
+
         private static string _matchId;
         private static string _callbackUrl;
         private static string _webhookSecret;
         private static bool _hasReported = false;
         private static PlayerTeam _forfeitingTeam = PlayerTeam.None;
         private static float _forfeitDetectedTime = -999f;
+
+        // Cached SteamId member on Player + snapshot of match participants
+        private static MemberInfo _cachedSteamIdMember = null;
+        private static bool _steamIdMemberSearched = false;
+        private static readonly Dictionary<string, CachedPlayerStat> _playerStatCache =
+            new Dictionary<string, CachedPlayerStat>();
 
         // Empty-server watchdog state
         private static float _serverStartTime = 0f;
@@ -41,6 +57,7 @@ namespace PuckUltimateFrisbeeMod
             _anyPlayerEverJoined = false;
             _forfeitingTeam = PlayerTeam.None;
             _emptySinceTime = -1f;
+            _playerStatCache.Clear();
             _serverStartTime = Time.realtimeSinceStartup;
             _nextWatchdogCheckTime = _serverStartTime + 10f;
 
@@ -77,6 +94,7 @@ namespace PuckUltimateFrisbeeMod
         {
             IsMatchServer = false;
             _hasReported = false;
+            _playerStatCache.Clear();
         }
 
         public static void RecordForfeitVote(Vote vote)
@@ -141,6 +159,94 @@ namespace PuckUltimateFrisbeeMod
                 if (count == 1) return found;
             }
             return PlayerTeam.None;
+        }
+
+        private static string ExtractSteamId(Player p)
+        {
+            if (p == null) return "";
+
+            if (!_steamIdMemberSearched)
+            {
+                _steamIdMemberSearched = true;
+                const BindingFlags flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+                Type t = p.GetType();
+                var props = t.GetProperties(flags).Where(prop => prop.GetIndexParameters().Length == 0).ToArray();
+                var fields = t.GetFields(flags);
+
+                _cachedSteamIdMember =
+                    (MemberInfo)props.FirstOrDefault(prop => string.Equals(prop.Name, "SteamId", StringComparison.OrdinalIgnoreCase))
+                    ?? fields.FirstOrDefault(f => string.Equals(f.Name, "SteamId", StringComparison.OrdinalIgnoreCase))
+                    ?? (MemberInfo)props.FirstOrDefault(prop => prop.Name.IndexOf("steamid", StringComparison.OrdinalIgnoreCase) >= 0)
+                    ?? fields.FirstOrDefault(f => f.Name.IndexOf("steamid", StringComparison.OrdinalIgnoreCase) >= 0);
+
+                if (_cachedSteamIdMember != null)
+                {
+                    UltimateFrisbeePlugin.ModLogger.Info(
+                        $"UltimateMatchReporter: Resolved SteamID member Player.{_cachedSteamIdMember.Name}.");
+                }
+                else
+                {
+                    UltimateFrisbeePlugin.ModLogger.Warning(
+                        "UltimateMatchReporter: Could not find a SteamId field/property on Player.");
+                }
+            }
+
+            if (_cachedSteamIdMember == null)
+                return "";
+
+            try
+            {
+                object raw = _cachedSteamIdMember is PropertyInfo pi
+                    ? pi.GetValue(p)
+                    : ((FieldInfo)_cachedSteamIdMember).GetValue(p);
+
+                if (raw == null) return "";
+
+                // Unwrap NetworkVariable<T>.Value if applicable
+                PropertyInfo valueProp = raw.GetType().GetProperty("Value", BindingFlags.Instance | BindingFlags.Public);
+                if (valueProp != null && valueProp.GetIndexParameters().Length == 0)
+                {
+                    raw = valueProp.GetValue(raw);
+                    if (raw == null) return "";
+                }
+
+                string sid = raw.ToString().Trim();
+                return sid == "0" ? "" : sid;
+            }
+            catch (Exception ex)
+            {
+                UltimateFrisbeePlugin.ModLogger.Warning($"UltimateMatchReporter: Failed to read SteamId: {ex.Message}");
+                return "";
+            }
+        }
+
+        private static void SnapshotConnectedPlayerStats()
+        {
+            if (MonoBehaviourSingleton<PlayerManager>.Instance == null)
+                return;
+
+            foreach (Player p in MonoBehaviourSingleton<PlayerManager>.Instance.GetPlayers(false))
+            {
+                if (p == null) continue;
+                PlayerTeam team = UltimateRulesManager.GetTeam(p);
+                if (team != PlayerTeam.Red && team != PlayerTeam.Blue) continue;
+
+                string steamId = ExtractSteamId(p);
+                string name = p.Username != null ? p.Username.Value.ToString() : "Player";
+                int goals = p.Goals != null ? p.Goals.Value : 0;
+                int assists = p.Assists != null ? p.Assists.Value : 0;
+                string teamStr = team == PlayerTeam.Red ? "red" : "blue";
+
+                string key = !string.IsNullOrEmpty(steamId) ? steamId : $"name:{name}";
+                _playerStatCache[key] = new CachedPlayerStat
+                {
+                    SteamId = steamId,
+                    Name = name,
+                    Team = teamStr,
+                    Goals = goals,
+                    Assists = assists
+                };
+            }
         }
 
         public static void OnGameOver(int redScore, int blueScore, int period)
@@ -220,6 +326,7 @@ namespace PuckUltimateFrisbeeMod
             {
                 _anyPlayerEverJoined = true;
                 _emptySinceTime = -1f;
+                SnapshotConnectedPlayerStats();
                 return;
             }
 
@@ -249,7 +356,7 @@ namespace PuckUltimateFrisbeeMod
             string payload =
                 "{" +
                 $"\"match_id\":\"{EscapeJson(_matchId)}\"," +
-                "\"winner_team\":null," +
+                $"\"winner_team\":null," +
                 $"\"reason\":\"{EscapeJson(reason)}\"" +
                 "}";
 
@@ -258,33 +365,25 @@ namespace PuckUltimateFrisbeeMod
 
         private static string CollectPlayerStatsJson()
         {
+            // Refresh with latest live stats while preserving anyone who left just before GameOver
+            SnapshotConnectedPlayerStats();
+
             var sb = new StringBuilder();
             sb.Append("[");
             bool first = true;
 
-            if (MonoBehaviourSingleton<PlayerManager>.Instance != null)
+            foreach (var stat in _playerStatCache.Values)
             {
-                foreach (Player p in MonoBehaviourSingleton<PlayerManager>.Instance.GetPlayers(false))
-                {
-                    if (p == null) continue;
-                    PlayerTeam team = UltimateRulesManager.GetTeam(p);
-                    if (team != PlayerTeam.Red && team != PlayerTeam.Blue) continue;
+                if (!first) sb.Append(",");
+                first = false;
 
-                    string name = p.Username != null ? p.Username.Value.ToString() : "Player";
-                    int goals = p.Goals != null ? p.Goals.Value : 0;
-                    int assists = p.Assists != null ? p.Assists.Value : 0;
-                    string teamStr = team == PlayerTeam.Red ? "red" : "blue";
-
-                    if (!first) sb.Append(",");
-                    first = false;
-
-                    sb.Append("{")
-                      .Append($"\"name\":\"{EscapeJson(name)}\",")
-                      .Append($"\"team\":\"{teamStr}\",")
-                      .Append($"\"goals\":{goals},")
-                      .Append($"\"assists\":{assists}")
-                      .Append("}");
-                }
+                sb.Append("{")
+                  .Append($"\"steam_id\":\"{EscapeJson(stat.SteamId)}\",")
+                  .Append($"\"name\":\"{EscapeJson(stat.Name)}\",")
+                  .Append($"\"team\":\"{stat.Team}\",")
+                  .Append($"\"goals\":{stat.Goals},")
+                  .Append($"\"assists\":{stat.Assists}")
+                  .Append("}");
             }
 
             sb.Append("]");
@@ -344,8 +443,6 @@ namespace PuckUltimateFrisbeeMod
             }
         }
 
-
-
         private static string ExtractJsonString(string json, string key)
         {
             var m = Regex.Match(json, $"\"{Regex.Escape(key)}\"\\s*:\\s*\"([^\"]*)\"");
@@ -392,6 +489,7 @@ namespace PuckUltimateFrisbeeMod
             }
         }
     }
+
     [HarmonyPatch(typeof(BaseGameMode<BaseGameModeConfig>), "OnVoteRemoved")]
     public static class BaseGameMode_TrackForfeit_Patch
     {
