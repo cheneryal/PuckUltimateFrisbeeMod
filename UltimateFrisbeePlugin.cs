@@ -49,6 +49,7 @@ namespace PuckUltimateFrisbeeMod
                 UltimateDiveMod.EnsureNetworkRegistered();
                 UltimateKeybindManager.Initialize(PluginDirectory);
                 UltimateAppearanceManager.Initialize(PluginDirectory);
+                UltimateChatReminders.Initialize();
 
                 Level existingLevel = UnityEngine.Object.FindFirstObjectByType<Level>();
                 if (existingLevel != null)
@@ -88,6 +89,7 @@ namespace PuckUltimateFrisbeeMod
                 UltimateAppearanceManager.Dispose();
                 UltimateAudioManager.UnregisterNetwork();
                 UltimateSocialGestureManager.Dispose();
+                UltimateChatReminders.Dispose();
                 // Do NOT unload the AssetBundle here; unloading destroys runtime shaders on reconnect!
                 _harmony?.UnpatchSelf();
                 ModLogger.Info("Ultimate Frisbee Mod Disabled!");

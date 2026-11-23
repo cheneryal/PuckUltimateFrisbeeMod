@@ -29,7 +29,10 @@ namespace PuckUltimateFrisbeeMod
         public static float FieldHalfWidth = 18.5f;
         public static float BrickMarkZ = 14.0f;
         public static float MarkerRadius = 4.5f;
-        public static float DoubleTeamRadius = 3.0f;
+        public static float DoubleTeamRadius = 4.5f;           // Matches MarkerRadius so there is no unpoliced gap
+        public static float DoubleTeamGuardOtherRadius = 2.5f; // Tighter exemption when genuinely guarding another cutter
+        public static float DoubleTeamPushSpeed = 14.0f;       // Firm outward push out of the double-team perimeter
+        public static float DoubleTeamResetGrace = 1.0f;       // Keeps stall pinned at 0 for 1s after double team clears
         public static float DiscSpaceRadius = 1.65f;      // Min horizontal center-to-center distance (~1 disc space between torsos)
         public static float DiscSpacePushSpeed = 7.5f;    // Smooth radial separation speed so catches/pivots don't teleport defenders
         public static float MarkBlockHandRadius = 0.50f;  // Slightly tighter handblock radius on point-blank mark blocks
@@ -82,6 +85,8 @@ namespace PuckUltimateFrisbeeMod
         public static int LastStallAnnounced = 0;
         public static Player ActiveMarker = null;
         public static float LastDoubleTeamWarningTime = 0f;
+        public static float DoubleTeamPenaltyUntil = 0f;
+        public static bool IsDoubleTeamActive = false;
 
         // Pre-Stall / Delay of Game Tracking
         public static float DiscStationaryStartTime = 0f;
@@ -644,6 +649,8 @@ namespace PuckUltimateFrisbeeMod
             LastStallAnnounced = 0;
             ActiveMarker = null;
             LastDoubleTeamWarningTime = 0f;
+            IsDoubleTeamActive = false;
+            DoubleTeamPenaltyUntil = 0f;
             WasTippedInFlight = false;
             WasDefensiveBlock = false;
             LastDeflector = null;
@@ -1239,6 +1246,8 @@ namespace PuckUltimateFrisbeeMod
                             UltimateRulesManager.WasDefensiveBlock = false;
                             UltimateRulesManager.LastDeflector = null;
                             UltimateRulesManager.ActiveMarker = null;
+                            UltimateRulesManager.IsDoubleTeamActive = false;
+                            UltimateRulesManager.DoubleTeamPenaltyUntil = 0f;
                             UltimateRulesManager.SecondLastThrower = null;
                             UltimateRulesManager.LastTurnoverTeam = pullerTeam;
                             UltimateRulesManager.OffensiveTeam = receivingTeam ?? PlayerTeam.None;
@@ -1782,6 +1791,43 @@ namespace PuckUltimateFrisbeeMod
             return a + ab * t;
         }
 
+        private struct DoubleTeamCandidate
+        {
+            public Player Player;
+            public Vector3 Pos;
+            public float HorizDist;
+            public bool InsideStrictRadius;
+        }
+
+        private static bool IsDefenderGuardingAnotherAttacker(
+            Vector3 defPos,
+            float defToHolderHorizDist,
+            Player holder,
+            PlayerTeam holderTeam,
+            IEnumerable<Player> allPlayers)
+        {
+            foreach (var other in allPlayers)
+            {
+                if (other == null || other == holder || !other.IsCharacterSpawned || other.PlayerBody == null)
+                    continue;
+
+                if (UltimateRulesManager.GetTeam(other) != holderTeam)
+                    continue;
+
+                Vector3 toOther = other.PlayerBody.transform.position - defPos;
+                toOther.y = 0f;
+                float defToOtherDist = toOther.magnitude;
+
+                // Must be tightly guarding the other attacker AND clearly closer to them than to the thrower
+                if (defToOtherDist <= UltimateRulesManager.DoubleTeamGuardOtherRadius &&
+                    defToOtherDist + 0.25f < defToHolderHorizDist)
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         private static bool UpdateMarkerAndStallCount(
             Puck disc,
             Player holder,
@@ -1795,12 +1841,14 @@ namespace PuckUltimateFrisbeeMod
             if (holderTeam != PlayerTeam.Blue && holderTeam != PlayerTeam.Red) return false;
 
             var allPlayers = MonoBehaviourSingleton<PlayerManager>.Instance.GetPlayers(false);
-
-            Player closestDefender = null;
-            float closestDist = float.MaxValue;
             Vector3 holderPos = holder.PlayerBody.transform.position;
 
-            var defendersInDoubleTeamZone = new List<Player>();
+            float dtRadius = UltimateRulesManager.DoubleTeamRadius;
+            float dtPressCheckRadius = dtRadius + 0.35f;
+
+            Player closestMarker = null;
+            float closestMarkerDist = float.MaxValue;
+            var activeDoubleTeamCandidates = new List<DoubleTeamCandidate>();
 
             foreach (var p in allPlayers)
             {
@@ -1810,64 +1858,139 @@ namespace PuckUltimateFrisbeeMod
                 if (!UltimateRulesManager.AreOpponents(holder, p))
                     continue;
 
-                float d = Vector3.Distance(holderPos, p.PlayerBody.transform.position);
-                if (d <= UltimateRulesManager.MarkerRadius && d < closestDist)
+                Vector3 defPos = p.PlayerBody.transform.position;
+                Vector3 delta = defPos - holderPos;
+                delta.y = 0f;
+                float horizDist = delta.magnitude;
+
+                bool withinMarker = horizDist <= UltimateRulesManager.MarkerRadius;
+                bool withinStrictDt = dtRadius > 0.01f && horizDist <= dtRadius;
+                bool withinPressDt = dtRadius > 0.01f && !withinStrictDt && horizDist <= dtPressCheckRadius;
+
+                if (!withinMarker && !withinStrictDt && !withinPressDt)
+                    continue;
+
+                if (withinMarker && horizDist < closestMarkerDist)
                 {
-                    closestDist = d;
-                    closestDefender = p;
+                    closestMarkerDist = horizDist;
+                    closestMarker = p;
                 }
 
-                if (d <= UltimateRulesManager.DoubleTeamRadius)
+                if (IsDefenderGuardingAnotherAttacker(defPos, horizDist, holder, holderTeam, allPlayers))
+                    continue;
+
+                if (withinStrictDt)
                 {
-                    defendersInDoubleTeamZone.Add(p);
+                    activeDoubleTeamCandidates.Add(new DoubleTeamCandidate
+                    {
+                        Player = p,
+                        Pos = defPos,
+                        HorizDist = horizDist,
+                        InsideStrictRadius = true
+                    });
+                }
+                else if (withinPressDt && UltimateRulesManager.IsDoubleTeamActive)
+                {
+                    // Keep flagging a 2nd defender who continuously presses inward against the perimeter
+                    Vector3 pushDir = horizDist > 0.001f ? (delta / horizDist) : -p.PlayerBody.transform.forward;
+                    pushDir.y = 0f;
+                    if (pushDir.sqrMagnitude > 0.001f) pushDir.Normalize();
+
+                    float inwardSpeed = 0f;
+                    if (p.PlayerBody.Rigidbody != null)
+                    {
+                        Vector3 v = p.PlayerBody.Rigidbody.linearVelocity;
+                        inwardSpeed = Vector3.Dot(new Vector3(v.x, 0f, v.z), -pushDir);
+                    }
+
+                    if (inwardSpeed > 0.20f)
+                    {
+                        activeDoubleTeamCandidates.Add(new DoubleTeamCandidate
+                        {
+                            Player = p,
+                            Pos = defPos,
+                            HorizDist = horizDist,
+                            InsideStrictRadius = false
+                        });
+                    }
                 }
             }
 
-            int illegalDoubleTeamers = 0;
-            if (defendersInDoubleTeamZone.Count > 1 && closestDefender != null)
+            int strictCount = 0;
+            int primaryIdx = -1;
+            float primaryDist = float.MaxValue;
+
+            for (int i = 0; i < activeDoubleTeamCandidates.Count; i++)
             {
-                foreach (var def in defendersInDoubleTeamZone)
+                if (activeDoubleTeamCandidates[i].InsideStrictRadius)
+                    strictCount++;
+
+                if (activeDoubleTeamCandidates[i].HorizDist < primaryDist)
                 {
-                    if (def == closestDefender) continue;
+                    primaryDist = activeDoubleTeamCandidates[i].HorizDist;
+                    primaryIdx = i;
+                }
+            }
 
-                    bool isGuardingAnotherAttacker = false;
-                    Vector3 defPos = def.PlayerBody.transform.position;
+            // Prefer the actual primary marker (not a defender guarding another cutter)
+            if (primaryIdx >= 0 && activeDoubleTeamCandidates[primaryIdx].HorizDist <= UltimateRulesManager.MarkerRadius)
+            {
+                closestMarker = activeDoubleTeamCandidates[primaryIdx].Player;
+            }
 
-                    foreach (var other in allPlayers)
+            int illegalDoubleTeamers = 0;
+            if (strictCount >= 1 && activeDoubleTeamCandidates.Count > 1)
+            {
+                float targetPerimeter = dtRadius + 0.12f;
+
+                for (int i = 0; i < activeDoubleTeamCandidates.Count; i++)
+                {
+                    if (i == primaryIdx) continue;
+
+                    illegalDoubleTeamers++;
+                    var candidate = activeDoubleTeamCandidates[i];
+                    Player def = candidate.Player;
+                    Vector3 defPos = candidate.Pos;
+                    float horizDist = candidate.HorizDist;
+
+                    Vector3 pushDir = defPos - holderPos;
+                    pushDir.y = 0f;
+                    if (pushDir.sqrMagnitude < 0.001f) pushDir = -def.PlayerBody.transform.forward;
+                    pushDir.y = 0f;
+                    if (pushDir.sqrMagnitude < 0.001f) pushDir = Vector3.forward;
+                    pushDir.Normalize();
+
+                    if (horizDist < targetPerimeter)
                     {
-                        if (other == null || other == holder || !other.IsCharacterSpawned || other.PlayerBody == null)
-                            continue;
-                        if (UltimateRulesManager.GetTeam(other) == holderTeam)
-                        {
-                            if (Vector3.Distance(defPos, other.PlayerBody.transform.position) <= 3.5f)
-                            {
-                                isGuardingAnotherAttacker = true;
-                                break;
-                            }
-                        }
-                    }
+                        float newDist = Mathf.MoveTowards(
+                            horizDist,
+                            targetPerimeter,
+                            UltimateRulesManager.DoubleTeamPushSpeed * Time.fixedDeltaTime);
 
-                    if (!isGuardingAnotherAttacker)
-                    {
-                        illegalDoubleTeamers++;
+                        Vector3 legalPerimeterPos = new Vector3(
+                            holderPos.x + pushDir.x * newDist,
+                            defPos.y,
+                            holderPos.z + pushDir.z * newDist);
 
-                        Vector3 pushDir = (defPos - holderPos);
-                        pushDir.y = 0f;
-                        if (pushDir.sqrMagnitude < 0.001f) pushDir = -def.PlayerBody.transform.forward;
-                        pushDir.Normalize();
-
-                        Vector3 legalPerimeterPos = holderPos + pushDir * (UltimateRulesManager.DoubleTeamRadius + 0.08f);
-                        legalPerimeterPos.y = defPos.y;
                         def.PlayerBody.transform.position = legalPerimeterPos;
                         if (def.PlayerBody.Rigidbody != null)
                         {
                             def.PlayerBody.Rigidbody.position = legalPerimeterPos;
                             Vector3 v = def.PlayerBody.Rigidbody.linearVelocity;
-                            float inwardSpeed = Vector3.Dot(v, -pushDir);
+                            float inwardSpeed = Vector3.Dot(new Vector3(v.x, 0f, v.z), -pushDir);
                             if (inwardSpeed > 0f)
                             {
                                 def.PlayerBody.Rigidbody.linearVelocity = v + pushDir * inwardSpeed;
                             }
+                        }
+                    }
+                    else if (def.PlayerBody.Rigidbody != null)
+                    {
+                        Vector3 v = def.PlayerBody.Rigidbody.linearVelocity;
+                        float inwardSpeed = Vector3.Dot(new Vector3(v.x, 0f, v.z), -pushDir);
+                        if (inwardSpeed > 0f)
+                        {
+                            def.PlayerBody.Rigidbody.linearVelocity = v + pushDir * inwardSpeed;
                         }
                     }
                 }
@@ -1878,20 +2001,39 @@ namespace PuckUltimateFrisbeeMod
 
             if (illegalDoubleTeamers > 0)
             {
-                UltimateRulesManager.StallCount = Mathf.Max(0f, UltimateRulesManager.StallCount - Time.fixedDeltaTime * 1.5f);
-                UltimateRulesManager.LastStallAnnounced = Mathf.Min(UltimateRulesManager.LastStallAnnounced, Mathf.FloorToInt(UltimateRulesManager.StallCount));
+                bool wasAlreadyDoubleTeaming = UltimateRulesManager.IsDoubleTeamActive;
+                bool hadStallToReset = UltimateRulesManager.StallCount >= 0.5f;
 
-                if (Time.time - UltimateRulesManager.LastDoubleTeamWarningTime > 2.5f)
+                UltimateRulesManager.IsDoubleTeamActive = true;
+                UltimateRulesManager.DoubleTeamPenaltyUntil = Time.time + UltimateRulesManager.DoubleTeamResetGrace;
+                UltimateRulesManager.StallCount = 0f;
+                UltimateRulesManager.LastStallAnnounced = 0;
+                UltimateRulesManager.ActiveMarker = closestMarker;
+
+                if ((!wasAlreadyDoubleTeaming && hadStallToReset) ||
+                    (Time.time - UltimateRulesManager.LastDoubleTeamWarningTime > 2.5f))
                 {
                     UltimateRulesManager.LastDoubleTeamWarningTime = Time.time;
-                    UltimateRulesManager.BroadcastAnnouncement("DOUBLE TEAM! Only 1 marker allowed within 3m - Stall paused & rewound!", "#f1c40f");
+                    UltimateRulesManager.BroadcastAnnouncement(
+                        $"DOUBLE TEAM! Stall RESET to 0 until 2nd defender clears {dtRadius:F1}m!",
+                        "#f1c40f");
                 }
                 return false;
             }
 
-            if (closestDefender != null)
+            if (Time.time < UltimateRulesManager.DoubleTeamPenaltyUntil)
             {
-                UltimateRulesManager.ActiveMarker = closestDefender;
+                UltimateRulesManager.StallCount = 0f;
+                UltimateRulesManager.LastStallAnnounced = 0;
+                UltimateRulesManager.ActiveMarker = closestMarker;
+                return false;
+            }
+
+            UltimateRulesManager.IsDoubleTeamActive = false;
+
+            if (closestMarker != null)
+            {
+                UltimateRulesManager.ActiveMarker = closestMarker;
                 UltimateRulesManager.StallCount += Time.fixedDeltaTime;
             }
             else
@@ -1906,7 +2048,7 @@ namespace PuckUltimateFrisbeeMod
                 if (stallSec == 1 || stallSec == 5 || stallSec >= 7)
                 {
                     UltimateRulesManager.LastStallAnnounced = stallSec;
-                    string markerInfo = $" (Marked by #{closestDefender.Number.Value})";
+                    string markerInfo = $" (Marked by #{closestMarker.Number.Value})";
                     UltimateRulesManager.BroadcastAnnouncement($"STALL {stallSec}...{markerInfo}", "#e67e22");
                 }
             }
@@ -1932,6 +2074,8 @@ namespace PuckUltimateFrisbeeMod
                 UltimateRulesManager.LastDeflectionTime = 0f;
                 UltimateRulesManager.WentOutOfBoundsInFlight = false;
                 UltimateRulesManager.ActiveMarker = null;
+                UltimateRulesManager.IsDoubleTeamActive = false;
+                UltimateRulesManager.DoubleTeamPenaltyUntil = 0f;
                 UltimateRulesManager.SecondLastThrower = null;
 
                 UltimateRulesManager.LastTurnoverTeam = holderTeam;
@@ -1946,9 +2090,9 @@ namespace PuckUltimateFrisbeeMod
 
                 // Drop flat on the turf cleanly between thrower and marker (not inside either player's hand)
                 Vector3 dropOffset = aimForward * 0.55f;
-                if (closestDefender != null && closestDefender.PlayerBody != null)
+                if (closestMarker != null && closestMarker.PlayerBody != null)
                 {
-                    Vector3 toMarker = closestDefender.PlayerBody.transform.position - holderPos;
+                    Vector3 toMarker = closestMarker.PlayerBody.transform.position - holderPos;
                     toMarker.y = 0f;
                     float distToMarker = toMarker.magnitude;
                     if (distToMarker > 0.05f)
@@ -2492,6 +2636,8 @@ namespace PuckUltimateFrisbeeMod
             UltimateRulesManager.ReleaseTime = Time.time;
             UltimateRulesManager.StallCount = 0f;
             UltimateRulesManager.LastStallAnnounced = 0;
+            UltimateRulesManager.IsDoubleTeamActive = false;
+            UltimateRulesManager.DoubleTeamPenaltyUntil = 0f;
             UltimateRulesManager.DiscStationaryStartTime = 0f;
             UltimateRulesManager.LastPreStallAnnounced = 0;
             UltimateRulesManager.IsDiscForceGrounded = false;
@@ -2690,6 +2836,8 @@ namespace PuckUltimateFrisbeeMod
             UltimateRulesManager.StallCount = 0f;
             UltimateRulesManager.LastStallAnnounced = 0;
             UltimateRulesManager.ActiveMarker = null;
+            UltimateRulesManager.IsDoubleTeamActive = false;
+            UltimateRulesManager.DoubleTeamPenaltyUntil = 0f;
             UltimateRulesManager.IsDiscInFlight = false;
             UltimateRulesManager.IsDiscTumblingOnGround = false;
             UltimateRulesManager.ActiveFlightWobble = 0f;
@@ -2984,95 +3132,6 @@ namespace PuckUltimateFrisbeeMod
             }
 
             UltimateRulesManager.BroadcastAnnouncement($"Line up on the Goal Lines! {UltimateRulesManager.PullingTeam} will Pull!", "#ffe97f");
-        }
-    }
-
-    [HarmonyPatch(typeof(BaseGameMode<BaseGameModeConfig>), "OnChatCommand")]
-    public static class UltimateVisualTuning_ChatCommands_Patch
-    {
-        [HarmonyPrefix]
-        public static bool Prefix(Player player, string command, string[] args)
-        {
-            if (command == "/armrot" && args.Length == 3 &&
-                float.TryParse(args[0], out float ax) && float.TryParse(args[1], out float ay) && float.TryParse(args[2], out float az))
-            {
-                UltimateVisualTuning.ArmRotationOffset = new Vector3(ax, ay, az);
-                UltimateRulesManager.BroadcastAnnouncement($"ArmRotationOffset set to ({ax}, {ay}, {az})");
-                return false;
-            }
-            if ((command == "/armscale" || command == "/armthick") && args.Length == 1 && float.TryParse(args[0], out float athick))
-            {
-                UltimateVisualTuning.ArmThicknessMultiplier = athick;
-                UltimateRulesManager.BroadcastAnnouncement($"ArmThicknessMultiplier set to {athick}");
-                return false;
-            }
-            if (command == "/armlen" && args.Length == 1 && float.TryParse(args[0], out float alen))
-            {
-                UltimateVisualTuning.ArmLengthMultiplier = alen;
-                UltimateRulesManager.BroadcastAnnouncement($"ArmLengthMultiplier set to {alen}");
-                return false;
-            }
-            if (command == "/discrot" && args.Length == 3 &&
-                float.TryParse(args[0], out float dx) && float.TryParse(args[1], out float dy) && float.TryParse(args[2], out float dz))
-            {
-                UltimateVisualTuning.DiscMeshRotationOffset = new Vector3(dx, dy, dz);
-                UltimateRulesManager.BroadcastAnnouncement($"DiscMeshRotationOffset set to ({dx}, {dy}, {dz})");
-                return false;
-            }
-            if (command == "/discscale" && args.Length == 1 && float.TryParse(args[0], out float dscale))
-            {
-                UltimateVisualTuning.DiscMeshScale = dscale;
-                UltimateRulesManager.BroadcastAnnouncement($"DiscMeshScale set to {dscale}");
-                return false;
-            }
-            if (command == "/discoffset" && args.Length == 3 &&
-                float.TryParse(args[0], out float ox) && float.TryParse(args[1], out float oy) && float.TryParse(args[2], out float oz))
-            {
-                UltimateVisualTuning.HeldDiscHandOffset = new Vector3(ox, oy, oz);
-                UltimateRulesManager.BroadcastAnnouncement($"HeldDiscHandOffset set to ({ox}, {oy}, {oz})");
-                return false;
-            }
-            if (command == "/armreach" && args.Length == 1 && float.TryParse(args[0], out float areach))
-            {
-                UltimateVisualTuning.ArmReachCompression = Mathf.Clamp(areach, 0.25f, 1.0f);
-                UltimateRulesManager.BroadcastAnnouncement($"ArmReachCompression set to {UltimateVisualTuning.ArmReachCompression:F2}");
-                return false;
-            }
-            if (command == "/wind" && args.Length >= 1)
-            {
-                if (args[0].Equals("auto", StringComparison.OrdinalIgnoreCase))
-                {
-                    UltimateWindManager.IsWindLockedByCommand = false;
-                    UltimateRulesManager.BroadcastAnnouncement("Wind set to automatic natural weather.");
-                    return false;
-                }
-                if (float.TryParse(args[0], out float kph))
-                {
-                    float angle = (args.Length >= 2 && float.TryParse(args[1], out float a)) ? a : 0f;
-                    UltimateWindManager.ServerSetManualWind(kph, angle);
-                    UltimateRulesManager.BroadcastAnnouncement($"Wind locked to {kph:F1} KPH at {angle:F0}°");
-                    return false;
-                }
-            }
-            if (command == "/whipeffort" && args.Length == 1 && float.TryParse(args[0], out float effortVal))
-            {
-                UltimateRulesManager.ThrowMotionTracker.WhipEffortScale = Mathf.Clamp(effortVal, 0.5f, 2.0f);
-                UltimateRulesManager.BroadcastAnnouncement($"Throw WhipEffortScale set to {UltimateRulesManager.ThrowMotionTracker.WhipEffortScale:F2}");
-                return false;
-            }
-            if (command == "/discspace" && args.Length == 1 && float.TryParse(args[0], out float discSpaceVal))
-            {
-                UltimateRulesManager.DiscSpaceRadius = Mathf.Clamp(discSpaceVal, 0f, 3.0f);
-                UltimateRulesManager.BroadcastAnnouncement($"DiscSpaceRadius set to {UltimateRulesManager.DiscSpaceRadius:F2}m");
-                return false;
-            }
-            if (command == "/markblock" && args.Length == 1 && float.TryParse(args[0], out float markBlockVal))
-            {
-                UltimateRulesManager.MarkBlockHandRadius = Mathf.Clamp(markBlockVal, 0.25f, 0.85f);
-                UltimateRulesManager.BroadcastAnnouncement($"MarkBlockHandRadius set to {UltimateRulesManager.MarkBlockHandRadius:F2}m");
-                return false;
-            }
-            return true;
         }
     }
 
