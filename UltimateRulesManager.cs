@@ -273,7 +273,14 @@ namespace PuckUltimateFrisbeeMod
         public class ThrowMotionTracker
         {
             // Live-tunable effort multiplier (1.0 = realistic default, >1.0 = requires harder whip, <1.0 = easier)
-            public static float WhipEffortScale = 1.0f;
+            public static float WhipEffortScale = 1.2f;
+
+            // Peak hold grace windows so normal aim-and-release timing (and network ping)
+            // never collapses a mid-range throw into a soft floater.
+            private const float WhipPeakHoldSeconds = 0.18f;
+            private const float WhipPostHoldDecayRate = 1.85f;
+            private const float TravelPeakHoldSeconds = 0.24f;
+            private const float TravelPostHoldDecayRate = 0.55f;
 
             public bool IsArmed = false;
             public bool RequireFreshLmbPress = false;
@@ -288,6 +295,7 @@ namespace PuckUltimateFrisbeeMod
             public float PrevBladeAngle = 0f;
 
             public float StrokeDistance = 0f;
+            public float PeakTravel = 0f;
             public float CoilSweepDeg = 0f;
             public float PeakCoil = 0f;
             public float PeakWhip = 0f;
@@ -296,6 +304,12 @@ namespace PuckUltimateFrisbeeMod
             public float SmoothedJerk = 0f;
             public float EstimatedWobble = 0f;
             public float VerticalReleaseVel = 0f;
+
+            private Vector3 _deepestCoilHand = Vector3.zero;
+            private Vector2 _deepestCoilAngle = Vector2.zero;
+            private float _lastWhipPeakTime = -999f;
+            private float _lastTravelPeakTime = -999f;
+            private UltimateThrowType _lastThrowType = UltimateThrowType.Backhand;
 
             public void OnCatchOrPickup(Player holder)
             {
@@ -317,13 +331,18 @@ namespace PuckUltimateFrisbeeMod
                 Reset();
                 IsArmed = true;
                 ArmStartTime = Time.time;
+                _lastThrowType = throwType;
 
                 if (body != null && stick != null)
                 {
                     PrevLocalHand = body.transform.InverseTransformPoint(GetHandWorldPosition(stick));
                 }
+                _deepestCoilHand = PrevLocalHand;
                 PrevStickAngle = stickAngle;
+                _deepestCoilAngle = stickAngle;
                 PrevBladeAngle = bladeAngle;
+                _lastWhipPeakTime = Time.time;
+                _lastTravelPeakTime = Time.time;
             }
 
             public void UpdateArm(
@@ -337,153 +356,285 @@ namespace PuckUltimateFrisbeeMod
                 float dt)
             {
                 if (!IsArmed || body == null || stick == null) return;
-                dt = Mathf.Max(0.001f, dt);
+                dt = Mathf.Clamp(dt, 0.002f, 0.05f);
 
                 Vector3 localHand = body.transform.InverseTransformPoint(GetHandWorldPosition(stick));
                 Vector3 handStep = localHand - PrevLocalHand;
-                Vector3 rawLocalVel = handStep / dt;
+                Vector3 rawLocalVel = Vector3.ClampMagnitude(handStep / dt, 14.0f);
 
-                // Smooth velocity (~55ms window) to eliminate 1-frame mouse polling spikes at all framerates
-                float velAlpha = Mathf.Clamp01(dt * 18f);
+                // Framerate-independent exponential smoothing (~65ms velocity window)
+                float velAlpha = 1f - Mathf.Exp(-dt * 15f);
                 PrevSmoothedLocalVel = SmoothedLocalVel;
                 SmoothedLocalVel = Vector3.Lerp(SmoothedLocalVel, rawLocalVel, velAlpha);
 
+                float worldAlpha = 1f - Mathf.Exp(-dt * 18f);
                 Vector3 worldVel = body.transform.TransformDirection(SmoothedLocalVel);
                 worldVel.y = 0f;
-                SmoothedHorizWorldVel = Vector3.Lerp(SmoothedHorizWorldVel, worldVel, Mathf.Clamp01(dt * 20f));
-                VerticalReleaseVel = Mathf.Lerp(VerticalReleaseVel, SmoothedLocalVel.y, Mathf.Clamp01(dt * 18f));
+                SmoothedHorizWorldVel = Vector3.Lerp(SmoothedHorizWorldVel, worldVel, worldAlpha);
+                VerticalReleaseVel = Mathf.Lerp(VerticalReleaseVel, SmoothedLocalVel.y, velAlpha);
 
                 Vector2 angleDelta = currentStickAngle - PrevStickAngle;
-                float rawAngularSpeed = angleDelta.magnitude / dt;
+                float rawAngularSpeed = Mathf.Min(angleDelta.magnitude / dt, 1100f);
                 SmoothedAngularSpeed = Mathf.Lerp(SmoothedAngularSpeed, rawAngularSpeed, velAlpha);
+
+                // If player switched sides before committing to a forward stroke, re-anchor windup cleanly
+                if (throwType != _lastThrowType)
+                {
+                    if (StrokeDistance < 0.14f)
+                    {
+                        _deepestCoilHand = localHand;
+                        _deepestCoilAngle = currentStickAngle;
+                    }
+                    _lastThrowType = throwType;
+                }
 
                 // +1 for right-handed (forehand is +X, backhand is -X), -1 for left-handed
                 float domSign = isLeftHanded ? -1f : 1f;
                 float crossBodyX = -localHand.x * domSign;
                 float domSideX = localHand.x * domSign;
-                float rearPull = Mathf.Max(0f, 0.38f - localHand.z);
+                float rearPull = Mathf.Max(0f, 0.42f - localHand.z);
 
-                // Only count angular sweep toward Coil when actually pulling back / winding up (not jittering in place)
-                bool isWindingUp = (SmoothedLocalVel.z < -0.25f) ||
-                                   (throwType == UltimateThrowType.Backhand && SmoothedLocalVel.x * domSign < -0.25f) ||
-                                   (throwType == UltimateThrowType.Hammer && SmoothedLocalVel.y > 0.25f);
-                if (isWindingUp)
-                {
-                    CoilSweepDeg = Mathf.Min(120f, CoilSweepDeg + angleDelta.magnitude);
-                }
-
-                // -------------------------------------------------------------
-                // 1. SPATIAL COIL (Deep Windup Unlocks Max Power Ceiling)
-                // -------------------------------------------------------------
-                float instantCoil = 0f;
+                // Detect genuine windup motion using raw velocity (zero lag at reversal apex)
+                float rawWindupSpeed = 0f;
                 switch (throwType)
                 {
                     case UltimateThrowType.Backhand:
-                        // Requires a real cross-body reach or rear draw-back (deadzone ignores neutral resting posture)
-                        instantCoil = Mathf.Clamp01(Mathf.Max(
-                            (crossBodyX - 0.16f) / 0.44f,
-                            Mathf.Max((rearPull - 0.05f) / 0.38f, CoilSweepDeg / 75f)));
+                        rawWindupSpeed = Mathf.Max(0f, -rawLocalVel.z) + Mathf.Max(0f, -rawLocalVel.x * domSign) * 0.85f;
+                        break;
+                    case UltimateThrowType.Forehand:
+                        rawWindupSpeed = Mathf.Max(0f, -rawLocalVel.z) +
+                                         (rawLocalVel.z <= 0.15f ? Mathf.Max(0f, rawLocalVel.x * domSign) * 0.55f : 0f);
+                        break;
+                    case UltimateThrowType.Hammer:
+                        rawWindupSpeed = Mathf.Max(0f, -rawLocalVel.z) + Mathf.Max(0f, rawLocalVel.y) * 0.75f;
+                        break;
+                    default: // Scoober
+                        rawWindupSpeed = Mathf.Max(0f, -rawLocalVel.z) + Mathf.Max(0f, -rawLocalVel.x * domSign) * 0.75f;
+                        break;
+                }
+
+                bool isWindingUp = rawWindupSpeed > 0.30f;
+                if (isWindingUp)
+                {
+                    CoilSweepDeg = Mathf.Min(120f, CoilSweepDeg + angleDelta.magnitude);
+
+                    // If the player pulls back after a forward swing (pumping/re-winding), bleed old forward stroke
+                    if (rawWindupSpeed > 0.65f && StrokeDistance > 0.14f)
+                    {
+                        float rewindDecay = Mathf.Exp(-dt * 4.5f);
+                        PeakWhip *= rewindDecay;
+                        PeakTravel *= rewindDecay;
+                        StrokeDistance = Mathf.MoveTowards(StrokeDistance, 0f, dt * 1.4f);
+                        _deepestCoilHand = Vector3.Lerp(_deepestCoilHand, localHand, 1f - Mathf.Exp(-dt * 14f));
+                        _deepestCoilAngle = Vector2.Lerp(_deepestCoilAngle, currentStickAngle, 1f - Mathf.Exp(-dt * 14f));
+                    }
+                }
+
+                // Always track the deepest point of the current windup without losing apex depth on reversal
+                bool updatedDeepest = false;
+                if (localHand.z < _deepestCoilHand.z)
+                {
+                    _deepestCoilHand.z = localHand.z;
+                    updatedDeepest = true;
+                }
+                if (throwType == UltimateThrowType.Backhand || throwType == UltimateThrowType.Scoober)
+                {
+                    if (localHand.x * domSign < _deepestCoilHand.x * domSign)
+                    {
+                        _deepestCoilHand.x = localHand.x;
+                        updatedDeepest = true;
+                    }
+                }
+                else if (throwType == UltimateThrowType.Forehand)
+                {
+                    if (rawLocalVel.z <= 0.25f && localHand.x * domSign > _deepestCoilHand.x * domSign)
+                    {
+                        _deepestCoilHand.x = localHand.x;
+                        updatedDeepest = true;
+                    }
+                }
+                else if (throwType == UltimateThrowType.Hammer)
+                {
+                    if (localHand.y > _deepestCoilHand.y)
+                    {
+                        _deepestCoilHand.y = localHand.y;
+                        updatedDeepest = true;
+                    }
+                }
+                if (updatedDeepest)
+                {
+                    _deepestCoilHand.y = (throwType == UltimateThrowType.Hammer) ? _deepestCoilHand.y : localHand.y;
+                    _deepestCoilAngle = currentStickAngle;
+                }
+
+                // -------------------------------------------------------------
+                // 1. SPATIAL COIL (Genuine Windup Unlocks Full Huck Ceiling)
+                // -------------------------------------------------------------
+                float stanceCoil;
+                switch (throwType)
+                {
+                    case UltimateThrowType.Backhand:
+                        stanceCoil = Mathf.Clamp01(Mathf.Max(
+                            (crossBodyX - 0.14f) / 0.54f,
+                            (rearPull - 0.08f) / 0.42f));
                         break;
 
                     case UltimateThrowType.Forehand:
-                        // Compact flick cocking behind hip or wide dominant extension
-                        instantCoil = Mathf.Clamp01(Mathf.Max(
-                            (rearPull - 0.03f) / 0.26f,
-                            Mathf.Max((domSideX - 0.24f) / 0.36f, CoilSweepDeg / 48f)));
+                        // Requires cocking behind the hip rather than merely holding the arm out to the side
+                        stanceCoil = Mathf.Clamp01(Mathf.Max(
+                            (rearPull - 0.06f) / 0.36f,
+                            ((domSideX - 0.30f) / 0.42f) * 0.60f + (rearPull / 0.34f) * 0.45f));
                         break;
 
                     case UltimateThrowType.Hammer:
                         float overheadLift = Mathf.Max(0f, localHand.y - 0.65f);
-                        instantCoil = Mathf.Clamp01(Mathf.Max(
-                            (overheadLift / 0.42f) * 0.65f + (rearPull / 0.32f) * 0.50f,
-                            CoilSweepDeg / 58f));
+                        stanceCoil = Mathf.Clamp01((overheadLift / 0.48f) * 0.60f + (rearPull / 0.36f) * 0.55f);
                         break;
 
-                    case UltimateThrowType.Scoober:
-                        instantCoil = Mathf.Clamp01(Mathf.Max(
-                            ((crossBodyX - 0.10f) / 0.36f) * 0.65f + (rearPull / 0.30f) * 0.45f,
-                            CoilSweepDeg / 50f));
+                    default: // Scoober
+                        stanceCoil = Mathf.Clamp01(((crossBodyX - 0.12f) / 0.42f) * 0.60f + (rearPull / 0.34f) * 0.50f);
                         break;
                 }
 
-                PeakCoil = Mathf.Max(instantCoil, PeakCoil - dt * 0.16f);
+                float sweepCoil = Mathf.Clamp01(CoilSweepDeg / (throwType == UltimateThrowType.Backhand ? 70f : 50f));
+                float instantCoil = Mathf.Clamp01(Mathf.Max(stanceCoil, sweepCoil * 0.90f));
+                bool holdingStroke = (Time.time - _lastTravelPeakTime <= TravelPeakHoldSeconds) ||
+                                     (Time.time - _lastWhipPeakTime <= WhipPeakHoldSeconds);
+                float coilDecay = holdingStroke ? 0f : (dt * 0.08f);
+                PeakCoil = Mathf.Max(instantCoil, PeakCoil - coilDecay);
 
                 // -------------------------------------------------------------
-                // 2. SUSTAINED DIRECTIONAL WHIP / SNAP (Requires Real Effort!)
+                // 2. GEOMETRIC STROKE TRAVEL + DIRECTIONAL WHIP / SNAP
                 // -------------------------------------------------------------
                 float fwdVel = Mathf.Max(0f, SmoothedLocalVel.z);
                 float sweepToDomVel = Mathf.Max(0f, SmoothedLocalVel.x * domSign);
+                float sweepInwardVel = Mathf.Max(0f, -SmoothedLocalVel.x * domSign);
+
+                Vector3 fromCoil = localHand - _deepestCoilHand;
+                float forwardTravel;
                 float directionalSpeed;
-                float minStrokeDist;
+                float fullStrokeDist;
+                float fullSweepDeg;
                 float linearMaxSpeed;
                 float angularMaxDegSec;
 
                 switch (throwType)
                 {
                     case UltimateThrowType.Backhand:
-                        directionalSpeed = fwdVel * 0.95f + sweepToDomVel * 0.95f;
-                        minStrokeDist = 0.55f;
-                        linearMaxSpeed = 5.4f;
-                        angularMaxDegSec = 540f;
+                        directionalSpeed = Mathf.Sqrt(fwdVel * fwdVel + sweepToDomVel * sweepToDomVel);
+                        {
+                            float tz = Mathf.Max(0f, fromCoil.z);
+                            float tx = Mathf.Max(0f, fromCoil.x * domSign);
+                            forwardTravel = Mathf.Sqrt(tz * tz + tx * tx);
+                        }
+                        fullStrokeDist = 0.90f;
+                        fullSweepDeg = 72f;
+                        linearMaxSpeed = 6.0f;
+                        angularMaxDegSec = 580f;
                         break;
 
                     case UltimateThrowType.Forehand:
-                        directionalSpeed = fwdVel * 1.15f + Mathf.Abs(SmoothedLocalVel.x) * 0.45f;
-                        minStrokeDist = 0.34f;
-                        linearMaxSpeed = 4.6f;
-                        angularMaxDegSec = 430f;
+                        // Pure forward + slight inward snap (ignores sideways outward wiggle)
+                        directionalSpeed = Mathf.Sqrt(fwdVel * fwdVel + (sweepInwardVel * 0.55f) * (sweepInwardVel * 0.55f));
+                        {
+                            float tz = Mathf.Max(0f, fromCoil.z);
+                            float tx = Mathf.Max(0f, -fromCoil.x * domSign) * 0.50f;
+                            forwardTravel = Mathf.Sqrt(tz * tz + tx * tx);
+                        }
+                        fullStrokeDist = 0.52f;
+                        fullSweepDeg = 50f;
+                        linearMaxSpeed = 5.4f;
+                        angularMaxDegSec = 480f;
                         break;
 
                     case UltimateThrowType.Hammer:
-                        directionalSpeed = fwdVel * 1.05f + Mathf.Abs(SmoothedLocalVel.y) * 0.70f + Mathf.Abs(SmoothedLocalVel.x) * 0.30f;
-                        minStrokeDist = 0.42f;
-                        linearMaxSpeed = 5.0f;
-                        angularMaxDegSec = 500f;
+                        directionalSpeed = Mathf.Sqrt(fwdVel * fwdVel + (SmoothedLocalVel.y * 0.65f) * (SmoothedLocalVel.y * 0.65f));
+                        {
+                            float tz = Mathf.Max(0f, fromCoil.z);
+                            float ty = Mathf.Abs(fromCoil.y) * 0.55f;
+                            forwardTravel = Mathf.Sqrt(tz * tz + ty * ty);
+                        }
+                        fullStrokeDist = 0.60f;
+                        fullSweepDeg = 58f;
+                        linearMaxSpeed = 5.6f;
+                        angularMaxDegSec = 540f;
                         break;
 
                     default: // Scoober
-                        directionalSpeed = fwdVel * 0.95f + sweepToDomVel * 0.60f + Mathf.Abs(SmoothedLocalVel.y) * 0.30f;
-                        minStrokeDist = 0.30f;
-                        linearMaxSpeed = 4.2f;
-                        angularMaxDegSec = 400f;
+                        directionalSpeed = Mathf.Sqrt(fwdVel * fwdVel + (sweepToDomVel * 0.65f) * (sweepToDomVel * 0.65f));
+                        {
+                            float tz = Mathf.Max(0f, fromCoil.z);
+                            float tx = Mathf.Max(0f, fromCoil.x * domSign) * 0.60f;
+                            forwardTravel = Mathf.Sqrt(tz * tz + tx * tx);
+                        }
+                        fullStrokeDist = 0.44f;
+                        fullSweepDeg = 44f;
+                        linearMaxSpeed = 4.8f;
+                        angularMaxDegSec = 440f;
                         break;
                 }
 
                 float effort = Mathf.Clamp(WhipEffortScale, 0.5f, 2.0f);
+                // Keep full speed effort (1.2x), but scale physical distance gently
+                // so max effort never exceeds the arm's physical workspace.
+                float travelEffort = Mathf.Lerp(1.0f, effort, 0.45f);
 
-                // Accumulate committed forward stroke distance ONLY while actively whipping forward
-                if (directionalSpeed > 0.85f)
+                // Track peak geometric stroke travel with a generous grace window
+                if (forwardTravel >= StrokeDistance)
                 {
-                    StrokeDistance = Mathf.Min(minStrokeDist * 1.35f, StrokeDistance + directionalSpeed * dt);
+                    StrokeDistance = forwardTravel;
+                    _lastTravelPeakTime = Time.time;
                 }
-                else
+                else if (Time.time - _lastTravelPeakTime > TravelPeakHoldSeconds)
                 {
-                    // Decays rapidly if the player stops/hesitates, forcing one clean explosive snap
-                    StrokeDistance = Mathf.MoveTowards(StrokeDistance, 0f, dt * 1.8f);
+                    StrokeDistance = Mathf.MoveTowards(StrokeDistance, forwardTravel, dt * 0.45f);
                 }
 
-                float strokeGate = Mathf.Clamp01(StrokeDistance / (minStrokeDist * effort));
+                float angularTravelDeg = forwardTravel > 0.03f
+                    ? Vector2.Distance(currentStickAngle, _deepestCoilAngle)
+                    : 0f;
 
-                // Linear effort-scaled scoring with a clear deadzone so tiny nudges stay gentle
-                float linearScore = Mathf.Clamp01((directionalSpeed - 0.70f) / ((linearMaxSpeed * effort) - 0.70f));
-                float angularScore = Mathf.Clamp01((SmoothedAngularSpeed - 65f) / ((angularMaxDegSec * effort) - 65f));
+                float linearTravel01 = Mathf.Clamp01(StrokeDistance / (fullStrokeDist * effort));
+                float angularTravel01 = Mathf.Clamp01(angularTravelDeg / (fullSweepDeg * effort));
+                float instantTravel01 = Mathf.Clamp01(linearTravel01 * 0.65f + angularTravel01 * 0.35f);
 
-                float speedScore = Mathf.Clamp01(linearScore * 0.60f + angularScore * 0.40f);
-                // Slightly concave curve so reaching the top 25% truly demands an athletic mouse whip
-                speedScore = Mathf.Pow(speedScore, 1.18f);
+                if (instantTravel01 >= PeakTravel)
+                {
+                    PeakTravel = instantTravel01;
+                    _lastTravelPeakTime = Time.time;
+                }
+                else if (Time.time - _lastTravelPeakTime > TravelPeakHoldSeconds)
+                {
+                    PeakTravel = Mathf.MoveTowards(PeakTravel, instantTravel01, dt * TravelPostHoldDecayRate);
+                }
 
-                // Micro-twitches without stroke travel cannot exceed ~30% whip
-                float instantWhip = speedScore * Mathf.Lerp(0.28f, 1.0f, strokeGate);
+                // Low deadzone so calm mid-range pushes register smoothly, while max snap still takes real speed
+                float linearScore = Mathf.Clamp01((directionalSpeed - 0.35f) / ((linearMaxSpeed * effort) - 0.35f));
+                float angularScore = Mathf.Clamp01((SmoothedAngularSpeed - 30f) / ((angularMaxDegSec * effort) - 30f));
+                float speedScore = Mathf.Clamp01(linearScore * 0.65f + angularScore * 0.35f);
 
-                // Crisp ~0.15s peak window so releasing LMB right after your whip apex catches the full snap
-                float whipDecay = Mathf.Exp(-dt * 6.0f);
-                PeakWhip = Mathf.Max(instantWhip, PeakWhip * whipDecay);
-                PeakAngularWhip = Mathf.Max(angularScore, PeakAngularWhip * whipDecay);
+                // Travel gate ensures a short wrist flick caps cleanly in mid-range instead of hitting 100%
+                float travelGate = Mathf.Lerp(0.22f, 1.0f, Mathf.Pow(PeakTravel, 0.85f));
+                float instantWhip = speedScore * travelGate;
+
+                if (instantWhip >= PeakWhip)
+                {
+                    PeakWhip = instantWhip;
+                    _lastWhipPeakTime = Time.time;
+                }
+                else if (Time.time - _lastWhipPeakTime > WhipPeakHoldSeconds)
+                {
+                    float whipDecay = Mathf.Exp(-dt * WhipPostHoldDecayRate);
+                    PeakWhip = Mathf.Max(instantWhip, PeakWhip * whipDecay);
+                }
+
+                PeakAngularWhip = Mathf.Max(angularScore, PeakAngularWhip * Mathf.Exp(-dt * 2.5f));
 
                 // -------------------------------------------------------------
                 // 3. OFF-AXIS TORQUE (WOBBLE) FROM SWING PLANE & JERKINESS
                 // -------------------------------------------------------------
                 float handSpeed = SmoothedLocalVel.magnitude;
+                float wobbleAlpha = 1f - Mathf.Exp(-dt * 10f);
                 if (handSpeed > 0.65f)
                 {
                     float rollDeg = bladeAngle * UltimateVisualTuning.WristRollMultiplier;
@@ -499,20 +650,21 @@ namespace PuckUltimateFrisbeeMod
                         offPlane = Mathf.Max(0f, offPlane - 0.16f) * 1.25f;
                     }
 
-                    SmoothedOffPlane = Mathf.Lerp(SmoothedOffPlane, Mathf.Clamp01(offPlane), Mathf.Clamp01(dt * 10f));
+                    SmoothedOffPlane = Mathf.Lerp(SmoothedOffPlane, Mathf.Clamp01(offPlane), wobbleAlpha);
 
                     float prevSpeed = PrevSmoothedLocalVel.magnitude;
                     if (prevSpeed > 0.75f)
                     {
                         float dirDot = Vector3.Dot(SmoothedLocalVel / handSpeed, PrevSmoothedLocalVel / prevSpeed);
                         float instantJerk = Mathf.Clamp01((0.45f - dirDot) / 1.1f);
-                        SmoothedJerk = Mathf.Lerp(SmoothedJerk, instantJerk, Mathf.Clamp01(dt * 9f));
+                        SmoothedJerk = Mathf.Lerp(SmoothedJerk, instantJerk, 1f - Mathf.Exp(-dt * 9f));
                     }
                 }
                 else
                 {
-                    SmoothedOffPlane = Mathf.Lerp(SmoothedOffPlane, 0f, Mathf.Clamp01(dt * 4f));
-                    SmoothedJerk = Mathf.Lerp(SmoothedJerk, 0f, Mathf.Clamp01(dt * 4f));
+                    float settleAlpha = 1f - Mathf.Exp(-dt * 4f);
+                    SmoothedOffPlane = Mathf.Lerp(SmoothedOffPlane, 0f, settleAlpha);
+                    SmoothedJerk = Mathf.Lerp(SmoothedJerk, 0f, settleAlpha);
                 }
 
                 float typeWobbleSens;
@@ -539,27 +691,39 @@ namespace PuckUltimateFrisbeeMod
 
             public float GetCombinedThrowPower(UltimateThrowType throwType, float pivotExtension01)
             {
-                // Multiplicative Coil: pulling back unlocks your MAX ceiling, but Whip is what actually launches the disc!
-                float rawPower;
+                // 1. Grip readiness floor (gentle touch dump on quick tap; clean short pass when gripped)
+                float gripHold01 = IsArmed ? Mathf.Clamp01((Time.time - ArmStartTime) / 0.18f) : 0f;
+                float gripBase = Mathf.Lerp(0.09f, 0.15f, gripHold01);
+
+                // 2. Committed arm follow-through (+0.02 coil headroom at the top end)
+                float strokeContribution = PeakTravel * (0.18f + 0.14f * PeakCoil);
+
+                // 3. Snap / whip (+0.04 coil headroom so full-effort hucks hit 100% reliably)
+                // Just +0.03 headroom on the coiled whip term (total max 1.03, clamped to 1.0)
+                float whipContribution;
                 switch (throwType)
                 {
                     case UltimateThrowType.Backhand:
-                        // No-coil quick snap caps at ~55%; full coil + strong whip hits 100%
-                        rawPower = 0.07f + PeakWhip * (0.48f + 0.45f * PeakCoil);
+                        whipContribution = PeakWhip * (0.28f + 0.28f * PeakCoil);
                         break;
 
                     case UltimateThrowType.Forehand:
-                        // Compact flick hits ~68% with fast snap alone; cocking + ripping hits 100%
-                        rawPower = 0.07f + PeakWhip * (0.61f + 0.32f * PeakCoil);
+                        whipContribution = PeakWhip * (0.33f + 0.23f * PeakCoil);
                         break;
 
                     case UltimateThrowType.Hammer:
-                        rawPower = 0.08f + PeakWhip * (0.50f + 0.42f * PeakCoil);
+                        whipContribution = PeakWhip * (0.29f + 0.27f * PeakCoil);
                         break;
 
                     default: // Scoober
-                        rawPower = Mathf.Min(0.75f, 0.07f + PeakWhip * (0.54f + 0.24f * PeakCoil));
+                        whipContribution = PeakWhip * (0.30f + 0.19f * PeakCoil);
                         break;
+                }
+
+                float rawPower = gripBase + strokeContribution + whipContribution;
+                if (throwType == UltimateThrowType.Scoober)
+                {
+                    rawPower = Mathf.Min(0.78f, rawPower);
                 }
 
                 float balanceMult = Mathf.Lerp(1.0f, 0.90f, Mathf.Clamp01((pivotExtension01 - 0.55f) / 0.45f));
@@ -583,10 +747,12 @@ namespace PuckUltimateFrisbeeMod
                 return (Quaternion.Euler(0f, releaseOffsetDeg, 0f) * baseAimForward).normalized;
             }
 
+
             public void Reset()
             {
                 IsArmed = false;
                 StrokeDistance = 0f;
+                PeakTravel = 0f;
                 CoilSweepDeg = 0f;
                 PeakCoil = 0f;
                 PeakWhip = 0f;
@@ -599,6 +765,10 @@ namespace PuckUltimateFrisbeeMod
                 SmoothedLocalVel = Vector3.zero;
                 PrevSmoothedLocalVel = Vector3.zero;
                 SmoothedHorizWorldVel = Vector3.zero;
+                _deepestCoilHand = Vector3.zero;
+                _deepestCoilAngle = Vector2.zero;
+                _lastWhipPeakTime = -999f;
+                _lastTravelPeakTime = -999f;
             }
         }
 
@@ -2559,8 +2729,9 @@ namespace PuckUltimateFrisbeeMod
                 default:                         maxTypeSpeed = 21.0f; break; // Scoober
             }
 
-            float powerCurve = Mathf.Pow(normalizedPower, 1.18f);
-            float launchSpeed = Mathf.Lerp(6.5f, maxTypeSpeed, powerCurve);
+            // Replaced Pow(..., 1.18f) & 6.5f floor so mid-range throws feel linear and soft dumps still glide cleanly
+            float powerCurve = Mathf.Pow(normalizedPower, 1.04f);
+            float launchSpeed = Mathf.Lerp(7.0f, maxTypeSpeed, powerCurve);
 
             if (UltimateRulesManager.IsPullPlay)
             {

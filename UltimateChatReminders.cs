@@ -26,8 +26,8 @@ namespace PuckUltimateFrisbeeMod
 
         // Posts once ~15s after joining a server so players see it (and you can test quickly),
         // then repeats on every 4-minute wall-clock boundary. Set to -1f to disable the join post.
-        private const float InitialJoinDelaySeconds = 15f;
-        private const float IntervalSeconds = 240f;
+        private const float InitialJoinDelaySeconds = 20f;
+        private const float IntervalSeconds = 600f;
         private const int MaxContentBytes = 480;
 
         private struct ReminderEntry
@@ -64,6 +64,7 @@ namespace PuckUltimateFrisbeeMod
         private static bool _wasInSession = false;
         private static float _nextPollTime = 0f;
         private static float _pendingJoinPostAt = -1f;
+        private static float _lastPostedTime = -99999f;
 
         public static void Initialize()
         {
@@ -98,8 +99,9 @@ namespace PuckUltimateFrisbeeMod
             if (UltimateFrisbeePlugin.IsHeadlessServer) return;
             if (Reminders.Length == 0) return;
 
-            if (Time.unscaledTime < _nextPollTime) return;
-            _nextPollTime = Time.unscaledTime + 0.5f;
+            float now = Time.unscaledTime;
+            if (now < _nextPollTime) return;
+            _nextPollTime = now + 0.5f;
 
             var nm = NetworkManager.Singleton;
             bool inSession = nm != null && nm.IsListening;
@@ -116,41 +118,42 @@ namespace PuckUltimateFrisbeeMod
 
             if (ChatManager.Instance == null) return;
 
-            double wallSeconds = Utils.GetTimestamp() / 1000.0;
-            long slot = (long)Math.Floor(wallSeconds / IntervalSeconds);
+            long unixSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            long slot = unixSeconds / (long)IntervalSeconds;
 
             if (!_wasInSession)
             {
                 _wasInSession = true;
                 _lastSlot = slot;
-                if (InitialJoinDelaySeconds >= 0f)
+
+                // Only schedule the join post if we haven't already posted recently (e.g. map reload / quick reconnect)
+                if (InitialJoinDelaySeconds >= 0f && (now - _lastPostedTime) >= IntervalSeconds)
                 {
-                    _pendingJoinPostAt = Time.unscaledTime + InitialJoinDelaySeconds;
+                    _pendingJoinPostAt = now + InitialJoinDelaySeconds;
                 }
-                UltimateFrisbeePlugin.ModLogger.Info(
-                    $"UltimateChatReminders: Session active (slot {slot}). Next join post in {InitialJoinDelaySeconds:0}s.");
                 return;
             }
 
-            // One-time post shortly after joining a match
-            if (_pendingJoinPostAt >= 0f && Time.unscaledTime >= _pendingJoinPostAt)
+            // One-time post shortly after joining
+            if (_pendingJoinPostAt >= 0f && now >= _pendingJoinPostAt)
             {
                 _pendingJoinPostAt = -1f;
+                _lastSlot = slot;
+                _lastPostedTime = now;
+
                 int joinIdx = (int)(((slot % Reminders.Length) + Reminders.Length) % Reminders.Length);
                 PostReminder(Reminders[joinIdx]);
                 return;
             }
 
-            // Subsequent synchronized wall-clock posts
-            if (_lastSlot == long.MinValue)
-            {
-                _lastSlot = slot;
-                return;
-            }
+            // Synchronized wall-clock boundary, guarded by a hard minimum cooldown
             if (slot == _lastSlot) return;
-
             _lastSlot = slot;
 
+            if ((now - _lastPostedTime) < IntervalSeconds * 0.75f)
+                return;
+
+            _lastPostedTime = now;
             int idx = (int)(((slot % Reminders.Length) + Reminders.Length) % Reminders.Length);
             PostReminder(Reminders[idx]);
         }

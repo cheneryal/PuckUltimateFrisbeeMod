@@ -1359,13 +1359,12 @@ namespace PuckUltimateFrisbeeMod
             DrawSolidRect(new Rect(tiltCenter.x - 3f, tiltCenter.y - 4.5f, 6f, 3f), typeAccent);
             GUI.matrix = savedMat;
 
-            string statusText;
-            Color statusCol;
-
-            string throwKey  = UltimateKeybindManager.GetDisplayLabel(UltimateBindAction.Throw);
-            string cancelKey = UltimateKeybindManager.GetDisplayLabel(UltimateBindAction.CancelThrow);
+            string throwKey   = UltimateKeybindManager.GetDisplayLabel(UltimateBindAction.Throw);
+            string cancelKey  = UltimateKeybindManager.GetDisplayLabel(UltimateBindAction.CancelThrow);
             string strafeKeys = $"{UltimateKeybindManager.GetDisplayLabel(UltimateBindAction.StrafeLeft)}-{UltimateKeybindManager.GetDisplayLabel(UltimateBindAction.StrafeRight)}";
 
+            string statusText;
+            Color statusCol;
             if (UltimateLocalThrowTelemetry.WaitingForFreshLmb)
             {
                 statusText = $"RELEASE {throwKey}";
@@ -1381,10 +1380,10 @@ namespace PuckUltimateFrisbeeMod
                 statusText = $"HOLD {throwKey} TO THROW";
                 statusCol = new Color(0.75f, 0.82f, 0.90f, 0.90f);
             }
+
+            // Draw statusText on the TOP ROW (y + 10) where it belongs
             _throwStatusStyle.normal.textColor = statusCol;
-            GUI.Label(new Rect(panel.x + 172f, panel.y + 68f, 184f, 20f),
-            armed ? $"{cancelKey}: CANCEL" : $"WASD / {strafeKeys}: PIVOT",
-            _throwStatusStyle);
+            GUI.Label(new Rect(panel.x + 180f, panel.y + 10f, 176f, 22f), statusText, _throwStatusStyle);
 
             // 2. MIDDLE ROW (y + 40): Power Bar with Coil Ceiling Marker
             Rect barBg = new Rect(panel.x + 12f, panel.y + 40f, panelW - 24f, 20f);
@@ -1392,11 +1391,15 @@ namespace PuckUltimateFrisbeeMod
 
             if (armed)
             {
-                float maxUnlocked = (tType == UltimateThrowType.Forehand)
-                    ? (0.07f + (0.61f + 0.32f * coil))
-                    : (tType == UltimateThrowType.Backhand
-                        ? (0.07f + (0.48f + 0.45f * coil))
-                        : (0.08f + (0.50f + 0.42f * coil)));
+                // Matches the rebalanced GetCombinedThrowPower ceiling for current Coil
+                float maxUnlocked;
+                switch (tType)
+                {
+                    case UltimateThrowType.Forehand: maxUnlocked = 0.66f + 0.40f * coil; break;
+                    case UltimateThrowType.Backhand: maxUnlocked = 0.61f + 0.45f * coil; break;
+                    case UltimateThrowType.Hammer:   maxUnlocked = 0.62f + 0.44f * coil; break;
+                    default:                         maxUnlocked = Mathf.Min(0.78f, 0.63f + 0.36f * coil); break;
+                }
                 maxUnlocked = Mathf.Clamp01(maxUnlocked);
 
                 DrawSolidRect(new Rect(barBg.x, barBg.y, barBg.width * maxUnlocked, barBg.height),
@@ -1420,7 +1423,7 @@ namespace PuckUltimateFrisbeeMod
                 : $"TILT {Mathf.RoundToInt(rollDeg)}°  ·  FREE FAKE MODE";
             GUI.Label(barBg, barLabel, _throwBadgeStyle);
 
-            // 3. BOTTOM ROW (y + 68): Pivot Lunge Stability Bar + Unclipped Single-Line Hint
+            // 3. BOTTOM ROW (y + 68): Pivot Lunge Stability Bar + Single Dynamic Keybind Hint
             _throwMicroStyle.normal.textColor = pivotExt > 0.65f
                 ? new Color(1f, 0.78f, 0.30f)
                 : new Color(0.68f, 0.75f, 0.82f, 0.88f);
@@ -1433,7 +1436,7 @@ namespace PuckUltimateFrisbeeMod
 
             _throwStatusStyle.normal.textColor = new Color(0.68f, 0.75f, 0.82f, 0.85f);
             GUI.Label(new Rect(panel.x + 172f, panel.y + 68f, 184f, 20f),
-                armed ? "RMB / SPACE: CANCEL" : "WASD / Q-E: PIVOT LUNGE",
+                armed ? $"{cancelKey}: CANCEL" : $"WASD / {strafeKeys}: PIVOT",
                 _throwStatusStyle);
         }
 

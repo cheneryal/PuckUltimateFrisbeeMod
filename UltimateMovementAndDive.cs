@@ -1726,12 +1726,12 @@ namespace PuckUltimateFrisbeeMod
                     tag = $"{liveType.ToString().ToUpperInvariant()} · {pct}% · WOBBLY";
                     col = new Color(1.0f, 0.58f, 0.22f);
                 }
-                else if (pct >= 75f)
+                else if (pct >= 80f)
                 {
                     tag = $"{liveType.ToString().ToUpperInvariant()} · {pct}% · FULL POWER";
                     col = new Color(1.0f, 0.85f, 0.30f);
                 }
-                else if (snap >= 0.55f)
+                else if (pct >= 42f || snap >= 0.45f)
                 {
                     tag = $"{liveType.ToString().ToUpperInvariant()} · {pct}% · CLEAN SNAP";
                     col = new Color(0.24f, 0.92f, 0.54f);
